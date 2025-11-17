@@ -383,7 +383,7 @@ export class WebRTCConnection {
    * Wait for at least one ICE candidate (for trickle ICE)
    */
   private waitForInitialICECandidate(
-    pc: RTCPeerConnection,
+    _pc: RTCPeerConnection,
     timeout: number
   ): Promise<void> {
     return new Promise((resolve) => {
@@ -720,6 +720,19 @@ export class WebRTCConnection {
     this.setState(ConnectionState.CLOSED);
     this.eventListeners.clear();
     this.iceCandidatesBuffer = [];
+  }
+
+  /**
+   * Get peer connection instance (for advanced usage)
+   */
+  public getPeerConnection(): RTCPeerConnection {
+    if (!this.peerConnection) {
+      throw new WebRTPayError(
+        ErrorType.CONNECTION_FAILED,
+        'Peer connection not initialized'
+      );
+    }
+    return this.peerConnection;
   }
 
   /**

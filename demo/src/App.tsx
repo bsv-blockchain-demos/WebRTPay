@@ -12,11 +12,11 @@ import {
 } from '../../src';
 
 type Mode = 'create' | 'join';
-type Method = 'qr' | 'remote';
+type Method = 'qr' | 'remote' | 'http';
 
 function App() {
   const [mode, setMode] = useState<Mode>('create');
-  const [method, setMethod] = useState<Method>('qr');
+  const [method, setMethod] = useState<Method>('http');
   const [manager, setManager] = useState<ConnectionManager | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>(
     ConnectionState.IDLE
@@ -34,6 +34,8 @@ function App() {
   const [stats, setStats] = useState({ sent: 0, received: 0 });
   const [tokenJson, setTokenJson] = useState<string>('');
   const [pasteInput, setPasteInput] = useState<string>('');
+  const [sessionUrl, setSessionUrl] = useState<string>('');
+  const [joinSessionId, setJoinSessionId] = useState<string>('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<any>(null);
@@ -58,6 +60,9 @@ function App() {
       connectionTimeout: 30000,
       autoRetry: true,
       maxRetries: 3,
+      httpSignaling: method === 'http' ? {
+        serverUrl: 'http://localhost:3001'
+      } : undefined
     });
 
     // Setup event listeners
@@ -141,11 +146,12 @@ function App() {
   };
 
   // Start scanning answer QR code (Step 3: Offerer scans answer QR)
-  const handleScanAnswer = () => {
-    setError('');
-    setWaitingForAnswer(false);
-    setIsScanning(true);
-  };
+  // Note: This is only used for legacy two-QR mode, not HTTP signaling
+  // const handleScanAnswer = () => {
+  //   setError('');
+  //   setWaitingForAnswer(false);
+  //   setIsScanning(true);
+  // };
 
   // Initialize scanner when video element is ready
   useEffect(() => {
@@ -290,6 +296,48 @@ function App() {
     }
   };
 
+  // Create HTTP session
+  const handleCreateHttp = async () => {
+    try {
+      setError('');
+      const mgr = initializeManager();
+
+      const { sessionId, sessionUrl, qrCodeDataUrl } = await mgr.createHttpSession();
+
+      setSessionUrl(sessionUrl);
+      setQrCodeUrl(qrCodeDataUrl);
+
+      console.log(`[HTTP] Session created: ${sessionId}`);
+      console.log(`[HTTP] Shareable URL: ${sessionUrl}`);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  // Join HTTP session
+  const handleJoinHttp = async () => {
+    if (!joinSessionId.trim()) {
+      setError('Please enter a session ID or URL');
+      return;
+    }
+
+    try {
+      setError('');
+      const mgr = initializeManager();
+
+      // Extract session ID from URL if needed
+      let sessionId = joinSessionId.trim();
+      if (sessionId.includes('/session/')) {
+        sessionId = sessionId.split('/session/')[1];
+      }
+
+      await mgr.joinHttpSession(sessionId);
+      console.log(`[HTTP] Joined session: ${sessionId}`);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   // Send message
   const handleSendMessage = async () => {
     if (!manager || !messageInput.trim()) return;
@@ -384,23 +432,38 @@ function App() {
 
             <div className="tabs">
               <button
+                className={`tab ${method === 'http' ? 'active' : ''}`}
+                onClick={() => setMethod('http')}
+              >
+                HTTP Signaling
+              </button>
+              <button
                 className={`tab ${method === 'qr' ? 'active' : ''}`}
                 onClick={() => setMethod('qr')}
               >
-                QR Code
+                QR Code (Legacy)
               </button>
               <button
                 className={`tab ${method === 'remote' ? 'active' : ''}`}
                 onClick={() => setMethod('remote')}
               >
-                Remote
+                Remote (Legacy)
               </button>
             </div>
 
             {/* Create Mode */}
             {mode === 'create' && (
               <>
-                {method === 'qr' ? (
+                {method === 'http' ? (
+                  <>
+                    <p className="info-text">
+                      Create a shareable connection URL for another device
+                    </p>
+                    <button className="button" onClick={handleCreateHttp}>
+                      Create Connection
+                    </button>
+                  </>
+                ) : method === 'qr' ? (
                   <>
                     <p className="info-text">
                       Generate a QR code for another device to scan
@@ -432,7 +495,28 @@ function App() {
             {/* Join Mode */}
             {mode === 'join' && (
               <>
-                {method === 'qr' ? (
+                {method === 'http' ? (
+                  <>
+                    <p className="info-text">
+                      Enter the session ID or paste the connection URL
+                    </p>
+                    <input
+                      type="text"
+                      className="input"
+                      placeholder="Paste session URL or ID here..."
+                      value={joinSessionId}
+                      onChange={(e) => setJoinSessionId(e.target.value)}
+                      style={{ marginBottom: '10px' }}
+                    />
+                    <button
+                      className="button"
+                      onClick={handleJoinHttp}
+                      disabled={!joinSessionId.trim()}
+                    >
+                      Join Connection
+                    </button>
+                  </>
+                ) : method === 'qr' ? (
                   <>
                     <p className="info-text">
                       Scan a QR code from another device or paste token JSON
@@ -494,8 +578,55 @@ function App() {
         )}
       </div>
 
+      {/* HTTP Session URL Display */}
+      {sessionUrl && method === 'http' && (
+        <div className="card">
+          <h2>Share this Connection URL</h2>
+          <div style={{ marginBottom: '15px' }}>
+            <p className="info-text" style={{ marginBottom: '10px' }}>
+              Share this URL with the other device:
+            </p>
+            <textarea
+              readOnly
+              value={sessionUrl}
+              onClick={(e) => e.currentTarget.select()}
+              style={{
+                width: '100%',
+                minHeight: '60px',
+                fontFamily: 'monospace',
+                fontSize: '14px',
+                padding: '10px',
+                marginBottom: '10px',
+                backgroundColor: '#f5f5f5',
+                border: '1px solid #ddd',
+                borderRadius: '4px'
+              }}
+            />
+            <button
+              className="button secondary"
+              onClick={() => {
+                navigator.clipboard.writeText(sessionUrl);
+                alert('URL copied to clipboard!');
+              }}
+            >
+              Copy URL
+            </button>
+          </div>
+          {qrCodeUrl && (
+            <>
+              <p className="info-text" style={{ marginTop: '15px', marginBottom: '10px' }}>
+                Or scan this QR code:
+              </p>
+              <div className="qr-container">
+                <img src={qrCodeUrl} alt="Session URL QR Code" className="qr-code" />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Offer QR Code Display (Step 1) */}
-      {qrCodeUrl && !answerQRCodeUrl && (
+      {qrCodeUrl && !answerQRCodeUrl && method !== 'http' && (
         <div className="card">
           <h2>Step 1: Show QR Code</h2>
           <div className="qr-container">

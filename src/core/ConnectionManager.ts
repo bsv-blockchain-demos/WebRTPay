@@ -6,6 +6,7 @@
 import { WebRTCConnection } from './WebRTCConnection';
 import { QRBootstrap } from '../bootstrap/QRBootstrap';
 import { RemoteBootstrap } from '../bootstrap/RemoteBootstrap';
+import { HttpSignaling, HttpSignalingConfig } from '../signaling/HttpSignaling';
 import { MessageProtocol, registerCommonSchemas } from '../protocol/MessageProtocol';
 import {
   BootstrapToken,
@@ -26,6 +27,8 @@ export interface ConnectionManagerConfig {
   webrtc?: WebRTCConfig;
   /** Remote bootstrap configuration (optional) */
   remote?: RemoteBootstrapConfig;
+  /** HTTP signaling configuration (optional) */
+  httpSignaling?: HttpSignalingConfig;
   /** Connection timeout in milliseconds */
   connectionTimeout?: number;
   /** Enable automatic retry on connection failure */
@@ -50,6 +53,7 @@ export class ConnectionManager {
   private readonly connection: WebRTCConnection;
   private readonly protocol: MessageProtocol;
   private readonly remoteBootstrap?: RemoteBootstrap;
+  private readonly httpSignaling?: HttpSignaling;
   private readonly config: ConnectionManagerConfig;
   private retryCount: number = 0;
 
@@ -68,6 +72,10 @@ export class ConnectionManager {
 
     if (config.remote) {
       this.remoteBootstrap = new RemoteBootstrap(config.remote);
+    }
+
+    if (config.httpSignaling) {
+      this.httpSignaling = new HttpSignaling(config.httpSignaling);
     }
 
     this.setupConnectionHandlers();
@@ -455,6 +463,206 @@ export class ConnectionManager {
    */
   public getRemoteBootstrap(): RemoteBootstrap | undefined {
     return this.remoteBootstrap;
+  }
+
+  // ===== HTTP Signaling Methods =====
+
+  /**
+   * Create HTTP signaling session (offerer side)
+   * Returns session info with shareable URL
+   */
+  public async createHttpSession(): Promise<{
+    sessionId: string;
+    sessionUrl: string;
+    qrCodeDataUrl: string;
+  }> {
+    if (!this.httpSignaling) {
+      throw new WebRTPayError(
+        ErrorType.SIGNALING_FAILED,
+        'HTTP signaling not configured'
+      );
+    }
+
+    try {
+      // Create offer
+      const token = await this.connection.createBootstrapToken(false);
+
+      // Create session on server
+      const sessionInfo = await this.httpSignaling.createSession(
+        token.offer,
+        token.iceCandidates || []
+      );
+
+      // Generate QR code with session URL
+      const qrCodeDataUrl = await QRBootstrap.generateQRCode(sessionInfo.sessionUrl as any);
+
+      console.log(`[HTTP SESSION] Created session: ${sessionInfo.sessionId}`);
+      console.log(`[HTTP SESSION] Shareable URL: ${sessionInfo.sessionUrl}`);
+
+      // Poll for answer in background
+      this.pollForAnswer();
+
+      return {
+        ...sessionInfo,
+        qrCodeDataUrl
+      };
+    } catch (error) {
+      throw new WebRTPayError(
+        ErrorType.SIGNALING_FAILED,
+        'Failed to create HTTP session',
+        error
+      );
+    }
+  }
+
+  /**
+   * Join HTTP signaling session (answerer side)
+   * @param sessionId - The session ID from URL
+   */
+  public async joinHttpSession(sessionId: string): Promise<void> {
+    if (!this.httpSignaling) {
+      throw new WebRTPayError(
+        ErrorType.SIGNALING_FAILED,
+        'HTTP signaling not configured'
+      );
+    }
+
+    try {
+      // Get peer connection
+      const pc = await this.connection.getPeerConnection();
+
+      // Get session and set remote offer
+      console.log(`[HTTP SESSION] Joining session ${sessionId}...`);
+
+      // We need to send the answer, so we'll create it after setting remote description
+      // For now, create a placeholder offer to get PC ready
+      const tempOffer = await pc.createOffer();
+      await pc.setLocalDescription(tempOffer);
+
+      // Join session (this sends our answer to the server)
+      const { offer, offererCandidates } = await this.httpSignaling.joinSession(
+        sessionId,
+        { type: 'answer', sdp: '' }, // Placeholder, will update
+        []
+      );
+
+      // Now set the real remote offer
+      await pc.setRemoteDescription(offer);
+
+      // Add offerer's ICE candidates
+      for (const candidate of offererCandidates) {
+        await pc.addIceCandidate(candidate);
+      }
+
+      // Create real answer
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      // Update answer on server (we'll need to add this method)
+      // For now, join again with real answer
+      await this.httpSignaling.joinSession(
+        sessionId,
+        answer,
+        []
+      );
+
+      console.log(`[HTTP SESSION] Joined session ${sessionId}`);
+
+      // Start trickling ICE candidates
+      this.setupHttpIceTrickle();
+
+      // Poll for remote candidates
+      this.pollForRemoteCandidates('offerer');
+    } catch (error) {
+      throw new WebRTPayError(
+        ErrorType.CONNECTION_FAILED,
+        'Failed to join HTTP session',
+        error
+      );
+    }
+  }
+
+  /**
+   * Poll for answer from answerer (offerer side)
+   */
+  private async pollForAnswer(): Promise<void> {
+    if (!this.httpSignaling) return;
+
+    try {
+      const { answer, answererCandidates } = await this.httpSignaling.waitForAnswer();
+
+      console.log('[HTTP SESSION] Received answer from answerer');
+
+      const pc = await this.connection.getPeerConnection();
+      await pc.setRemoteDescription(answer);
+
+      // Add answerer's ICE candidates
+      for (const candidate of answererCandidates) {
+        await pc.addIceCandidate(candidate);
+      }
+
+      // Poll for more candidates
+      this.pollForRemoteCandidates('answerer');
+    } catch (error) {
+      console.error('[HTTP SESSION] Error polling for answer:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Poll for remote ICE candidates
+   */
+  private async pollForRemoteCandidates(role: 'offerer' | 'answerer'): Promise<void> {
+    if (!this.httpSignaling) return;
+
+    // Poll every 2 seconds for new candidates
+    const interval = setInterval(async () => {
+      try {
+        const candidates = await this.httpSignaling!.getCandidates(role);
+
+        if (candidates.length > 0) {
+          const pc = await this.connection.getPeerConnection();
+
+          for (const candidate of candidates) {
+            await pc.addIceCandidate(candidate);
+          }
+
+          console.log(`[HTTP SESSION] Added ${candidates.length} ${role} candidates`);
+        }
+      } catch (error) {
+        console.error('[HTTP SESSION] Error polling candidates:', error);
+        clearInterval(interval);
+      }
+    }, 2000);
+
+    // Stop polling after connection is established
+    this.connection.on(ConnectionEvent.STATE_CHANGE, ({ state }) => {
+      if (state === ConnectionState.CONNECTED || state === ConnectionState.FAILED) {
+        clearInterval(interval);
+      }
+    });
+  }
+
+  /**
+   * Setup ICE candidate trickling to HTTP signaling server
+   */
+  private setupHttpIceTrickle(): void {
+    if (!this.httpSignaling) return;
+
+    this.connection.on(ConnectionEvent.ICE_CANDIDATE, async ({ candidate }) => {
+      try {
+        await this.httpSignaling!.sendCandidate(candidate.toJSON());
+      } catch (error) {
+        console.error('[HTTP SESSION] Error sending ICE candidate:', error);
+      }
+    });
+  }
+
+  /**
+   * Get HTTP signaling instance
+   */
+  public getHttpSignaling(): HttpSignaling | undefined {
+    return this.httpSignaling;
   }
 }
 

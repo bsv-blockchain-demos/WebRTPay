@@ -144,7 +144,8 @@ export enum ErrorType {
   DATA_CHANNEL_FAILED = 'data_channel_failed',
   MESSAGE_SEND_FAILED = 'message_send_failed',
   TIMEOUT = 'timeout',
-  REMOTE_SERVICE_ERROR = 'remote_service_error'
+  REMOTE_SERVICE_ERROR = 'remote_service_error',
+  SIGNALING_FAILED = 'signaling_failed'
 }
 
 /**
