@@ -2,19 +2,21 @@ import express from "express";
 import { createServer } from "http";
 import { AuthSocketServer, AuthSocket } from "@bsv/authsocket";
 import { ProtoWallet, PrivateKey, WalletInterface } from "@bsv/sdk";
+import "dotenv/config";
 
 const app = express();
 const httpServer = createServer(app);
 const PORT = process.env.PORT ?? 8080;
 
-const privateKey = process.env.SERVER_PRIVATE_KEY
-  ? PrivateKey.fromString(process.env.SERVER_PRIVATE_KEY)
-  : PrivateKey.fromRandom();
+const serverPrivateKey = process.env.SERVER_PRIVATE_KEY;
+if (!serverPrivateKey)
+  throw new Error("SERVER_PRIVATE_KEY env var is required");
+const privateKey = PrivateKey.fromString(serverPrivateKey);
 const wallet = new ProtoWallet(privateKey) as unknown as WalletInterface;
 
 const io = new AuthSocketServer(httpServer, {
   wallet,
-  cors: { origin: "*" },
+  cors: { origin: process.env.CROSS_ORIGIN },
 });
 
 // maps roomId to Map<socketId, identityKey>
@@ -26,6 +28,16 @@ io.on("connection", (socket) => {
   sockets.set(socket.id, socket);
 
   socket.on("join-room", ({ roomId }: { roomId: string }) => {
+    if (
+      typeof roomId !== "string" ||
+      roomId.length === 0 ||
+      roomId.length > 128
+    ) {
+      console.warn(`[room] invalid roomId from ${socket.id}`);
+      socket.emit("error", { message: "Invalid roomId" });
+      return;
+    }
+
     const identityKey = socket.identityKey ?? "unknown";
     console.log(`[room:${roomId}] ${identityKey.slice(0, 8)}... joined`);
 
