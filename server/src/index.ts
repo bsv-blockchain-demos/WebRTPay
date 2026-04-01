@@ -16,7 +16,7 @@ const wallet = new ProtoWallet(privateKey) as unknown as WalletInterface;
 
 const io = new AuthSocketServer(httpServer, {
   wallet,
-  cors: { origin: process.env.CROSS_ORIGIN },
+  cors: { origin: process.env.CORS_ORIGIN },
 });
 
 // maps roomId to Map<socketId, identityKey>
