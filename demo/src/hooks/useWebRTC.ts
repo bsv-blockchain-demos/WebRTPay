@@ -49,6 +49,8 @@ export function useWebRTC(
         channel.onclose = () => {
           setDataChannel(null);
           setConnected(false);
+          remoteDescriptionSet.current = false;
+          iceCandidateBuffer.current = [];
         };
       };
 
@@ -118,6 +120,8 @@ export function useWebRTC(
     channel.onclose = () => {
       setDataChannel(null);
       setConnected(false);
+      remoteDescriptionSet.current = false;
+      iceCandidateBuffer.current = [];
     };
 
     pc.onicecandidate = (event) => {
