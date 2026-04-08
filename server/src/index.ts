@@ -29,13 +29,18 @@ const io = new AuthSocketServer(httpServer, {
 
 // maps roomId to Map<socketId, identityKey>
 const rooms = new Map<string, Map<string, string>>();
+// maps socketId to roomId
+const socketRooms = new Map<string, string>();
 const sockets = new Map<string, AuthSocket>();
 
 io.on("connection", (socket) => {
   console.log("[+] connected: ", socket.id);
   sockets.set(socket.id, socket);
 
-  socket.on("join-room", ({ roomId }: JoinRoomPayload) => {
+  socket.on("join-room", (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return;
+    const { roomId } = payload as JoinRoomPayload;
+
     if (
       typeof roomId !== "string" ||
       roomId.length === 0 ||
@@ -57,36 +62,71 @@ io.on("connection", (socket) => {
 
     // notify existing peers that someone joined
     room.forEach((_, peerId) => {
-      const joined: PeerInfo = { socketId: socket.id, identityKey }
+      const joined: PeerInfo = { socketId: socket.id, identityKey };
       sockets.get(peerId)?.emit("peer-joined", joined);
     });
 
     // send current peer list to joining socket
-    const peers: PeerInfo[] = Array.from(room.entries()).map(([socketId, ik]) => ({
-      socketId,
-      identityKey: ik,
-    }));
+    const peers: PeerInfo[] = Array.from(room.entries()).map(
+      ([socketId, ik]) => ({
+        socketId,
+        identityKey: ik,
+      }),
+    );
     socket.emit("peers", peers);
 
     room.set(socket.id, identityKey);
+    socketRooms.set(socket.id, roomId);
   });
 
   // sdp and candidate are typed as unknown — server only routes them, never reads them
-  socket.on("offer", ({ to, sdp }: ForwardPayload) => {
-    sockets.get(to)?.emit("offer", { from: socket.id, identityKey: socket.identityKey, sdp });
+  socket.on("offer", (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return;
+    const { to, sdp } = payload as ForwardPayload;
+    if (typeof to !== "string" || !sdp) return;
+
+    // verify sender and receiver are in the same room
+    const senderRoom = socketRooms.get(socket.id);
+    const targetRoom = socketRooms.get(to);
+    if (!senderRoom || senderRoom !== targetRoom) return;
+
+    sockets.get(to)?.emit("offer", {
+      from: socket.id,
+      identityKey: socket.identityKey,
+      sdp,
+    });
   });
 
-  socket.on("answer", ({ to, sdp }: ForwardPayload) => {
+  socket.on("answer", (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return;
+    const { to, sdp } = payload as ForwardPayload;
+    if (typeof to !== "string" || !sdp) return;
+
+    // verify sender and receiver are in the same room
+    const senderRoom = socketRooms.get(socket.id);
+    const targetRoom = socketRooms.get(to);
+    if (!senderRoom || senderRoom !== targetRoom) return;
+
     sockets.get(to)?.emit("answer", { from: socket.id, sdp });
   });
 
-  socket.on("ice-candidate", ({ to, candidate }: IceCandidatePayload) => {
+  socket.on("ice-candidate", (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return;
+    const { to, candidate } = payload as IceCandidatePayload;
+    if (typeof to !== "string" || !candidate) return;
+
+    // verify sender and receiver are in the same room
+    const senderRoom = socketRooms.get(socket.id);
+    const targetRoom = socketRooms.get(to);
+    if (!senderRoom || senderRoom !== targetRoom) return;
+
     sockets.get(to)?.emit("ice-candidate", { from: socket.id, candidate });
   });
 
   socket.ioSocket.on("disconnect", () => {
     console.log("[-] disconnected: ", socket.id);
     sockets.delete(socket.id);
+    socketRooms.delete(socket.id);
 
     rooms.forEach((room, roomId) => {
       if (!room.has(socket.id)) return;

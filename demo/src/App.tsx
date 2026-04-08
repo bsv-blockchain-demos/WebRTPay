@@ -47,16 +47,9 @@ function App() {
     peers,
     roomId,
     error: signalingError,
-  } = useSignaling(wallet, "http://localhost:8080");
-
-  console.log({ socket });
-  console.log({ peers });
-  console.log({ roomId });
-  console.log({ signalingError });
+  } = useSignaling(wallet, import.meta.env.VITE_SIGNALING_URL);
 
   const { call, dataChannel, connected } = useWebRTC(socket);
-  console.log({ dataChannel });
-  console.log({ connected });
 
   useEffect(() => {
     const client = new WalletClient();
@@ -64,7 +57,6 @@ function App() {
       .getPublicKey({ identityKey: true })
       .then(() => {
         setWallet(client);
-        console.log("DASDADADASDAD");
       })
       .catch(() =>
         setError("Could not connect to wallet. Is BSV Desktop running?"),

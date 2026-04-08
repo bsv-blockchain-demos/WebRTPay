@@ -14,7 +14,9 @@ export function useSignaling(
   wallet: WalletInterface | null,
   serverUrl: string,
 ): UseSignalingResult {
-  const socketRef = useRef<ReturnType<typeof AuthSocketClient> | null>(null);
+  const [socket, setSocket] = useState<ReturnType<
+    typeof AuthSocketClient
+  > | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [roomId] = useState<string>(() => {
@@ -31,7 +33,7 @@ export function useSignaling(
     if (!wallet) return;
 
     const socket = AuthSocketClient(serverUrl, { wallet });
-    socketRef.current = socket;
+    setSocket(socket);
 
     socket.on("connect", () => {
       socket.emit("join-room", { roomId });
@@ -55,9 +57,9 @@ export function useSignaling(
 
     return () => {
       socket.disconnect();
-      socketRef.current = null;
+      setSocket(null);
     };
   }, [wallet, serverUrl, roomId]);
 
-  return { socket: socketRef.current, peers, roomId, error };
+  return { socket, peers, roomId, error };
 }
