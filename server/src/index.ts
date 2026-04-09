@@ -16,6 +16,13 @@ const app = express();
 const httpServer = createServer(app);
 const PORT = process.env.PORT ?? 8080;
 
+const shutdown = () => {
+  httpServer.close(() => process.exit(0));
+};
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
 const serverPrivateKey = process.env.SERVER_PRIVATE_KEY;
 if (!serverPrivateKey)
   throw new Error("SERVER_PRIVATE_KEY env var is required");
@@ -121,6 +128,18 @@ io.on("connection", (socket) => {
     if (!senderRoom || senderRoom !== targetRoom) return;
 
     sockets.get(to)?.emit("ice-candidate", { from: socket.id, candidate });
+  });
+
+  socket.on("reject", (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return;
+    const { to } = payload as { to: string };
+    if (typeof to !== "string") return;
+
+    const senderRoom = socketRooms.get(socket.id);
+    const targetRoom = socketRooms.get(to);
+    if (!senderRoom || senderRoom !== targetRoom) return;
+
+    sockets.get(to)?.emit("rejected", { from: socket.id });
   });
 
   socket.ioSocket.on("disconnect", () => {

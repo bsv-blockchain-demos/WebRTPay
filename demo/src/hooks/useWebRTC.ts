@@ -9,10 +9,24 @@ const STUN_CONFIG: RTCConfiguration = {
   ],
 };
 
+export interface IncomingCall {
+  from: string;
+  identityKey: string;
+  sdp: RTCSessionDescriptionInit;
+}
+
 interface UseWebRTCResult {
-  call: (socketId: string) => Promise<void>;
+  call: (socketId: string, identityKey: string) => Promise<void>;
+  acceptCall: () => Promise<void>;
+  rejectCall: () => void;
+  disconnect: () => void;
+  incomingCall: IncomingCall | null;
+  callRejected: boolean;
+  connecting: boolean;
   dataChannel: RTCDataChannel | null;
   connected: boolean;
+  peerDisconnected: boolean;
+  connectedPeerIdentityKey: string | null;
 }
 
 export function useWebRTC(
@@ -21,60 +35,34 @@ export function useWebRTC(
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const iceCandidateBuffer = useRef<RTCIceCandidateInit[]>([]);
   const remoteDescriptionSet = useRef(false);
+  const pendingOfferRef = useRef<IncomingCall | null>(null);
 
+  const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
+  const [callRejected, setCallRejected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [dataChannel, setDataChannel] = useState<RTCDataChannel | null>(null);
   const [connected, setConnected] = useState(false);
+  const [peerDisconnected, setPeerDisconnected] = useState(false);
+  const [connectedPeerIdentityKey, setConnectedPeerIdentityKey] = useState<string | null>(null);
 
   const getOrCreatePC = () => {
     if (pcRef.current) return pcRef.current;
-
     const pc = new RTCPeerConnection(STUN_CONFIG);
     pcRef.current = pc;
-
     return pc;
   };
 
   useEffect(() => {
     if (!socket) return;
 
-    socket.on("offer", async ({ from, sdp }: OfferMessage) => {
-      const pc = getOrCreatePC();
-
-      pc.ondatachannel = (event) => {
-        const channel = event.channel;
-        channel.onopen = () => {
-          setDataChannel(channel);
-          setConnected(true);
-        };
-        channel.onclose = () => {
-          setDataChannel(null);
-          setConnected(false);
-          remoteDescriptionSet.current = false;
-          iceCandidateBuffer.current = [];
-        };
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit("ice-candidate", {
-            to: from,
-            candidate: event.candidate,
-          });
-        }
-      };
-
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      remoteDescriptionSet.current = true;
-
-      // flush buffered candidates
-      for (const candidate of iceCandidateBuffer.current) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    socket.on("offer", ({ from, identityKey, sdp }: OfferMessage) => {
+      // Already connected — auto-reject the new offer
+      if (pcRef.current) {
+        socket.emit("reject", { to: from });
+        return;
       }
-      iceCandidateBuffer.current = [];
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("answer", { to: from, sdp: answer });
+      pendingOfferRef.current = { from, identityKey, sdp };
+      setIncomingCall({ from, identityKey, sdp });
     });
 
     socket.on("answer", async ({ sdp }: AnswerMessage) => {
@@ -95,6 +83,15 @@ export function useWebRTC(
       await pcRef.current?.addIceCandidate(new RTCIceCandidate(candidate));
     });
 
+    socket.on("rejected", () => {
+      pcRef.current?.close();
+      pcRef.current = null;
+      setConnecting(false);
+      setConnectedPeerIdentityKey(null);
+      setCallRejected(true);
+      setTimeout(() => setCallRejected(false), 3000);
+    });
+
     return () => {
       pcRef.current?.close();
       pcRef.current = null;
@@ -103,33 +100,94 @@ export function useWebRTC(
     };
   }, [socket]);
 
-  const call = async (targetSocketId: string) => {
-    // reject any other connection if already connected
+  const acceptCall = async () => {
+    const offer = pendingOfferRef.current;
+    if (!offer || !socket) return;
+    pendingOfferRef.current = null;
+    setIncomingCall(null);
+
+    const pc = getOrCreatePC();
+    setPeerDisconnected(false);
+
+    pc.ondatachannel = (event) => {
+      const channel = event.channel;
+      const handleOpen = () => {
+        setDataChannel(channel);
+        setConnected(true);
+        setConnectedPeerIdentityKey(offer.identityKey);
+      };
+      channel.onclose = () => {
+        setDataChannel(null);
+        setPeerDisconnected(true);
+        pcRef.current = null;
+        remoteDescriptionSet.current = false;
+        iceCandidateBuffer.current = [];
+      };
+      // Channel may already be open by the time ondatachannel fires
+      if (channel.readyState === 'open') {
+        handleOpen();
+      } else {
+        channel.onopen = handleOpen;
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("ice-candidate", { to: offer.from, candidate: event.candidate });
+      }
+    };
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer.sdp));
+    remoteDescriptionSet.current = true;
+
+    for (const candidate of iceCandidateBuffer.current) {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    }
+    iceCandidateBuffer.current = [];
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit("answer", { to: offer.from, sdp: answer });
+  };
+
+  const rejectCall = () => {
+    const offer = pendingOfferRef.current;
+    pendingOfferRef.current = null;
+    setIncomingCall(null);
+    if (offer && socket) {
+      socket.emit("reject", { to: offer.from });
+    }
+  };
+
+  const call = async (targetSocketId: string, targetIdentityKey: string) => {
     if (pcRef.current) {
       console.warn("Already connected to a peer");
       return;
     }
 
+    setPeerDisconnected(false);
+    setConnecting(true);
+    setConnectedPeerIdentityKey(targetIdentityKey);
+
     const pc = getOrCreatePC();
 
     const channel = pc.createDataChannel("payments");
     channel.onopen = () => {
+      setConnecting(false);
       setDataChannel(channel);
       setConnected(true);
     };
     channel.onclose = () => {
       setDataChannel(null);
-      setConnected(false);
+      setPeerDisconnected(true);
+      pcRef.current = null;
       remoteDescriptionSet.current = false;
       iceCandidateBuffer.current = [];
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket?.emit("ice-candidate", {
-          to: targetSocketId,
-          candidate: event.candidate,
-        });
+        socket?.emit("ice-candidate", { to: targetSocketId, candidate: event.candidate });
       }
     };
 
@@ -138,5 +196,29 @@ export function useWebRTC(
     socket?.emit("offer", { to: targetSocketId, sdp: offer });
   };
 
-  return { call, dataChannel, connected };
+  const disconnect = () => {
+    pcRef.current?.close();
+    pcRef.current = null;
+    setConnecting(false);
+    setDataChannel(null);
+    setConnected(false);
+    setPeerDisconnected(false);
+    setConnectedPeerIdentityKey(null);
+    iceCandidateBuffer.current = [];
+    remoteDescriptionSet.current = false;
+  };
+
+  return {
+    call,
+    acceptCall,
+    rejectCall,
+    disconnect,
+    incomingCall,
+    callRejected,
+    connecting,
+    dataChannel,
+    connected,
+    peerDisconnected,
+    connectedPeerIdentityKey,
+  };
 }

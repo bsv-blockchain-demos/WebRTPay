@@ -1,692 +1,276 @@
-import { useState, useEffect, useRef } from "react";
-import {
-  createConnectionManager,
-  ConnectionManager,
-  ConnectionState,
-  ConnectionEvent,
-  PaymentMessage,
-  PaymentMessageTypes,
-  QRBootstrap,
-  isWebRTCSupported,
-  getBrowserInfo,
-} from "../../src";
+import { useState, useEffect } from "react";
 import { WalletClient, WalletInterface } from "@bsv/sdk";
+import QRCode from "qrcode";
 import { useSignaling } from "./hooks/useSignaling";
 import { useWebRTC } from "./hooks/useWebRTC";
 
-type Mode = "create" | "join";
-type Method = "qr" | "remote";
-
 function App() {
   const [wallet, setWallet] = useState<WalletInterface | null>(null);
-  const [mode, setMode] = useState<Mode>("create");
-  const [method, setMethod] = useState<Method>("qr");
-  const [manager, setManager] = useState<ConnectionManager | null>(null);
-  const [connectionState, setConnectionState] = useState<ConnectionState>(
-    ConnectionState.IDLE,
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [messageInput, setMessageInput] = useState("");
+  type ChatMessage = { sender: 'you' | 'peer'; text: string; timestamp: number };
+  const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
+
+  const signalingUrl =
+    import.meta.env.VITE_SIGNALING_URL ?? "http://localhost:8080";
+  const { socket, peers, roomId, error: signalingError } = useSignaling(
+    wallet,
+    signalingUrl,
   );
-  const [qrCodeUrl, setQrCodeUrl] = useState<string>("");
-  const [answerQRCodeUrl, setAnswerQRCodeUrl] = useState<string>("");
-  const [waitingForAnswer, setWaitingForAnswer] = useState(false);
-  const [username, setUsername] = useState<string>("");
-  const [remoteUsername, setRemoteUsername] = useState<string>("");
-  const [messages, setMessages] = useState<PaymentMessage[]>([]);
-  const [messageInput, setMessageInput] = useState<string>("");
-  const [error, setError] = useState<string>("");
-  const [isScanning, setIsScanning] = useState(false);
-  const [scannerReady, setScannerReady] = useState(false);
-  const [stats, setStats] = useState({ sent: 0, received: 0 });
-  const [tokenJson, setTokenJson] = useState<string>("");
-  const [pasteInput, setPasteInput] = useState<string>("");
-
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const scannerRef = useRef<any>(null);
-
   const {
-    socket,
-    peers,
-    roomId,
-    error: signalingError,
-  } = useSignaling(wallet, import.meta.env.VITE_SIGNALING_URL);
-
-  const { call, dataChannel, connected } = useWebRTC(socket);
+    call,
+    acceptCall,
+    rejectCall,
+    disconnect,
+    incomingCall,
+    callRejected,
+    connecting,
+    dataChannel,
+    connected,
+    peerDisconnected,
+    connectedPeerIdentityKey,
+  } = useWebRTC(socket);
 
   useEffect(() => {
     const client = new WalletClient();
     client
       .getPublicKey({ identityKey: true })
-      .then(() => {
-        setWallet(client);
-      })
+      .then(() => setWallet(client))
       .catch(() =>
-        setError("Could not connect to wallet. Is BSV Desktop running?"),
+        setWalletError("Could not connect to wallet. Is BSV Desktop running?"),
       );
   }, []);
 
-  // Check WebRTC support on mount
   useEffect(() => {
-    if (!isWebRTCSupported()) {
-      setError("WebRTC is not supported in this browser");
-    }
+    if (!dataChannel || !connectedPeerIdentityKey) return;
+    dataChannel.onmessage = (event) => {
+      setMessages((prev) => ({
+        ...prev,
+        [connectedPeerIdentityKey]: [
+          ...(prev[connectedPeerIdentityKey] ?? []),
+          { sender: 'peer', text: event.data, timestamp: Date.now() },
+        ],
+      }));
+    };
+  }, [dataChannel, connectedPeerIdentityKey]);
 
-    const info = getBrowserInfo();
-    console.log("Browser info:", info);
-  }, []);
-
-  // Initialize connection manager
-  const initializeManager = () => {
-    if (manager) {
-      manager.close();
-    }
-
-    const newManager = createConnectionManager({
-      connectionTimeout: 30000,
-      autoRetry: true,
-      maxRetries: 3,
-    });
-
-    // Setup event listeners
-    newManager.getConnection().on(ConnectionEvent.STATE_CHANGE, ({ state }) => {
-      console.log("Connection state:", state);
-      setConnectionState(state);
-
-      if (state === ConnectionState.FAILED) {
-        setError("Connection failed. Please try again.");
-      }
-    });
-
-    newManager.onAnyMessage((message) => {
-      console.log("Message received:", message);
-      setMessages((prev) => [...prev, message]);
-      setStats((prev) => ({ ...prev, received: prev.received + 1 }));
-    });
-
-    setManager(newManager);
-    return newManager;
+  const handleCall = (socketId: string, identityKey: string) => {
+    setMessages((prev) => ({ ...prev, [identityKey]: prev[identityKey] ?? [] }));
+    call(socketId, identityKey);
   };
 
-  // Create QR connection (Step 1: Offerer generates QR)
-  const handleCreateQR = async () => {
-    try {
-      setError("");
-      const mgr = initializeManager();
-
-      // Use trickle ICE mode (single QR code with answer via data channel)
-      const { qrCodeDataUrl, token, isTrickleICE } =
-        await mgr.createQRConnection(true);
-      setQrCodeUrl(qrCodeDataUrl);
-      setTokenJson(JSON.stringify(token));
-      // In trickle ICE mode, no need to wait for answer QR code
-
-      // Log payload size for debugging
-      const payloadSize = QRBootstrap.estimatePayloadSize(token);
-      console.log(
-        `QR code payload size: ${payloadSize} bytes (${(payloadSize / 1024).toFixed(2)} KB)`,
-      );
-      console.log(
-        `ICE candidates included: ${token.iceCandidates?.length || 0}`,
-      );
-      console.log(`Trickle ICE mode (single QR code): ${isTrickleICE}`);
-    } catch (err) {
-      setError((err as Error).message);
-    }
+  const handleDisconnect = () => {
+    disconnect();
   };
 
-  // Start scanning QR code (Step 2: Answerer scans offer QR)
-  const handleStartScan = () => {
-    setError("");
-    setIsScanning(true);
+  const handleSend = () => {
+    if (!dataChannel || !messageInput.trim() || !connectedPeerIdentityKey) return;
+    dataChannel.send(messageInput);
+    setMessages((prev) => ({
+      ...prev,
+      [connectedPeerIdentityKey]: [
+        ...(prev[connectedPeerIdentityKey] ?? []),
+        { sender: 'you', text: messageInput, timestamp: Date.now() },
+      ],
+    }));
+    setMessageInput("");
   };
 
-  // Copy token JSON to clipboard
-  const handleCopyToken = async () => {
-    try {
-      await navigator.clipboard.writeText(tokenJson);
-      alert("Token copied to clipboard!");
-    } catch (err) {
-      console.error("Failed to copy:", err);
-      setError("Failed to copy to clipboard");
-    }
-  };
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [showQr, setShowQr] = useState(false);
+  const [peerSearch, setPeerSearch] = useState("");
 
-  // Connect using pasted token JSON
-  const handlePasteConnect = async () => {
-    try {
-      setError("");
-      const token = JSON.parse(pasteInput);
-      const mgr = manager || initializeManager();
-      const result = await mgr.joinQRConnection(token);
-
-      if (result.isTrickleICE) {
-        console.log(
-          ">>> Trickle ICE mode: answer will be sent via data channel",
-        );
-      } else if (result.answerQRCode) {
-        console.log(">>> Traditional mode: showing answer QR code");
-        setAnswerQRCodeUrl(result.answerQRCode);
-      }
-      setPasteInput("");
-    } catch (err) {
-      console.error("Failed to connect with pasted token:", err);
-      setError((err as Error).message);
-    }
-  };
-
-  // Start scanning answer QR code (Step 3: Offerer scans answer QR)
-  const handleScanAnswer = () => {
-    setError("");
-    setWaitingForAnswer(false);
-    setIsScanning(true);
-  };
-
-  // Initialize scanner when video element is ready
   useEffect(() => {
-    if (!isScanning || !videoRef.current || scannerRef.current) {
-      console.log("Scanner init skipped:", {
-        isScanning,
-        hasVideo: !!videoRef.current,
-        hasScanner: !!scannerRef.current,
-      });
-      return;
-    }
+    QRCode.toDataURL(window.location.href, { width: 200, margin: 1 }).then(setQrDataUrl);
+  }, [roomId]);
 
-    console.log("Initializing scanner...");
-    let mounted = true;
+  const activeMessages = connectedPeerIdentityKey
+    ? (messages[connectedPeerIdentityKey] ?? [])
+    : [];
 
-    const initScanner = async () => {
-      try {
-        console.log("Creating scanner on video element");
-
-        // Create scanner with callbacks
-        const scanner = await QRBootstrap.createScanner(
-          videoRef.current!,
-          async (data) => {
-            if (!mounted) return;
-            console.log("========================================");
-            console.log("QR code scanned successfully!");
-            console.log("Data type:", typeof data);
-            console.log("Data keys:", Object.keys(data));
-            console.log("Full data:", JSON.stringify(data, null, 2));
-            console.log('Has "a" key:', "a" in data);
-            console.log('Has "i" key:', "i" in data);
-            console.log('Has "offer" key:', "offer" in data);
-            console.log("========================================");
-
-            // Successfully scanned
-            stopScanner();
-
-            try {
-              // Check if this is an answer QR code or offer QR code
-              if ("a" in data && "i" in data) {
-                // This is an answer QR code (Step 3)
-                console.log(">>> DETECTED: Answer QR code");
-                console.log(">>> Manager exists:", !!manager);
-                if (manager) {
-                  console.log(">>> Calling completeQRConnection...");
-                  await manager.completeQRConnection(data as any);
-                  console.log(
-                    ">>> completeQRConnection completed successfully",
-                  );
-                } else {
-                  console.error(">>> ERROR: No manager available!");
-                  setError("Connection manager not initialized");
-                }
-              } else {
-                // This is an offer QR code (Step 2)
-                console.log(">>> DETECTED: Offer QR code");
-                const mgr = manager || initializeManager();
-                const result = await mgr.joinQRConnection(data);
-
-                // Check if this is trickle ICE or traditional mode
-                if (result.isTrickleICE) {
-                  console.log(
-                    ">>> Trickle ICE mode: answer will be sent via data channel",
-                  );
-                  // No QR code to show - answer sent through data channel
-                } else if (result.answerQRCode) {
-                  console.log(">>> Traditional mode: showing answer QR code");
-                  setAnswerQRCodeUrl(result.answerQRCode);
-                } else {
-                  setError("Failed to generate answer QR code");
-                }
-              }
-            } catch (err) {
-              console.error(">>> ERROR during QR processing:", err);
-              setError((err as Error).message);
-            }
-          },
-          (error) => {
-            console.error("Scan error:", error);
-            // Continue scanning on errors
-          },
-        );
-
-        if (mounted) {
-          console.log("Scanner created successfully");
-          scannerRef.current = scanner;
-          setScannerReady(true);
-        } else {
-          scanner.stop();
-          scanner.destroy();
-        }
-      } catch (err) {
-        console.error("Failed to initialize scanner:", err);
-        if (mounted) {
-          setError((err as Error).message);
-          setIsScanning(false);
-        }
-      }
-    };
-
-    initScanner();
-
-    return () => {
-      mounted = false;
-    };
-  }, [isScanning, manager]);
-
-  // Stop scanner
-  const stopScanner = () => {
-    if (scannerRef.current) {
-      QRBootstrap.stopScanner(scannerRef.current);
-      scannerRef.current = null;
-    }
-    setIsScanning(false);
-    setScannerReady(false);
-  };
-
-  // Create remote connection
-  const handleCreateRemote = async () => {
-    if (!username || username.length < 3) {
-      setError("Username must be at least 3 characters");
-      return;
-    }
-
-    try {
-      setError("");
-      const mgr = initializeManager();
-
-      await mgr.publishRemoteConnection(username);
-      setError(""); // Success
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  };
-
-  // Join remote connection
-  const handleJoinRemote = async () => {
-    if (!remoteUsername || remoteUsername.length < 3) {
-      setError("Username must be at least 3 characters");
-      return;
-    }
-
-    try {
-      setError("");
-      const mgr = initializeManager();
-
-      await mgr.joinRemoteConnection(remoteUsername);
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  };
-
-  // Send message
-  const handleSendMessage = async () => {
-    if (!manager || !messageInput.trim()) return;
-
-    try {
-      await manager.send(PaymentMessageTypes.PAYMENT_REQUEST, {
-        text: messageInput,
-        amount: 100,
-        currency: "USD",
-        recipient: "demo-recipient",
-      });
-
-      setMessageInput("");
-      setStats((prev) => ({ ...prev, sent: prev.sent + 1 }));
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  };
-
-  // Send test payment
-  const handleTestPayment = async () => {
-    if (!manager) return;
-
-    try {
-      await manager.send(PaymentMessageTypes.PAYMENT_REQUEST, {
-        amount: 50.0,
-        currency: "USD",
-        recipient: "test-user",
-        description: "Test payment",
-      });
-
-      setStats((prev) => ({ ...prev, sent: prev.sent + 1 }));
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  };
-
-  // Close connection
-  const handleClose = () => {
-    if (manager) {
-      manager.close();
-      setManager(null);
-    }
-    setConnectionState(ConnectionState.IDLE);
-    setQrCodeUrl("");
-    setAnswerQRCodeUrl("");
-    setWaitingForAnswer(false);
-    setMessages([]);
-    setStats({ sent: 0, received: 0 });
-    stopScanner();
-  };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (manager) {
-        manager.close();
-      }
-      stopScanner();
-    };
-  }, [manager]);
+  const showChat = (connected || peerDisconnected) && connectedPeerIdentityKey;
 
   return (
     <div className="app">
-      <h1>WebRTPay Demo</h1>
-
-      {/* Status Card */}
-      <div className="card">
-        <h2>Connection Status</h2>
-        <div className={`status ${connectionState}`}>
-          {connectionState.toUpperCase()}
-        </div>
-
-        {error && <div className="error">{error}</div>}
-
-        <div>Room: {roomId}</div>
-        <div>Peers: {peers.length}</div>
-        {peers.map((peer) => (
-          <button key={peer.socketId} onClick={() => call(peer.socketId)}>
-            Connect to {peer.identityKey.slice(0, 8)}...
-          </button>
-        ))}
-        {connected && <div>Connected!</div>}
-
-        {connectionState === ConnectionState.IDLE && (
-          <>
-            <div className="tabs">
-              <button
-                className={`tab ${mode === "create" ? "active" : ""}`}
-                onClick={() => setMode("create")}
-              >
-                Create
-              </button>
-              <button
-                className={`tab ${mode === "join" ? "active" : ""}`}
-                onClick={() => setMode("join")}
-              >
-                Join
-              </button>
-            </div>
-
-            <div className="tabs">
-              <button
-                className={`tab ${method === "qr" ? "active" : ""}`}
-                onClick={() => setMethod("qr")}
-              >
-                QR Code
-              </button>
-              <button
-                className={`tab ${method === "remote" ? "active" : ""}`}
-                onClick={() => setMethod("remote")}
-              >
-                Remote
-              </button>
-            </div>
-
-            {/* Create Mode */}
-            {mode === "create" && (
-              <>
-                {method === "qr" ? (
-                  <>
-                    <p className="info-text">
-                      Generate a QR code for another device to scan
-                    </p>
-                    <button className="button" onClick={handleCreateQR}>
-                      Generate QR Code
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <p className="info-text">
-                      Publish your connection to a remote server
-                    </p>
-                    <input
-                      type="text"
-                      className="input"
-                      placeholder="Enter your username"
-                      value={username}
-                      onChange={(e) => setUsername(e.target.value)}
-                    />
-                    <button className="button" onClick={handleCreateRemote}>
-                      Publish Connection
-                    </button>
-                  </>
-                )}
-              </>
-            )}
-
-            {/* Join Mode */}
-            {mode === "join" && (
-              <>
-                {method === "qr" ? (
-                  <>
-                    <p className="info-text">
-                      Scan a QR code from another device or paste token JSON
-                    </p>
-                    <button className="button" onClick={handleStartScan}>
-                      Start Camera
-                    </button>
-                    <div
-                      style={{
-                        marginTop: "20px",
-                        borderTop: "1px solid #ccc",
-                        paddingTop: "20px",
-                      }}
-                    >
-                      <p className="info-text" style={{ marginBottom: "10px" }}>
-                        Or paste token JSON:
-                      </p>
-                      <textarea
-                        className="input"
-                        placeholder="Paste token JSON here..."
-                        value={pasteInput}
-                        onChange={(e) => setPasteInput(e.target.value)}
-                        style={{
-                          minHeight: "80px",
-                          fontFamily: "monospace",
-                          fontSize: "12px",
-                          marginBottom: "10px",
-                        }}
-                      />
-                      <button
-                        className="button"
-                        onClick={handlePasteConnect}
-                        disabled={!pasteInput.trim()}
-                      >
-                        Connect with Pasted Token
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <p className="info-text">
-                      Lookup and connect to a remote user
-                    </p>
-                    <input
-                      type="text"
-                      className="input"
-                      placeholder="Enter username to connect"
-                      value={remoteUsername}
-                      onChange={(e) => setRemoteUsername(e.target.value)}
-                    />
-                    <button className="button" onClick={handleJoinRemote}>
-                      Connect
-                    </button>
-                  </>
-                )}
-              </>
-            )}
-          </>
-        )}
-
-        {connectionState !== ConnectionState.IDLE &&
-          !answerQRCodeUrl &&
-          !waitingForAnswer && (
-            <button className="button secondary" onClick={handleClose}>
-              Close Connection
+      <header className="app-header">
+        <h1>WebRTPay</h1>
+        {wallet && (
+          <div className="room-badge">
+            <span className="room-label">Room</span>
+            <span className="room-id">{roomId.slice(0, 8)}...</span>
+            <button
+              className="copy-btn"
+              onClick={() => navigator.clipboard.writeText(window.location.href)}
+              title="Copy invite link"
+            >
+              Copy link
             </button>
+            <button
+              className="copy-btn"
+              onClick={() => setShowQr(prev => !prev)}
+              title="Show QR code"
+            >
+              {showQr ? 'Hide QR' : 'QR'}
+            </button>
+          </div>
+        )}
+      </header>
+
+      {walletError && <div className="alert alert-error">{walletError}</div>}
+      {signalingError && <div className="alert alert-error">{signalingError}</div>}
+      {callRejected && <div className="alert alert-error">Your connection request was rejected.</div>}
+      {connecting && connectedPeerIdentityKey && (
+        <div className="connecting-banner">
+          <div className="spinner connecting-spinner" />
+          Waiting for <span className="connecting-key">{connectedPeerIdentityKey.slice(0, 16)}...</span> to accept
+        </div>
+      )}
+
+      {incomingCall && (
+        <div className="incoming-call-card">
+          <div className="incoming-call-avatar">
+            {incomingCall.identityKey.slice(0, 2).toUpperCase()}
+          </div>
+          <div className="incoming-call-info">
+            <div className="incoming-call-label">Incoming connection</div>
+            <div className="incoming-call-key">{incomingCall.identityKey.slice(0, 16)}...</div>
+          </div>
+          <div className="incoming-call-actions">
+            <button className="accept-btn" onClick={acceptCall}>Accept</button>
+            <button className="reject-btn" onClick={rejectCall}>Reject</button>
+          </div>
+        </div>
+      )}
+
+      {!wallet && !walletError && (
+        <div className="loading">
+          <div className="spinner" />
+          <p>Connecting to wallet...</p>
+        </div>
+      )}
+
+      {showQr && qrDataUrl && (
+        <div className="qr-panel">
+          <img src={qrDataUrl} alt="Room QR code" className="room-qr" />
+          <p className="empty-hint">Scan to join this room</p>
+        </div>
+      )}
+
+      {wallet && !showChat && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Peers in room</h2>
+            <span className="peer-count">{peers.length} online</span>
+          </div>
+
+          {peers.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">👥</div>
+              <p>Waiting for others to join...</p>
+              <p className="empty-hint">Share the link to invite someone</p>
+            </div>
+          ) : (
+            <div className="peer-list">
+              <input
+                className="peer-search"
+                value={peerSearch}
+                onChange={(e) => setPeerSearch(e.target.value)}
+                placeholder="Search by identity key..."
+              />
+              {peers.filter(p => p.identityKey.toLowerCase().includes(peerSearch.toLowerCase())).map((peer) => {
+                const history = messages[peer.identityKey];
+                return (
+                  <button
+                    key={peer.socketId}
+                    className="peer-item"
+                    onClick={() => handleCall(peer.socketId, peer.identityKey)}
+                  >
+                    <div className="peer-avatar">
+                      {peer.identityKey.slice(0, 2).toUpperCase()}
+                    </div>
+                    <div className="peer-info">
+                      <div className="peer-key">
+                        {peer.identityKey.slice(0, 16)}...
+                      </div>
+                      {history?.length ? (
+                        <div className="peer-history">
+                          {history.length} previous message{history.length !== 1 ? 's' : ''}
+                        </div>
+                      ) : (
+                        <div className="peer-history">Click to connect</div>
+                      )}
+                    </div>
+                    <div className="peer-arrow">→</div>
+                  </button>
+                );
+              })}
+            </div>
           )}
-      </div>
-
-      {/* Offer QR Code Display (Step 1) */}
-      {qrCodeUrl && !answerQRCodeUrl && (
-        <div className="card">
-          <h2>Step 1: Show QR Code</h2>
-          <div className="qr-container">
-            <img src={qrCodeUrl} alt="QR Code" className="qr-code" />
-            <p className="info-text">Have the other device scan this code</p>
-          </div>
-          <button className="button secondary" onClick={handleCopyToken}>
-            Copy Token JSON
-          </button>
-          <details style={{ marginTop: "10px" }}>
-            <summary style={{ cursor: "pointer", padding: "5px" }}>
-              Show Token JSON
-            </summary>
-            <textarea
-              readOnly
-              value={tokenJson}
-              style={{
-                width: "100%",
-                minHeight: "100px",
-                fontFamily: "monospace",
-                fontSize: "10px",
-                marginTop: "10px",
-                padding: "8px",
-              }}
-            />
-          </details>
         </div>
       )}
 
-      {/* Answer QR Code Display (Step 2) */}
-      {answerQRCodeUrl && (
-        <div className="card">
-          <h2>Step 2: Show This Answer QR Code</h2>
-          <div className="qr-container">
-            <img
-              src={answerQRCodeUrl}
-              alt="Answer QR Code"
-              className="qr-code"
-            />
-            <p className="info-text">
-              Show this code to the other device to complete the connection
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Video Scanner */}
-      {isScanning && (
-        <div className="card">
-          <h2>
-            {scannerReady ? "Scanning QR Code..." : "Initializing Camera..."}
-          </h2>
-          <div className="video-container" style={{ position: "relative" }}>
-            <video
-              ref={videoRef}
-              className="video"
-              autoPlay
-              playsInline
-              muted
-              style={{ width: "100%", maxWidth: "100%", display: "block" }}
-            />
-            {!scannerReady && (
-              <div
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  background: "rgba(0,0,0,0.7)",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "white",
-                  fontSize: "16px",
-                }}
-              >
-                Starting camera...
+      {showChat && connectedPeerIdentityKey && (
+        <div className="card chat-card">
+          <div className="chat-header">
+            <div className="chat-peer">
+              <div className="peer-avatar">
+                {connectedPeerIdentityKey.slice(0, 2).toUpperCase()}
               </div>
-            )}
-          </div>
-          <p className="info-text">
-            {scannerReady
-              ? "Point your camera at the QR code"
-              : "Please allow camera access when prompted"}
-          </p>
-          <button className="button secondary" onClick={stopScanner}>
-            Cancel
-          </button>
-        </div>
-      )}
-
-      {/* Messaging */}
-      {connectionState === ConnectionState.CONNECTED && (
-        <div className="card">
-          <h2>Messages</h2>
-
-          <div className="stats">
-            <div className="stat">
-              <div className="stat-value">{stats.sent}</div>
-              <div className="stat-label">Sent</div>
+              <div>
+                <div
+                  className="peer-key peer-key-clickable"
+                  onClick={() => navigator.clipboard.writeText(connectedPeerIdentityKey)}
+                  title="Click to copy full identity key"
+                >{connectedPeerIdentityKey.slice(0, 16)}...</div>
+                <div className={`connection-status ${peerDisconnected ? 'disconnected' : 'connected'}`}>
+                  {peerDisconnected ? 'Disconnected' : 'Connected'}
+                </div>
+              </div>
             </div>
-            <div className="stat">
-              <div className="stat-value">{stats.received}</div>
-              <div className="stat-label">Received</div>
-            </div>
+            <button className="disconnect-btn" onClick={handleDisconnect}>
+              {peerDisconnected ? 'Back' : 'Disconnect'}
+            </button>
           </div>
 
           <div className="messages">
-            {messages.map((msg, idx) => (
-              <div key={idx} className="message received">
-                <div className="message-type">{msg.type}</div>
-                <pre>{JSON.stringify(msg.payload, null, 2)}</pre>
-                <div className="message-time">
-                  {new Date(msg.timestamp).toLocaleTimeString()}
-                </div>
+            {activeMessages.length === 0 && (
+              <div className="empty-state">
+                <p>No messages yet. Say hello!</p>
               </div>
-            ))}
+            )}
+            {activeMessages.map((msg, i) => {
+              const isYou = msg.sender === 'you';
+              const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+              return (
+                <div key={i} className={`message ${isYou ? 'message-you' : 'message-peer'}`}>
+                  <div className="message-label">
+                    {isYou ? 'You' : connectedPeerIdentityKey.slice(0, 10) + '...'}
+                    <span className="message-time">{time}</span>
+                  </div>
+                  <div className="message-text">{msg.text}</div>
+                </div>
+              )
+            })}
           </div>
 
-          <input
-            type="text"
-            className="input"
-            placeholder="Enter message"
-            value={messageInput}
-            onChange={(e) => setMessageInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
-          />
-          <button className="button" onClick={handleSendMessage}>
-            Send Message
-          </button>
-          <button className="button secondary" onClick={handleTestPayment}>
-            Send Test Payment
-          </button>
+          {connected && (
+            <div className="chat-input-row">
+              <input
+                className="chat-input"
+                value={messageInput}
+                onChange={(e) => setMessageInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleSend()}
+                placeholder="Send a message..."
+              />
+              <button
+                className="send-btn"
+                onClick={handleSend}
+                disabled={!messageInput.trim()}
+              >
+                Send
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
