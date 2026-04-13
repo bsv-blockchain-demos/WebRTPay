@@ -248,6 +248,12 @@ coturn:
 
 ### DO NOT use this configuration in production!
 
+> **Security note:** The current dev setup exposes TURN credentials via `VITE_TURN_*` environment variables, which are baked into the client JS bundle at build time. Anyone can extract them and abuse your relay. For production, replace static credentials with **server-issued short-lived tokens** using coturn's time-limited credential mechanism:
+> 1. Set `use-auth-secret` and `static-auth-secret=<strong-secret>` in `turnserver.conf`
+> 2. Add a `/turn-credentials` endpoint to the signaling server that computes `HMAC-SHA1(timestamp:username, secret)` and returns tokens expiring in ~1 hour
+> 3. Have the client fetch credentials from that endpoint instead of reading from `import.meta.env`
+> 4. coturn independently verifies the HMAC — expired or forged tokens are rejected
+
 For production deployments:
 
 1. **Enable TLS/DTLS:**
