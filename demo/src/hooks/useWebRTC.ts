@@ -43,7 +43,9 @@ export function useWebRTC(
   const [dataChannel, setDataChannel] = useState<RTCDataChannel | null>(null);
   const [connected, setConnected] = useState(false);
   const [peerDisconnected, setPeerDisconnected] = useState(false);
-  const [connectedPeerIdentityKey, setConnectedPeerIdentityKey] = useState<string | null>(null);
+  const [connectedPeerIdentityKey, setConnectedPeerIdentityKey] = useState<
+    string | null
+  >(null);
 
   const getOrCreatePC = () => {
     if (pcRef.current) return pcRef.current;
@@ -89,6 +91,8 @@ export function useWebRTC(
       setConnecting(false);
       setConnectedPeerIdentityKey(null);
       setCallRejected(true);
+      setDataChannel(null);
+      setConnected(false);
       setTimeout(() => setCallRejected(false), 3000);
     });
 
@@ -124,7 +128,7 @@ export function useWebRTC(
         iceCandidateBuffer.current = [];
       };
       // Channel may already be open by the time ondatachannel fires
-      if (channel.readyState === 'open') {
+      if (channel.readyState === "open") {
         handleOpen();
       } else {
         channel.onopen = handleOpen;
@@ -133,7 +137,10 @@ export function useWebRTC(
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket.emit("ice-candidate", { to: offer.from, candidate: event.candidate });
+        socket.emit("ice-candidate", {
+          to: offer.from,
+          candidate: event.candidate,
+        });
       }
     };
 
@@ -187,7 +194,10 @@ export function useWebRTC(
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket?.emit("ice-candidate", { to: targetSocketId, candidate: event.candidate });
+        socket?.emit("ice-candidate", {
+          to: targetSocketId,
+          candidate: event.candidate,
+        });
       }
     };
 
