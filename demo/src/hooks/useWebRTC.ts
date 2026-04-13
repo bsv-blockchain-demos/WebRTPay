@@ -2,12 +2,24 @@ import { useEffect, useRef, useState } from "react";
 import { AuthSocketClient } from "@bsv/authsocket-client";
 import { OfferMessage, AnswerMessage, IceCandidateMessage } from "../types";
 
-const STUN_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+const iceServers: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+const turnUrl = import.meta.env.VITE_TURN_URL;
+const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+if (turnUrl && turnUsername && turnCredential) {
+  iceServers.push({
+    urls: turnUrl,
+    username: turnUsername,
+    credential: turnCredential,
+  });
+}
+
+const STUN_CONFIG: RTCConfiguration = { iceServers };
 
 export interface IncomingCall {
   from: string;
