@@ -7,13 +7,7 @@ export default defineConfig({
   server: {
     port: 3000,
     host: true,
-    allowedHosts: [
-      "localhost",
-      "127.0.0.1",
-      "0.0.0.0",
-      "deggen.ngrok.app",
-      "0198-2a02-a315-43da-ae80-4154-a432-ad33-c3a9.ngrok-free.app",
-    ],
+    allowedHosts: ["localhost", "127.0.0.1", "0.0.0.0", "deggen.ngrok.app"],
   },
   resolve: {
     alias: {
