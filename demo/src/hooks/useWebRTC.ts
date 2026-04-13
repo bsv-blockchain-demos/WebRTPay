@@ -63,6 +63,13 @@ export function useWebRTC(
         socket.emit("reject", { to: from });
         return;
       }
+      // Already have a pending offer waiting for
+      // user input — auto-reject
+      if (pendingOfferRef.current) {
+        socket.emit("reject", { to: from });
+        return;
+      }
+
       pendingOfferRef.current = { from, identityKey, sdp };
       setIncomingCall({ from, identityKey, sdp });
     });
@@ -167,6 +174,10 @@ export function useWebRTC(
   };
 
   const call = async (targetSocketId: string, targetIdentityKey: string) => {
+    if (!socket) {
+      console.warn("Cannot call: socket not connected");
+      return;
+    }
     if (pcRef.current) {
       console.warn("Already connected to a peer");
       return;
