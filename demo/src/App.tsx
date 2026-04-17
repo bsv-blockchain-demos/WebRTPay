@@ -1,14 +1,25 @@
 import { useState, useEffect } from "react";
-import { WalletClient, WalletInterface, PublicKey, P2PKH } from "@bsv/sdk";
+import { WalletClient, WalletInterface, Brc29RemittanceModule, Transaction } from "@bsv/sdk";
 import QRCode from "qrcode";
 import { useSignaling } from "./hooks/useSignaling";
 import { useWebRTC } from "./hooks/useWebRTC";
 import {
   ChannelMessage,
+  PaymentToken,
   PaymentRequest,
   PaymentResponse,
   PaymentDeclined,
 } from "./types";
+
+const SETTLEMENT_MODULE = new Brc29RemittanceModule({
+  protocolID: [2, "3241645161d8"],
+  labels: ["webrtpay"],
+  description: "WebRTPay payment",
+  outputDescription: "WebRTPay payment",
+  internalizeProtocol: "wallet payment",
+  refundFeeSatoshis: 1000,
+  minRefundSatoshis: 1000,
+});
 
 type PaymentHistoryEntry = {
   requestId: string;
@@ -69,7 +80,7 @@ function App() {
   }, [roomId]);
 
   useEffect(() => {
-    if (!dataChannel || !connectedPeerIdentityKey) return;
+    if (!dataChannel || !connectedPeerIdentityKey || !wallet) return;
     dataChannel.onmessage = (event: MessageEvent) => {
       let msg: ChannelMessage;
       try {
@@ -81,15 +92,40 @@ function App() {
         case "payment-request":
           setIncomingRequest(msg);
           break;
-        case "payment-response":
-          setPaymentHistory((prev) =>
-            prev.map((e) =>
-              e.requestId === msg.requestId
-                ? { ...e, status: "paid" as const, txid: msg.txid }
-                : e,
-            ),
-          );
+        case "payment-response": {
+          const { requestId, txid, token } = msg;
+          void (async () => {
+            try {
+              const result = await SETTLEMENT_MODULE.acceptSettlement(
+                {
+                  threadId: "webrtpay",
+                  sender: connectedPeerIdentityKey,
+                  settlement: {
+                    customInstructions: token.customInstructions,
+                    transaction: token.transaction,
+                    amountSatoshis: token.amount,
+                    outputIndex: token.outputIndex ?? 0,
+                  },
+                },
+                { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
+              );
+              if (result.action === "terminate") {
+                setPaymentError(result.termination.message);
+                return;
+              }
+              setPaymentHistory((prev) =>
+                prev.map((e) =>
+                  e.requestId === requestId ? { ...e, status: "paid" as const, txid } : e,
+                ),
+              );
+            } catch (err) {
+              setPaymentError(
+                err instanceof Error ? err.message : "Failed to internalize payment.",
+              );
+            }
+          })();
           break;
+        }
         case "payment-declined":
           setPaymentHistory((prev) =>
             prev.map((e) =>
@@ -106,7 +142,7 @@ function App() {
           break;
       }
     };
-  }, [dataChannel, connectedPeerIdentityKey]);
+  }, [dataChannel, connectedPeerIdentityKey, wallet]);
 
   const handleCall = (socketId: string, identityKey: string) => {
     call(socketId, identityKey);
@@ -177,24 +213,42 @@ function App() {
     if (!wallet || !dataChannel || !incomingRequest || !connectedPeerIdentityKey) return;
     setPaymentError(null);
     try {
-      const pubKey = PublicKey.fromString(connectedPeerIdentityKey);
-      const lockingScript = new P2PKH().lock(pubKey.toAddress());
-
-      const result = await wallet.createAction({
-        description: incomingRequest.description,
-        outputs: [
-          {
-            lockingScript: lockingScript.toHex(),
-            satoshis: incomingRequest.amount,
-            outputDescription: incomingRequest.description,
+      const result = await SETTLEMENT_MODULE.buildSettlement(
+        {
+          threadId: "webrtpay",
+          option: {
+            amountSatoshis: incomingRequest.amount,
+            payee: connectedPeerIdentityKey,
+            labels: ["webrtpay"],
+            description: incomingRequest.description,
           },
-        ],
-      });
+        },
+        { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
+      );
+
+      if (result.action === "terminate") {
+        throw new Error(result.termination.message);
+      }
+
+      const token: PaymentToken = {
+        customInstructions: {
+          derivationPrefix: result.artifact.customInstructions.derivationPrefix as string,
+          derivationSuffix: result.artifact.customInstructions.derivationSuffix as string,
+        },
+        transaction: Array.isArray(result.artifact.transaction)
+          ? result.artifact.transaction
+          : Array.from(result.artifact.transaction as Uint8Array),
+        amount: result.artifact.amountSatoshis,
+      };
+
+      const tx = Transaction.fromAtomicBEEF(token.transaction);
+      const txid = tx.id("hex");
 
       const response: PaymentResponse = {
         type: "payment-response",
         requestId: incomingRequest.requestId,
-        txid: result.txid ?? "",
+        txid,
+        token,
       };
       dataChannel.send(JSON.stringify(response));
       setPaymentHistory((prev) => [
@@ -205,7 +259,7 @@ function App() {
           amount: incomingRequest.amount,
           description: incomingRequest.description,
           status: "paid",
-          txid: result.txid,
+          txid,
         },
       ]);
       setIncomingRequest(null);
@@ -406,8 +460,19 @@ function App() {
                 <p className="payment-entry-description">{entry.description}</p>
                 <div className={`payment-entry-status status-${entry.status}`}>
                   {entry.status === "pending" && "Waiting for payment..."}
-                  {entry.status === "paid" &&
-                    `Paid${entry.txid ? ` · ${entry.txid.slice(0, 12)}...` : ""}`}
+                  {entry.status === "paid" && (
+                    <>
+                      Paid{entry.txid && (
+                        <span
+                          className="txid-link"
+                          onClick={() => navigator.clipboard.writeText(entry.txid!)}
+                          title="Click to copy txid"
+                        >
+                          {" · "}{entry.txid.slice(0, 12)}...
+                        </span>
+                      )}
+                    </>
+                  )}
                   {entry.status === "declined" && "Declined"}
                   {entry.status === "cancelled" && "Cancelled"}
                 </div>

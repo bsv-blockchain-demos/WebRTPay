@@ -31,10 +31,21 @@ export interface PaymentRequest {
   requestProof: string       // HMAC proof binding this request to the counterparty
 }
 
+export interface PaymentToken {
+  customInstructions: {
+    derivationPrefix: string
+    derivationSuffix: string
+  }
+  transaction: number[]      // AtomicBEEF serialized as number array for JSON transport
+  amount: number
+  outputIndex?: number
+}
+
 export interface PaymentResponse {
   type: 'payment-response'
   requestId: string          // references the original PaymentRequest
-  txid: string               // BSV transaction ID after wallet.createAction()
+  txid: string               // transaction ID for display
+  token: PaymentToken        // full settlement token — receiver calls internalizeAction on this
 }
 
 export interface PaymentDeclined {

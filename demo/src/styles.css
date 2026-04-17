@@ -532,6 +532,17 @@ h1 {
 .status-declined { color: #f87171; }
 .status-cancelled { color: #6b7280; }
 
+.txid-link {
+  font-family: monospace;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s;
+}
+
+.txid-link:hover {
+  opacity: 1;
+}
+
 /* Payment form */
 .payment-form {
   display: flex;
