@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { WalletClient, WalletInterface, Brc29RemittanceModule, Transaction } from "@bsv/sdk";
 import QRCode from "qrcode";
 import { useSignaling } from "./hooks/useSignaling";
@@ -39,6 +39,8 @@ function App() {
   const [descriptionInput, setDescriptionInput] = useState("");
   const [incomingRequest, setIncomingRequest] = useState<PaymentRequest | null>(null);
   const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryEntry[]>([]);
+  const paymentHistoryRef = useRef<PaymentHistoryEntry[]>([]);
+  paymentHistoryRef.current = paymentHistory;
   const [isRequesting, setIsRequesting] = useState(false);
   const [paymentError, setPaymentError] = useState<string | null>(null);
 
@@ -93,9 +95,14 @@ function App() {
           setIncomingRequest(msg);
           break;
         case "payment-response": {
-          const { requestId, txid, token } = msg;
+          const { requestId, token } = msg;
+          const isPending = paymentHistoryRef.current.some(
+            (e) => e.requestId === requestId && e.direction === "sent" && e.status === "pending",
+          );
+          if (!isPending) break;
           void (async () => {
             try {
+              const localTxid = Transaction.fromAtomicBEEF(token.transaction).id("hex");
               const result = await SETTLEMENT_MODULE.acceptSettlement(
                 {
                   threadId: "webrtpay",
@@ -115,7 +122,7 @@ function App() {
               }
               setPaymentHistory((prev) =>
                 prev.map((e) =>
-                  e.requestId === requestId ? { ...e, status: "paid" as const, txid } : e,
+                  e.requestId === requestId ? { ...e, status: "paid" as const, txid: localTxid } : e,
                 ),
               );
             } catch (err) {
@@ -275,6 +282,16 @@ function App() {
       requestId: incomingRequest.requestId,
     };
     dataChannel.send(JSON.stringify(msg));
+    setPaymentHistory((prev) => [
+      ...prev,
+      {
+        requestId: incomingRequest.requestId,
+        direction: "received",
+        amount: incomingRequest.amount,
+        description: incomingRequest.description,
+        status: "declined",
+      },
+    ]);
     setIncomingRequest(null);
   };
 
