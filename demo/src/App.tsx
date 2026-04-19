@@ -91,9 +91,29 @@ function App() {
         return;
       }
       switch (msg.type) {
-        case "payment-request":
-          setIncomingRequest(msg);
+        case "payment-request": {
+          void (async () => {
+            try {
+              const encoder = new TextEncoder();
+              const data = Array.from(encoder.encode(msg.requestId + myIdentityKey));
+              const hmac = Array.from(
+                { length: msg.requestProof.length / 2 },
+                (_, i) => parseInt(msg.requestProof.slice(i * 2, i * 2 + 2), 16),
+              );
+              const { valid } = await wallet.verifyHmac({
+                data,
+                hmac,
+                protocolID: [2, "payment request auth"],
+                keyID: msg.requestId,
+                counterparty: msg.senderIdentityKey,
+              });
+              if (valid) setIncomingRequest(msg);
+            } catch {
+              // verification failed — silently ignore malformed request
+            }
+          })();
           break;
+        }
         case "payment-response": {
           const { requestId, token } = msg;
           const isPending = paymentHistoryRef.current.some(
@@ -101,34 +121,48 @@ function App() {
           );
           if (!isPending) break;
           void (async () => {
-            try {
-              const localTxid = Transaction.fromAtomicBEEF(token.transaction).id("hex");
-              const result = await SETTLEMENT_MODULE.acceptSettlement(
-                {
-                  threadId: "webrtpay",
-                  sender: connectedPeerIdentityKey,
-                  settlement: {
-                    customInstructions: token.customInstructions,
-                    transaction: token.transaction,
-                    amountSatoshis: token.amount,
-                    outputIndex: token.outputIndex ?? 0,
+            const localTxid = Transaction.fromAtomicBEEF(token.transaction).id("hex");
+            const MAX_RETRIES = 5;
+            const RETRY_DELAY_MS = 700;
+            let attempt = 0;
+            while (attempt <= MAX_RETRIES) {
+              try {
+                const result = await SETTLEMENT_MODULE.acceptSettlement(
+                  {
+                    threadId: "webrtpay",
+                    sender: connectedPeerIdentityKey,
+                    settlement: {
+                      customInstructions: token.customInstructions,
+                      transaction: token.transaction,
+                      amountSatoshis: token.amount,
+                      outputIndex: token.outputIndex ?? 0,
+                    },
                   },
-                },
-                { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
-              );
-              if (result.action === "terminate") {
-                setPaymentError(result.termination.message);
+                  { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
+                );
+                if (result.action === "terminate") {
+                  setPaymentError(result.termination.message);
+                  return;
+                }
+                setPaymentHistory((prev) =>
+                  prev.map((e) =>
+                    e.requestId === requestId ? { ...e, status: "paid" as const, txid: localTxid } : e,
+                  ),
+                );
                 return;
+              } catch (err) {
+                const isSending =
+                  err instanceof Error && err.message.includes('"sending"');
+                if (isSending && attempt < MAX_RETRIES) {
+                  attempt++;
+                  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+                } else {
+                  setPaymentError(
+                    err instanceof Error ? err.message : "Failed to internalize payment.",
+                  );
+                  return;
+                }
               }
-              setPaymentHistory((prev) =>
-                prev.map((e) =>
-                  e.requestId === requestId ? { ...e, status: "paid" as const, txid: localTxid } : e,
-                ),
-              );
-            } catch (err) {
-              setPaymentError(
-                err instanceof Error ? err.message : "Failed to internalize payment.",
-              );
             }
           })();
           break;
@@ -218,6 +252,11 @@ function App() {
 
   const handleAcceptPayment = async () => {
     if (!wallet || !dataChannel || !incomingRequest || !connectedPeerIdentityKey) return;
+    if (incomingRequest.expiresAt <= Date.now()) {
+      setIncomingRequest(null);
+      setPaymentError("Payment request has expired.");
+      return;
+    }
     setPaymentError(null);
     try {
       const result = await SETTLEMENT_MODULE.buildSettlement(
