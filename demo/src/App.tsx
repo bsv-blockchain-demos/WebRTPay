@@ -9,6 +9,7 @@ import {
   PaymentRequest,
   PaymentResponse,
   PaymentDeclined,
+  PaymentExpired,
 } from "./types";
 
 const SETTLEMENT_MODULE = new Brc29RemittanceModule({
@@ -26,7 +27,7 @@ type PaymentHistoryEntry = {
   direction: "sent" | "received";
   amount: number;
   description: string;
-  status: "pending" | "paid" | "declined" | "cancelled";
+  status: "pending" | "paid" | "declined" | "expired" | "cancelled";
   txid?: string;
 };
 
@@ -82,7 +83,29 @@ function App() {
   }, [roomId]);
 
   useEffect(() => {
-    if (!dataChannel || !connectedPeerIdentityKey || !wallet) return;
+    if (!incomingRequest || !dataChannel) return;
+    const remaining = incomingRequest.expiresAt - Date.now();
+    if (remaining <= 0) return;
+    const timer = setTimeout(() => {
+      const msg: PaymentExpired = { type: "payment-expired", requestId: incomingRequest.requestId };
+      dataChannel.send(JSON.stringify(msg));
+      setPaymentHistory((prev) => [
+        ...prev,
+        {
+          requestId: incomingRequest.requestId,
+          direction: "received",
+          amount: incomingRequest.amount,
+          description: incomingRequest.description,
+          status: "expired",
+        },
+      ]);
+      setIncomingRequest(null);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [incomingRequest, dataChannel]);
+
+  useEffect(() => {
+    if (!dataChannel || !connectedPeerIdentityKey || !wallet || !myIdentityKey) return;
     dataChannel.onmessage = (event: MessageEvent) => {
       let msg: ChannelMessage;
       try {
@@ -176,6 +199,15 @@ function App() {
             ),
           );
           break;
+        case "payment-expired":
+          setPaymentHistory((prev) =>
+            prev.map((e) =>
+              e.requestId === msg.requestId
+                ? { ...e, status: "expired" as const }
+                : e,
+            ),
+          );
+          break;
         case "payment-cancel":
           setIncomingRequest((prev) =>
             prev?.requestId === msg.requestId ? null : prev,
@@ -183,7 +215,7 @@ function App() {
           break;
       }
     };
-  }, [dataChannel, connectedPeerIdentityKey, wallet]);
+  }, [dataChannel, connectedPeerIdentityKey, wallet, myIdentityKey]);
 
   const handleCall = (socketId: string, identityKey: string) => {
     call(socketId, identityKey);
@@ -198,8 +230,8 @@ function App() {
 
   const handleRequestPayment = async () => {
     if (!wallet || !dataChannel || !connectedPeerIdentityKey || !myIdentityKey) return;
-    const amount = parseInt(amountInput);
-    if (isNaN(amount) || amount <= 0) return;
+    const amount = Number(amountInput);
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0) return;
 
     setIsRequesting(true);
     setPaymentError(null);
@@ -253,6 +285,21 @@ function App() {
   const handleAcceptPayment = async () => {
     if (!wallet || !dataChannel || !incomingRequest || !connectedPeerIdentityKey) return;
     if (incomingRequest.expiresAt <= Date.now()) {
+      const expired: PaymentExpired = {
+        type: "payment-expired",
+        requestId: incomingRequest.requestId,
+      };
+      dataChannel.send(JSON.stringify(expired));
+      setPaymentHistory((prev) => [
+        ...prev,
+        {
+          requestId: incomingRequest.requestId,
+          direction: "received",
+          amount: incomingRequest.amount,
+          description: incomingRequest.description,
+          status: "expired",
+        },
+      ]);
       setIncomingRequest(null);
       setPaymentError("Payment request has expired.");
       return;
@@ -477,21 +524,32 @@ function App() {
             </button>
           </div>
 
-          {incomingRequest && !peerDisconnected && (
-            <div className="payment-request-card">
-              <div className="payment-request-header">
-                <span className="payment-request-label">Payment requested</span>
-                <span className="payment-amount">
-                  {incomingRequest.amount.toLocaleString()} sats
-                </span>
+          {incomingRequest && !peerDisconnected && (() => {
+            const isExpired = incomingRequest.expiresAt <= Date.now();
+            return (
+              <div className="payment-request-card">
+                <div className="payment-request-header">
+                  <span className="payment-request-label">
+                    {isExpired ? "Request expired" : "Payment requested"}
+                  </span>
+                  <span className="payment-amount">
+                    {incomingRequest.amount.toLocaleString()} sats
+                  </span>
+                </div>
+                <p className="payment-description">{incomingRequest.description}</p>
+                <div className="payment-request-actions">
+                  <button
+                    className="accept-btn"
+                    onClick={handleAcceptPayment}
+                    disabled={isExpired}
+                  >
+                    Pay
+                  </button>
+                  <button className="reject-btn" onClick={handleDeclinePayment}>Decline</button>
+                </div>
               </div>
-              <p className="payment-description">{incomingRequest.description}</p>
-              <div className="payment-request-actions">
-                <button className="accept-btn" onClick={handleAcceptPayment}>Pay</button>
-                <button className="reject-btn" onClick={handleDeclinePayment}>Decline</button>
-              </div>
-            </div>
-          )}
+            );
+          })()}
 
           <div className="payment-history">
             {paymentHistory.length === 0 && (
@@ -530,6 +588,7 @@ function App() {
                     </>
                   )}
                   {entry.status === "declined" && "Declined"}
+                  {entry.status === "expired" && "Expired"}
                   {entry.status === "cancelled" && "Cancelled"}
                 </div>
               </div>
@@ -542,9 +601,11 @@ function App() {
                 className="chat-input"
                 type="number"
                 min="1"
+                step="1"
                 value={amountInput}
                 onChange={(e) => setAmountInput(e.target.value)}
-                placeholder="Amount (satoshis)"
+                onKeyDown={(e) => [".", "e", "E", "+", "-"].includes(e.key) && e.preventDefault()}
+                placeholder="Amount in satoshis (whole number)"
               />
               <input
                 className="chat-input"

@@ -53,6 +53,11 @@ export interface PaymentDeclined {
   requestId: string
 }
 
+export interface PaymentExpired {
+  type: 'payment-expired'
+  requestId: string
+}
+
 export interface PaymentCancel {
   type: 'payment-cancel'
   requestId: string          // cancels a previously sent PaymentRequest
@@ -62,4 +67,5 @@ export type ChannelMessage =
   | PaymentRequest
   | PaymentResponse
   | PaymentDeclined
+  | PaymentExpired
   | PaymentCancel

@@ -530,6 +530,7 @@ h1 {
 .status-pending { color: #f59e0b; }
 .status-paid    { color: #34d399; }
 .status-declined { color: #f87171; }
+.status-expired { color: #fb923c; }
 .status-cancelled { color: #6b7280; }
 
 .txid-link {
