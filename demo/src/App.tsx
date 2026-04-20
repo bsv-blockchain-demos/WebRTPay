@@ -1,22 +1,56 @@
-import { useState, useEffect } from "react";
-import { WalletClient, WalletInterface } from "@bsv/sdk";
+import { useState, useEffect, useRef } from "react";
+import { WalletClient, WalletInterface, Brc29RemittanceModule, Transaction } from "@bsv/sdk";
 import QRCode from "qrcode";
 import { useSignaling } from "./hooks/useSignaling";
 import { useWebRTC } from "./hooks/useWebRTC";
+import {
+  ChannelMessage,
+  PaymentToken,
+  PaymentRequest,
+  PaymentResponse,
+  PaymentDeclined,
+  PaymentExpired,
+} from "./types";
+
+const SETTLEMENT_MODULE = new Brc29RemittanceModule({
+  protocolID: [2, "3241645161d8"],
+  labels: ["webrtpay"],
+  description: "WebRTPay payment",
+  outputDescription: "WebRTPay payment",
+  internalizeProtocol: "wallet payment",
+  refundFeeSatoshis: 1000,
+  minRefundSatoshis: 1000,
+});
+
+type PaymentHistoryEntry = {
+  requestId: string;
+  direction: "sent" | "received";
+  amount: number;
+  description: string;
+  status: "pending" | "paid" | "declined" | "expired" | "cancelled";
+  txid?: string;
+};
 
 function App() {
   const [wallet, setWallet] = useState<WalletInterface | null>(null);
+  const [myIdentityKey, setMyIdentityKey] = useState<string | null>(null);
   const [walletError, setWalletError] = useState<string | null>(null);
-  const [messageInput, setMessageInput] = useState("");
-  type ChatMessage = { sender: 'you' | 'peer'; text: string; timestamp: number };
-  const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
 
-  const signalingUrl =
-    import.meta.env.VITE_SIGNALING_URL ?? "http://localhost:8080";
-  const { socket, peers, roomId, error: signalingError } = useSignaling(
-    wallet,
-    signalingUrl,
-  );
+  const [amountInput, setAmountInput] = useState("");
+  const [descriptionInput, setDescriptionInput] = useState("");
+  const [incomingRequest, setIncomingRequest] = useState<PaymentRequest | null>(null);
+  const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryEntry[]>([]);
+  const paymentHistoryRef = useRef<PaymentHistoryEntry[]>([]);
+  paymentHistoryRef.current = paymentHistory;
+  const [isRequesting, setIsRequesting] = useState(false);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [showQr, setShowQr] = useState(false);
+  const [peerSearch, setPeerSearch] = useState("");
+
+  const signalingUrl = import.meta.env.VITE_SIGNALING_URL ?? "http://localhost:8080";
+  const { socket, peers, roomId, error: signalingError } = useSignaling(wallet, signalingUrl);
   const {
     call,
     acceptCall,
@@ -35,60 +69,319 @@ function App() {
     const client = new WalletClient();
     client
       .getPublicKey({ identityKey: true })
-      .then(() => setWallet(client))
+      .then((result) => {
+        setWallet(client);
+        setMyIdentityKey(result.publicKey);
+      })
       .catch(() =>
         setWalletError("Could not connect to wallet. Is BSV Desktop running?"),
       );
   }, []);
 
   useEffect(() => {
-    if (!dataChannel || !connectedPeerIdentityKey) return;
-    dataChannel.onmessage = (event) => {
-      setMessages((prev) => ({
+    QRCode.toDataURL(window.location.href, { width: 200, margin: 1 }).then(setQrDataUrl);
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!incomingRequest || !dataChannel) return;
+    const remaining = incomingRequest.expiresAt - Date.now();
+    if (remaining <= 0) return;
+    const timer = setTimeout(() => {
+      const msg: PaymentExpired = { type: "payment-expired", requestId: incomingRequest.requestId };
+      dataChannel.send(JSON.stringify(msg));
+      setPaymentHistory((prev) => [
         ...prev,
-        [connectedPeerIdentityKey]: [
-          ...(prev[connectedPeerIdentityKey] ?? []),
-          { sender: 'peer', text: event.data, timestamp: Date.now() },
-        ],
-      }));
+        {
+          requestId: incomingRequest.requestId,
+          direction: "received",
+          amount: incomingRequest.amount,
+          description: incomingRequest.description,
+          status: "expired",
+        },
+      ]);
+      setIncomingRequest(null);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [incomingRequest, dataChannel]);
+
+  useEffect(() => {
+    if (!dataChannel || !connectedPeerIdentityKey || !wallet || !myIdentityKey) return;
+    dataChannel.onmessage = (event: MessageEvent) => {
+      let msg: ChannelMessage;
+      try {
+        msg = JSON.parse(event.data as string) as ChannelMessage;
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "payment-request": {
+          void (async () => {
+            try {
+              const encoder = new TextEncoder();
+              const data = Array.from(encoder.encode(msg.requestId + myIdentityKey));
+              const hmac = Array.from(
+                { length: msg.requestProof.length / 2 },
+                (_, i) => parseInt(msg.requestProof.slice(i * 2, i * 2 + 2), 16),
+              );
+              const { valid } = await wallet.verifyHmac({
+                data,
+                hmac,
+                protocolID: [2, "payment request auth"],
+                keyID: msg.requestId,
+                counterparty: msg.senderIdentityKey,
+              });
+              if (valid) setIncomingRequest(msg);
+            } catch {
+              // verification failed — silently ignore malformed request
+            }
+          })();
+          break;
+        }
+        case "payment-response": {
+          const { requestId, token } = msg;
+          const isPending = paymentHistoryRef.current.some(
+            (e) => e.requestId === requestId && e.direction === "sent" && e.status === "pending",
+          );
+          if (!isPending) break;
+          void (async () => {
+            const localTxid = Transaction.fromAtomicBEEF(token.transaction).id("hex");
+            const MAX_RETRIES = 5;
+            const RETRY_DELAY_MS = 700;
+            let attempt = 0;
+            while (attempt <= MAX_RETRIES) {
+              try {
+                const result = await SETTLEMENT_MODULE.acceptSettlement(
+                  {
+                    threadId: "webrtpay",
+                    sender: connectedPeerIdentityKey,
+                    settlement: {
+                      customInstructions: token.customInstructions,
+                      transaction: token.transaction,
+                      amountSatoshis: token.amount,
+                      outputIndex: token.outputIndex ?? 0,
+                    },
+                  },
+                  { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
+                );
+                if (result.action === "terminate") {
+                  setPaymentError(result.termination.message);
+                  return;
+                }
+                setPaymentHistory((prev) =>
+                  prev.map((e) =>
+                    e.requestId === requestId ? { ...e, status: "paid" as const, txid: localTxid } : e,
+                  ),
+                );
+                return;
+              } catch (err) {
+                const isSending =
+                  err instanceof Error && err.message.includes('"sending"');
+                if (isSending && attempt < MAX_RETRIES) {
+                  attempt++;
+                  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+                } else {
+                  setPaymentError(
+                    err instanceof Error ? err.message : "Failed to internalize payment.",
+                  );
+                  return;
+                }
+              }
+            }
+          })();
+          break;
+        }
+        case "payment-declined":
+          setPaymentHistory((prev) =>
+            prev.map((e) =>
+              e.requestId === msg.requestId
+                ? { ...e, status: "declined" as const }
+                : e,
+            ),
+          );
+          break;
+        case "payment-expired":
+          setPaymentHistory((prev) =>
+            prev.map((e) =>
+              e.requestId === msg.requestId
+                ? { ...e, status: "expired" as const }
+                : e,
+            ),
+          );
+          break;
+        case "payment-cancel":
+          setIncomingRequest((prev) =>
+            prev?.requestId === msg.requestId ? null : prev,
+          );
+          break;
+      }
     };
-  }, [dataChannel, connectedPeerIdentityKey]);
+  }, [dataChannel, connectedPeerIdentityKey, wallet, myIdentityKey]);
 
   const handleCall = (socketId: string, identityKey: string) => {
-    setMessages((prev) => ({ ...prev, [identityKey]: prev[identityKey] ?? [] }));
     call(socketId, identityKey);
   };
 
   const handleDisconnect = () => {
+    setIncomingRequest(null);
+    setPaymentHistory([]);
+    setPaymentError(null);
     disconnect();
   };
 
-  const handleSend = () => {
-    if (!dataChannel || !messageInput.trim() || !connectedPeerIdentityKey) return;
-    dataChannel.send(messageInput);
-    setMessages((prev) => ({
-      ...prev,
-      [connectedPeerIdentityKey]: [
-        ...(prev[connectedPeerIdentityKey] ?? []),
-        { sender: 'you', text: messageInput, timestamp: Date.now() },
-      ],
-    }));
-    setMessageInput("");
+  const handleRequestPayment = async () => {
+    if (!wallet || !dataChannel || !connectedPeerIdentityKey || !myIdentityKey) return;
+    const amount = Number(amountInput);
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0) return;
+
+    setIsRequesting(true);
+    setPaymentError(null);
+    try {
+      const requestId = crypto.randomUUID();
+      const expiresAt = Date.now() + 10 * 60 * 1000;
+
+      const encoder = new TextEncoder();
+      const data = Array.from(encoder.encode(requestId + connectedPeerIdentityKey));
+      const { hmac } = await wallet.createHmac({
+        data,
+        protocolID: [2, "payment request auth"],
+        keyID: requestId,
+        counterparty: connectedPeerIdentityKey,
+      });
+
+      const requestProof = Array.from(hmac)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      const request: PaymentRequest = {
+        type: "payment-request",
+        requestId,
+        senderIdentityKey: myIdentityKey,
+        amount,
+        description: descriptionInput.trim() || "Payment request",
+        expiresAt,
+        requestProof,
+      };
+
+      dataChannel.send(JSON.stringify(request));
+      setPaymentHistory((prev) => [
+        ...prev,
+        {
+          requestId,
+          direction: "sent",
+          amount,
+          description: request.description,
+          status: "pending",
+        },
+      ]);
+      setAmountInput("");
+      setDescriptionInput("");
+    } catch {
+      setPaymentError("Failed to send payment request.");
+    } finally {
+      setIsRequesting(false);
+    }
   };
 
-  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
-  const [showQr, setShowQr] = useState(false);
-  const [peerSearch, setPeerSearch] = useState("");
+  const handleAcceptPayment = async () => {
+    if (!wallet || !dataChannel || !incomingRequest || !connectedPeerIdentityKey) return;
+    if (incomingRequest.expiresAt <= Date.now()) {
+      const expired: PaymentExpired = {
+        type: "payment-expired",
+        requestId: incomingRequest.requestId,
+      };
+      dataChannel.send(JSON.stringify(expired));
+      setPaymentHistory((prev) => [
+        ...prev,
+        {
+          requestId: incomingRequest.requestId,
+          direction: "received",
+          amount: incomingRequest.amount,
+          description: incomingRequest.description,
+          status: "expired",
+        },
+      ]);
+      setIncomingRequest(null);
+      setPaymentError("Payment request has expired.");
+      return;
+    }
+    setPaymentError(null);
+    try {
+      const result = await SETTLEMENT_MODULE.buildSettlement(
+        {
+          threadId: "webrtpay",
+          option: {
+            amountSatoshis: incomingRequest.amount,
+            payee: connectedPeerIdentityKey,
+            labels: ["webrtpay"],
+            description: incomingRequest.description,
+          },
+        },
+        { wallet, originator: undefined, now: () => Date.now(), logger: undefined },
+      );
 
-  useEffect(() => {
-    QRCode.toDataURL(window.location.href, { width: 200, margin: 1 }).then(setQrDataUrl);
-  }, [roomId]);
+      if (result.action === "terminate") {
+        throw new Error(result.termination.message);
+      }
 
-  const activeMessages = connectedPeerIdentityKey
-    ? (messages[connectedPeerIdentityKey] ?? [])
-    : [];
+      const token: PaymentToken = {
+        customInstructions: {
+          derivationPrefix: result.artifact.customInstructions.derivationPrefix as string,
+          derivationSuffix: result.artifact.customInstructions.derivationSuffix as string,
+        },
+        transaction: Array.isArray(result.artifact.transaction)
+          ? result.artifact.transaction
+          : Array.from(result.artifact.transaction as Uint8Array),
+        amount: result.artifact.amountSatoshis,
+      };
 
-  const showChat = (connected || peerDisconnected) && connectedPeerIdentityKey;
+      const tx = Transaction.fromAtomicBEEF(token.transaction);
+      const txid = tx.id("hex");
+
+      const response: PaymentResponse = {
+        type: "payment-response",
+        requestId: incomingRequest.requestId,
+        txid,
+        token,
+      };
+      dataChannel.send(JSON.stringify(response));
+      setPaymentHistory((prev) => [
+        ...prev,
+        {
+          requestId: incomingRequest.requestId,
+          direction: "received",
+          amount: incomingRequest.amount,
+          description: incomingRequest.description,
+          status: "paid",
+          txid,
+        },
+      ]);
+      setIncomingRequest(null);
+    } catch (err) {
+      setPaymentError(err instanceof Error ? err.message : "Payment failed. Check your wallet balance.");
+    }
+  };
+
+  const handleDeclinePayment = () => {
+    if (!dataChannel || !incomingRequest) return;
+    const msg: PaymentDeclined = {
+      type: "payment-declined",
+      requestId: incomingRequest.requestId,
+    };
+    dataChannel.send(JSON.stringify(msg));
+    setPaymentHistory((prev) => [
+      ...prev,
+      {
+        requestId: incomingRequest.requestId,
+        direction: "received",
+        amount: incomingRequest.amount,
+        description: incomingRequest.description,
+        status: "declined",
+      },
+    ]);
+    setIncomingRequest(null);
+  };
+
+  const showPaymentView = (connected || peerDisconnected) && connectedPeerIdentityKey;
 
   return (
     <div className="app">
@@ -107,10 +400,10 @@ function App() {
             </button>
             <button
               className="copy-btn"
-              onClick={() => setShowQr(prev => !prev)}
+              onClick={() => setShowQr((prev) => !prev)}
               title="Show QR code"
             >
-              {showQr ? 'Hide QR' : 'QR'}
+              {showQr ? "Hide QR" : "QR"}
             </button>
           </div>
         )}
@@ -119,16 +412,20 @@ function App() {
       {walletError && <div className="alert alert-error">{walletError}</div>}
       {signalingError && <div className="alert alert-error">{signalingError}</div>}
       {callRejected && <div className="alert alert-error">Your connection request was rejected.</div>}
+      {paymentError && <div className="alert alert-error">{paymentError}</div>}
+
       {connecting && connectedPeerIdentityKey && (
         <div className="connecting-banner">
           <div className="spinner connecting-spinner" />
-          Waiting for <span className="connecting-key">{connectedPeerIdentityKey.slice(0, 16)}...</span> to accept
+          Waiting for{" "}
+          <span className="connecting-key">{connectedPeerIdentityKey.slice(0, 16)}...</span>{" "}
+          to accept
         </div>
       )}
 
       {incomingCall && (
         <div className="incoming-call-card">
-          <div className="incoming-call-avatar">
+          <div className="peer-avatar incoming-call-avatar">
             {incomingCall.identityKey.slice(0, 2).toUpperCase()}
           </div>
           <div className="incoming-call-info">
@@ -156,7 +453,7 @@ function App() {
         </div>
       )}
 
-      {wallet && !showChat && (
+      {wallet && !showPaymentView && (
         <div className="card">
           <div className="card-header">
             <h2>Peers in room</h2>
@@ -177,9 +474,11 @@ function App() {
                 onChange={(e) => setPeerSearch(e.target.value)}
                 placeholder="Search by identity key..."
               />
-              {peers.filter(p => p.identityKey.toLowerCase().includes(peerSearch.toLowerCase())).map((peer) => {
-                const history = messages[peer.identityKey];
-                return (
+              {peers
+                .filter((p) =>
+                  p.identityKey.toLowerCase().includes(peerSearch.toLowerCase()),
+                )
+                .map((peer) => (
                   <button
                     key={peer.socketId}
                     className="peer-item"
@@ -189,28 +488,19 @@ function App() {
                       {peer.identityKey.slice(0, 2).toUpperCase()}
                     </div>
                     <div className="peer-info">
-                      <div className="peer-key">
-                        {peer.identityKey.slice(0, 16)}...
-                      </div>
-                      {history?.length ? (
-                        <div className="peer-history">
-                          {history.length} previous message{history.length !== 1 ? 's' : ''}
-                        </div>
-                      ) : (
-                        <div className="peer-history">Click to connect</div>
-                      )}
+                      <div className="peer-key">{peer.identityKey.slice(0, 16)}...</div>
+                      <div className="peer-history">Click to connect</div>
                     </div>
                     <div className="peer-arrow">→</div>
                   </button>
-                );
-              })}
+                ))}
             </div>
           )}
         </div>
       )}
 
-      {showChat && connectedPeerIdentityKey && (
-        <div className="card chat-card">
+      {showPaymentView && connectedPeerIdentityKey && (
+        <div className="card payment-card">
           <div className="chat-header">
             <div className="chat-peer">
               <div className="peer-avatar">
@@ -221,53 +511,115 @@ function App() {
                   className="peer-key peer-key-clickable"
                   onClick={() => navigator.clipboard.writeText(connectedPeerIdentityKey)}
                   title="Click to copy full identity key"
-                >{connectedPeerIdentityKey.slice(0, 16)}...</div>
-                <div className={`connection-status ${peerDisconnected ? 'disconnected' : 'connected'}`}>
-                  {peerDisconnected ? 'Disconnected' : 'Connected'}
+                >
+                  {connectedPeerIdentityKey.slice(0, 16)}...
+                </div>
+                <div className={`connection-status ${peerDisconnected ? "disconnected" : "connected"}`}>
+                  {peerDisconnected ? "Disconnected" : "Connected"}
                 </div>
               </div>
             </div>
             <button className="disconnect-btn" onClick={handleDisconnect}>
-              {peerDisconnected ? 'Back' : 'Disconnect'}
+              {peerDisconnected ? "Back" : "Disconnect"}
             </button>
           </div>
 
-          <div className="messages">
-            {activeMessages.length === 0 && (
+          {incomingRequest && !peerDisconnected && (() => {
+            const isExpired = incomingRequest.expiresAt <= Date.now();
+            return (
+              <div className="payment-request-card">
+                <div className="payment-request-header">
+                  <span className="payment-request-label">
+                    {isExpired ? "Request expired" : "Payment requested"}
+                  </span>
+                  <span className="payment-amount">
+                    {incomingRequest.amount.toLocaleString()} sats
+                  </span>
+                </div>
+                <p className="payment-description">{incomingRequest.description}</p>
+                <div className="payment-request-actions">
+                  <button
+                    className="accept-btn"
+                    onClick={handleAcceptPayment}
+                    disabled={isExpired}
+                  >
+                    Pay
+                  </button>
+                  <button className="reject-btn" onClick={handleDeclinePayment}>Decline</button>
+                </div>
+              </div>
+            );
+          })()}
+
+          <div className="payment-history">
+            {paymentHistory.length === 0 && (
               <div className="empty-state">
-                <p>No messages yet. Say hello!</p>
+                <p>No payments yet.</p>
+                <p className="empty-hint">Request a payment using the form below.</p>
               </div>
             )}
-            {activeMessages.map((msg, i) => {
-              const isYou = msg.sender === 'you';
-              const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-              return (
-                <div key={i} className={`message ${isYou ? 'message-you' : 'message-peer'}`}>
-                  <div className="message-label">
-                    {isYou ? 'You' : connectedPeerIdentityKey.slice(0, 10) + '...'}
-                    <span className="message-time">{time}</span>
-                  </div>
-                  <div className="message-text">{msg.text}</div>
+            {paymentHistory.map((entry) => (
+              <div
+                key={entry.requestId}
+                className={`payment-entry payment-entry-${entry.direction}`}
+              >
+                <div className="payment-entry-top">
+                  <span className="payment-entry-direction">
+                    {entry.direction === "sent" ? "You requested" : "You paid"}
+                  </span>
+                  <span className="payment-entry-amount">
+                    {entry.amount.toLocaleString()} sats
+                  </span>
                 </div>
-              )
-            })}
+                <p className="payment-entry-description">{entry.description}</p>
+                <div className={`payment-entry-status status-${entry.status}`}>
+                  {entry.status === "pending" && "Waiting for payment..."}
+                  {entry.status === "paid" && (
+                    <>
+                      Paid{entry.txid && (
+                        <span
+                          className="txid-link"
+                          onClick={() => navigator.clipboard.writeText(entry.txid!)}
+                          title="Click to copy txid"
+                        >
+                          {" · "}{entry.txid.slice(0, 12)}...
+                        </span>
+                      )}
+                    </>
+                  )}
+                  {entry.status === "declined" && "Declined"}
+                  {entry.status === "expired" && "Expired"}
+                  {entry.status === "cancelled" && "Cancelled"}
+                </div>
+              </div>
+            ))}
           </div>
 
           {connected && (
-            <div className="chat-input-row">
+            <div className="payment-form">
               <input
                 className="chat-input"
-                value={messageInput}
-                onChange={(e) => setMessageInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleSend()}
-                placeholder="Send a message..."
+                type="number"
+                min="1"
+                step="1"
+                value={amountInput}
+                onChange={(e) => setAmountInput(e.target.value)}
+                onKeyDown={(e) => [".", "e", "E", "+", "-"].includes(e.key) && e.preventDefault()}
+                placeholder="Amount in satoshis (whole number)"
+              />
+              <input
+                className="chat-input"
+                value={descriptionInput}
+                onChange={(e) => setDescriptionInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleRequestPayment()}
+                placeholder="Description (optional)"
               />
               <button
                 className="send-btn"
-                onClick={handleSend}
-                disabled={!messageInput.trim()}
+                onClick={handleRequestPayment}
+                disabled={!amountInput || isRequesting}
               >
-                Send
+                {isRequesting ? "Sending..." : "Request Payment"}
               </button>
             </div>
           )}
