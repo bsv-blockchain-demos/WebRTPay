@@ -1,321 +1,71 @@
-# WebRTPay Demo Application
+# WebRTPay payment demo
 
-React-based demo application showcasing WebRTPay's capabilities.
+React application for connecting BSV wallet users in a shared room and exchanging BRC-29 payments over a WebRTC data channel. The active application is [`src/App.tsx`](src/App.tsx); `App.cp.tsx` is an older implementation and is not the entry point.
 
 ## Setup
 
-### Install Dependencies
+Follow the [root setup](../README.md#run-the-payment-demo) to install dependencies and start the authenticated signalling server on port 8080. The demo also needs root dependencies for older demo files that import the library source.
 
-```bash
-npm install
-```
+From `demo/`:
 
-The demo imports WebRTPay from the parent `../src` directory, so the parent dependencies (qrcode, jsqr) are resolved from the root package.
-
-## Running the Demo
-
-### Quick Start
-
-```bash
+```sh
+npm ci
+cp .env.example .env
 npm run dev
 ```
 
-Then open http://localhost:3000 in two browser tabs.
+Set `VITE_SIGNALING_URL` to the signalling server origin, normally `http://localhost:8080` for local development. Optional TURN settings are `VITE_TURN_URL`, `VITE_TURN_USERNAME` and `VITE_TURN_CREDENTIAL`; all three are needed to add a TURN server.
 
-### With TURN Server
+Open [localhost:3000](http://localhost:3000) with a compatible BRC-100 wallet. The app requests the wallet's public identity key before connecting to signalling.
 
-For proper testing with NAT traversal:
+## Try a payment
 
-```bash
-# From project root
-make turn-up
+1. Open the application and connect the first wallet.
+2. Copy the full invitation URL, including the `#room-id` fragment, or share the displayed QR code.
+3. Open that invitation with a second wallet identity. Both participants should appear in the same room.
+4. Select the peer and accept the incoming connection on the other device.
+5. Enter a positive whole-number amount in satoshis and send a payment request.
+6. Accept or decline on the receiving side. Acceptance spends from that wallet and sends the settlement transaction to the requester, whose wallet imports it.
 
-# Then start demo
-cd demo
-npm run dev
-```
+Requests expire after ten minutes. The interface displays payment status and transaction identifiers. Payment history is held in React state and is cleared on disconnection or page reload; it is not a persistent accounting ledger.
 
-## Features
+The QR code shares a room URL. The active application does not use the older library's in-page camera scanning or username lookup flow.
 
-### 1. Connection Methods
+## Two-device configuration
 
-**QR Code (Local):**
-- Tab 1: Click "Create" → "Generate QR Code"
-- Tab 2: Click "Join" → "Start Camera" → Scan QR
-- Connection establishes automatically
+Both devices must reach the frontend and signalling server. A phone cannot use the development computer's `localhost` address. Use HTTPS and secure signalling for a hosted or tunnelled setup, set `VITE_SIGNALING_URL` accordingly, and allow the frontend origin in the server's `CORS_ORIGIN`.
 
-**Remote Lookup:**
-- Requires remote services running (see main README)
-- Tab 1: Click "Create" → "Remote" → Enter username → Publish
-- Tab 2: Click "Join" → "Remote" → Enter username → Connect
+Vite's allowed development hosts are listed in [`vite.config.ts`](vite.config.ts). Add your chosen tunnel hostname if necessary. Public STUN servers are configured in [`src/hooks/useWebRTC.ts`](src/hooks/useWebRTC.ts); provide TURN settings for networks that require a relay.
 
-### 2. Messaging
+Frontend environment values are embedded when Vite builds the bundle. Rebuild after changing a deployed signalling URL or TURN configuration.
 
-Once connected:
-- Type messages in the input field
-- Click "Send Message" to send text
-- Click "Send Test Payment" to send structured payment message
-- Watch messages appear in real-time
+## Checks
 
-### 3. Connection States
-
-Monitor connection states:
-- **IDLE** - Not connected
-- **CREATING_OFFER** - Generating connection
-- **CONNECTING** - Establishing connection
-- **CONNECTED** - Ready for messaging
-- **FAILED** - Connection failed
-- **DISCONNECTED** - Connection lost
-
-## Testing
-
-### Two Browser Tabs
-
-1. Open http://localhost:3000 in two tabs
-2. Tab 1: Create connection
-3. Tab 2: Join connection
-4. Exchange messages
-
-### Two Devices (Same Network)
-
-1. Find your local IP: `ifconfig | grep "inet "`
-2. Device 1: Navigate to `http://YOUR_IP:3000`
-3. Device 1: Create QR code
-4. Device 2: Navigate to `http://YOUR_IP:3000`
-5. Device 2: Scan QR code
-6. Exchange messages
-
-### Mobile Testing
-
-1. Ensure mobile device is on same network
-2. Navigate to `http://YOUR_IP:3000` on mobile
-3. Grant camera permissions when prompted
-4. Test QR scanning
-
-## Configuration
-
-The demo uses default WebRTPay configuration with:
-- Connection timeout: 30 seconds
-- Auto-retry: Enabled
-- Max retries: 3
-- STUN servers: Google public STUN servers
-
-### Using Local TURN Server
-
-Update [App.tsx](src/App.tsx):
-
-```typescript
-const newManager = createConnectionManager({
-  webrtc: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      {
-        urls: 'turn:localhost:3478',
-        username: 'testuser',
-        credential: 'testpass'
-      }
-    ]
-  }
-});
-```
-
-## Project Structure
-
-```
-demo/
-├── src/
-│   ├── App.tsx       # Main demo component
-│   ├── main.tsx      # React entry point
-│   └── styles.css    # Styling
-├── index.html        # HTML template
-├── vite.config.ts    # Vite configuration
-├── tsconfig.json     # TypeScript config
-└── package.json      # Dependencies
-```
-
-## Dependencies
-
-### Runtime Dependencies
-- **react** - UI framework
-- **react-dom** - React DOM rendering
-
-### Dev Dependencies
-- **vite** - Build tool and dev server
-- **@vitejs/plugin-react** - React plugin for Vite
-- **typescript** - Type checking
-- **@types/react** - React type definitions
-- **@types/react-dom** - React DOM type definitions
-- **@types/qrcode** - QR code type definitions
-- **@types/node** - Node.js type definitions
-
-Note: `qrcode` and `jsqr` are imported from parent package.
-
-## Troubleshooting
-
-### Camera Not Working
-
-**Issue:** Camera permission denied or not accessible
-
-**Solutions:**
-- Grant camera permissions in browser
-- Use HTTPS (camera requires secure context)
-- Check browser console for errors
-- Try different camera (front/back)
-
-### QR Code Won't Scan
-
-**Issue:** QR code detected but not parsing
-
-**Solutions:**
-- Ensure good lighting
-- Hold camera steady, 10-30cm from QR
-- Try refreshing and regenerating QR
-- Check browser console for errors
-
-### Connection Failed
-
-**Issue:** Connection state goes to FAILED
-
-**Solutions:**
-- Check TURN server is running: `make turn-logs`
-- Verify network connectivity
-- Check browser console for WebRTC errors
-- Try forcing TURN relay (see Configuration above)
-
-### Types Not Found
-
-**Issue:** TypeScript errors about missing types
-
-**Solutions:**
-```bash
-# Install dependencies
-npm install
-
-# Install parent dependencies
-cd .. && npm install && cd demo
-```
-
-### Port Already in Use
-
-**Issue:** Port 3000 is already taken
-
-**Solutions:**
-```bash
-# Use different port
-npm run dev -- --port 3001
-
-# Or kill process on port 3000
-lsof -ti:3000 | xargs kill -9
-```
-
-## Development
-
-### Hot Module Replacement
-
-Vite provides instant HMR - edit files and see changes immediately.
-
-### Type Checking
-
-```bash
+```sh
+npm run build
 npm run type-check
-```
-
-### Building for Production
-
-```bash
-npm run build
-```
-
-Output will be in `dist/` directory.
-
-### Preview Production Build
-
-```bash
-npm run build
 npm run preview
 ```
 
-## Browser Support
+`build` writes static assets to `dist/`. The preview server serves that bundle; it does not start signalling.
 
-- Chrome/Edge 90+
-- Firefox 88+
-- Safari 14.1+
-- Mobile Chrome (Android 5.0+)
-- Mobile Safari (iOS 14.3+)
+The current Vite build passes, but the TypeScript check fails on unused declarations and an outdated call in `App.cp.tsx`, plus unused declarations in `useSignaling.ts` and the root `WebRTCConnection.ts`. There is no automated test script. Wallet settlement and connectivity require a functional check with two participants.
 
-## Known Limitations
+## Source map
 
-1. **Camera Access**
-   - Requires HTTPS in production
-   - Some browsers restrict camera in HTTP
+- [`src/App.tsx`](src/App.tsx): wallet connection, invitations, requests and BRC-29 settlement
+- [`src/hooks/useSignaling.ts`](src/hooks/useSignaling.ts): authenticated room membership and peer discovery
+- [`src/hooks/useWebRTC.ts`](src/hooks/useWebRTC.ts): offers, answers, ICE candidates and data channel lifecycle
+- [`src/types.ts`](src/types.ts): signalling and payment message types
 
-2. **WebRTC Support**
-   - Older browsers may not support WebRTC
-   - Check with `isWebRTCSupported()`
+## Troubleshooting
 
-3. **Mobile Webview**
-   - Some WebView configurations may block camera
-   - See main README for WebView setup
+- **Wallet connection fails:** start a compatible wallet and approve the app's identity-key request.
+- **No peers appear:** use the same complete invitation URL, check the signalling server, and verify its allowed origin.
+- **A peer appears but connection fails:** check STUN/TURN reachability and browser WebRTC support.
+- **Payment fails:** check the payer's funds, both wallets' network selection and the reported wallet error.
+- **Port 3000 is occupied:** use `npm run dev -- --port 3001` and update the server's allowed frontend origin.
 
-## Extending the Demo
+## Licence
 
-### Adding Custom Message Types
-
-```typescript
-// In App.tsx
-const protocol = manager.getProtocol();
-
-protocol.registerSchema({
-  type: 'custom_message',
-  requiredFields: ['customField'],
-  validate: (payload) => payload.customField !== null
-});
-
-// Send custom message
-await manager.send('custom_message', {
-  customField: 'value'
-});
-
-// Handle custom message
-manager.onMessage('custom_message', (message) => {
-  console.log('Custom message:', message.payload);
-});
-```
-
-### Adding UI Features
-
-The demo uses vanilla React with inline styles. Feel free to:
-- Add UI component library (MUI, Chakra, etc.)
-- Add state management (Redux, Zustand, etc.)
-- Add routing for multi-page app
-- Add animations and transitions
-
-## Performance
-
-The demo is optimized for:
-- Fast dev server startup (~500ms)
-- Instant HMR updates
-- Small bundle size (~150KB gzipped)
-- Efficient React rendering
-
-## Security Notes
-
-This is a demo application for development and testing only.
-
-For production:
-- Enable HTTPS
-- Validate all inputs
-- Add authentication
-- Rate limit connections
-- Monitor for abuse
-- See main README for security guidelines
-
-## Support
-
-- **Main Documentation:** See project root README.md
-- **Issues:** Report bugs on GitHub
-- **Discussions:** Ask questions on GitHub Discussions
-
-## License
-
-MIT - Same as parent project
+See the [root licence note](../README.md#licence-and-contributions).

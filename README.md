@@ -1,477 +1,114 @@
 # WebRTPay
 
-A mobile-to-mobile WebRTC connection system for secure, peer-to-peer payment interactions. Built for web applications rendered in mobile WebView containers (iOS and Android) and standard mobile browsers.
+A BSV wallet payment demonstration that exchanges payment requests and transaction data over WebRTC. An authenticated signalling server introduces peers in a shared room; their browsers then use a WebRTC data channel for the payment exchange.
 
-## Features
+The repository also contains an earlier TypeScript connection library with QR and remote bootstrap helpers. The current payment demo uses its own signalling and WebRTC hooks, so the two entry points have different connection flows.
 
-- **WebRTC Data Channels**: Direct peer-to-peer communication
-- **QR Code Bootstrapping**: Quick local connection via QR code scanning
-- **Remote Bootstrapping**: Connect via username lookup with Topic Broadcaster and Lookup Resolver services
-- **STUN/TURN Support**: Automatic NAT traversal with fallback relay
-- **JSON Message Protocol**: Structured message validation and routing
-- **TypeScript**: Full type safety and IntelliSense support
-- **Mobile-Optimized**: Designed for mobile WebView and browser environments
+## Repository layout
 
-## Installation
+| Location | Purpose |
+| --- | --- |
+| `demo/` | React payment application with wallet connection, room invitations and BRC-29 settlement |
+| `server/` | Express and `@bsv/authsocket` signalling service; keeps rooms and peers in memory |
+| `src/` | Earlier connection library, QR helpers and JSON message protocol |
+| `docker-compose.yml` | Local Coturn and demo services; does not include the signalling server |
 
-```bash
-npm install webrtpay
+## Run the payment demo
+
+Use Node.js 22, npm, Bun for the server's committed lockfile, and two compatible BRC-100 wallet identities. Both wallets must use the same network. Accepting a payment request creates an actual wallet payment, so use wallets funded for your chosen demonstration.
+
+```sh
+git clone https://github.com/bsv-blockchain-demos/WebRTPay.git
+cd WebRTPay
+npm ci
+npm --prefix demo ci
 ```
 
-Or with yarn:
+Install the signalling server using its Bun lockfile:
 
-```bash
-yarn add webrtpay
+```sh
+cd server
+bun install --frozen-lockfile
+cp .env.example .env
 ```
 
-## Local Development Setup
+Set these values in `server/.env`:
 
-### Running the Demo with Local TURN Server
+| Variable | Purpose |
+| --- | --- |
+| `SERVER_PRIVATE_KEY` | Dedicated server identity private key in hex, required for authenticated sockets. |
+| `CORS_ORIGIN` | Allowed frontend origin, for example `http://localhost:3000`. |
+| `PORT` | Signalling port, default `8080`. |
 
-WebRTPay includes a Docker Compose setup for running a local TURN server:
+Start it from `server/`:
 
-```bash
-# Clone the repository
-git clone https://github.com/sirdeggen/webrtpay.git
-cd webrtpay
-
-# Start TURN server and demo
-docker-compose up -d
-
-# Or start just the TURN server
-docker-compose up -d coturn
-
-# View logs
-docker-compose logs -f
-```
-
-The local TURN server runs on `localhost:3478` with credentials:
-- **Username:** `testuser`
-- **Password:** `testpass`
-
-See [TURN_SERVER_SETUP.md](TURN_SERVER_SETUP.md) for detailed configuration.
-
-## Quick Start
-
-### 1. Create a Connection (Device A)
-
-```typescript
-import { createConnectionManager } from 'webrtpay';
-
-// Initialize connection manager
-const manager = createConnectionManager({
-  connectionTimeout: 30000,
-  autoRetry: true,
-  maxRetries: 3
-});
-
-// Generate QR code for local connection
-const { qrCodeDataUrl, token } = await manager.createQRConnection();
-
-// Display QR code
-document.getElementById('qr-image').src = qrCodeDataUrl;
-```
-
-### 2. Join Connection (Device B)
-
-```typescript
-import { createConnectionManager, QRBootstrap } from 'webrtpay';
-
-const manager = createConnectionManager();
-
-// Setup camera for scanning
-const { video, stream } = await QRBootstrap.setupCamera('environment');
-
-// Scan and join
-await manager.scanAndJoin(video);
-
-// Stop camera after successful connection
-QRBootstrap.stopCamera(stream);
-```
-
-### 3. Exchange Messages
-
-```typescript
-import { PaymentMessageTypes } from 'webrtpay';
-
-// Listen for messages
-manager.onMessage(PaymentMessageTypes.PAYMENT_REQUEST, (message) => {
-  console.log('Payment request:', message.payload);
-});
-
-// Send a message
-await manager.send(PaymentMessageTypes.PAYMENT_REQUEST, {
-  amount: 50.00,
-  currency: 'USD',
-  recipient: 'user123',
-  description: 'Coffee payment'
-});
-```
-
-## Connection Methods
-
-### QR Code (Local)
-
-Best for face-to-face payments:
-
-```typescript
-// Device A: Create QR code
-const { qrCodeDataUrl } = await manager.createQRConnection();
-
-// Device B: Scan QR code
-const token = await QRBootstrap.scanQRCodeFromVideo(videoElement);
-await manager.joinQRConnection(token);
-```
-
-### Remote Lookup
-
-Best for remote payments:
-
-```typescript
-// Configure remote services
-const manager = createConnectionManager({
-  remote: {
-    broadcasterUrl: 'https://broadcaster.example.com',
-    lookupUrl: 'https://lookup.example.com',
-    tokenValidityMs: 300000 // 5 minutes
-  }
-});
-
-// Device A: Publish connection
-await manager.publishRemoteConnection('alice');
-
-// Device B: Lookup and connect
-await manager.joinRemoteConnection('alice');
-```
-
-## Message Protocol
-
-### Built-in Message Types
-
-```typescript
-import { PaymentMessageTypes } from 'webrtpay';
-
-// Available types:
-PaymentMessageTypes.PAYMENT_REQUEST
-PaymentMessageTypes.PAYMENT_RESPONSE
-PaymentMessageTypes.PAYMENT_ACKNOWLEDGMENT
-PaymentMessageTypes.ERROR
-PaymentMessageTypes.HANDSHAKE
-PaymentMessageTypes.PING
-PaymentMessageTypes.PONG
-```
-
-### Custom Message Schemas
-
-```typescript
-import { MessageProtocol } from 'webrtpay';
-
-const protocol = manager.getProtocol();
-
-// Register custom schema
-protocol.registerSchema({
-  type: 'custom_payment',
-  requiredFields: ['amount', 'token'],
-  validate: (payload) => {
-    return payload.amount > 0;
-  }
-});
-
-// Send custom message
-await manager.send('custom_payment', {
-  amount: 100,
-  token: 'abc123'
-});
-```
-
-## API Reference
-
-### ConnectionManager
-
-Main class for managing WebRTC connections.
-
-#### Constructor
-
-```typescript
-const manager = createConnectionManager(config?: ConnectionManagerConfig);
-```
-
-**ConnectionManagerConfig:**
-- `webrtc?: WebRTCConfig` - WebRTC configuration (ICE servers, etc.)
-- `remote?: RemoteBootstrapConfig` - Remote service configuration
-- `connectionTimeout?: number` - Connection timeout in ms (default: 30000)
-- `autoRetry?: boolean` - Enable automatic retry (default: true)
-- `maxRetries?: number` - Maximum retry attempts (default: 3)
-
-#### Methods
-
-**Connection Management:**
-- `createQRConnection()` - Create connection and generate QR code
-- `joinQRConnection(token)` - Join using bootstrap token
-- `scanAndJoin(video, timeout?)` - Scan QR and join automatically
-- `publishRemoteConnection(username)` - Publish to remote broadcaster
-- `joinRemoteConnection(username)` - Lookup and join remote connection
-
-**Messaging:**
-- `send(type, payload)` - Create and send message
-- `sendMessage(message)` - Send pre-created message
-- `onMessage(type, handler)` - Register message handler
-- `offMessage(type, handler)` - Unregister message handler
-- `onAnyMessage(handler)` - Handle all message types
-
-**State & Info:**
-- `getState()` - Get current connection state
-- `isReady()` - Check if ready for messaging
-- `getConnectionId()` - Get unique connection ID
-- `getMessageHistory(type?)` - Get message history
-- `getStats()` - Get connection statistics
-- `close()` - Close connection and cleanup
-
-### QRBootstrap
-
-Utilities for QR code generation and scanning.
-
-#### Methods
-
-- `generateQRCode(token, options?)` - Generate QR code as data URL
-- `generateQRCodeSVG(token, options?)` - Generate QR code as SVG
-- `scanQRCode(imageData)` - Scan QR from ImageData
-- `scanQRCodeFromVideo(video, timeout?)` - Continuous video scanning
-- `setupCamera(facingMode?)` - Setup camera for scanning
-- `stopCamera(stream)` - Stop camera stream
-- `validateToken(token)` - Validate token structure
-- `isTokenExpired(token, maxAge?)` - Check token expiration
-
-### ConnectionState
-
-```typescript
-enum ConnectionState {
-  IDLE = 'idle',
-  CREATING_OFFER = 'creating_offer',
-  AWAITING_ANSWER = 'awaiting_answer',
-  CONNECTING = 'connecting',
-  CONNECTED = 'connected',
-  DISCONNECTED = 'disconnected',
-  FAILED = 'failed',
-  CLOSED = 'closed'
-}
-```
-
-## Configuration
-
-### STUN/TURN Servers
-
-```typescript
-import { createConnectionManager } from 'webrtpay';
-
-const manager = createConnectionManager({
-  webrtc: {
-    iceServers: [
-      // Public STUN servers
-      { urls: 'stun:stun.l.google.com:19302' },
-
-      // Your TURN server
-      {
-        urls: 'turn:turn.example.com:3478',
-        username: 'user',
-        credential: 'password'
-      }
-    ],
-    iceTransportPolicy: 'all', // or 'relay' to force TURN
-    bundlePolicy: 'balanced'
-  }
-});
-```
-
-### Remote Services
-
-To use remote bootstrapping, you need to implement two services:
-
-**Topic Broadcaster API:**
-```
-POST /publish
-Body: { username: string, token: BootstrapToken, ttl: number }
-Response: { tokenId: string, expiresAt: number }
-
-DELETE /publish?username=<username>
-Response: { success: boolean }
-```
-
-**Lookup Resolver API:**
-```
-GET /lookup?username=<username>
-Response: { token: BootstrapToken, username: string, publishedAt: number }
-```
-
-## Error Handling
-
-```typescript
-import { WebRTPayError, ErrorType } from 'webrtpay';
-
-try {
-  await manager.createQRConnection();
-} catch (error) {
-  if (error instanceof WebRTPayError) {
-    switch (error.type) {
-      case ErrorType.BOOTSTRAP_GENERATION_FAILED:
-        console.error('Failed to generate bootstrap token');
-        break;
-      case ErrorType.CONNECTION_FAILED:
-        console.error('WebRTC connection failed');
-        break;
-      case ErrorType.ICE_FAILED:
-        console.error('ICE negotiation failed');
-        break;
-      case ErrorType.TIMEOUT:
-        console.error('Operation timed out');
-        break;
-      // ... handle other error types
-    }
-  }
-}
-```
-
-## Mobile WebView Integration
-
-### iOS (WKWebView)
-
-```swift
-import WebKit
-
-let webView = WKWebView()
-let config = webView.configuration
-
-// Enable camera access
-config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
-config.mediaTypesRequiringUserActionForPlayback = []
-```
-
-### Android (WebView)
-
-```java
-WebView webView = new WebView(this);
-WebSettings settings = webView.getSettings();
-
-settings.setJavaScriptEnabled(true);
-settings.setDomStorageEnabled(true);
-settings.setMediaPlaybackRequiresUserGesture(false);
-
-// Enable camera permission
-webView.setWebChromeClient(new WebChromeClient() {
-    @Override
-    public void onPermissionRequest(PermissionRequest request) {
-        request.grant(request.getResources());
-    }
-});
-```
-
-## Browser Compatibility
-
-- Chrome/Edge 90+
-- Firefox 88+
-- Safari 14.1+
-- Mobile Chrome (Android)
-- Mobile Safari (iOS 14.3+)
-
-WebRTC is supported in all modern browsers. Check compatibility:
-
-```typescript
-import { isWebRTCSupported } from 'webrtpay';
-
-if (!isWebRTCSupported()) {
-  alert('WebRTC is not supported in this browser');
-}
-```
-
-## Security
-
-- All WebRTC connections use DTLS-SRTP encryption
-- Bootstrap tokens should have short TTL (5 minutes recommended)
-- Token publication does not authorize payments, only communication
-- Implement additional authentication in your payment flow
-- Validate all incoming messages before processing
-
-## Examples
-
-See the `/demo` directory for a complete React application demonstrating:
-- QR code generation and scanning
-- Remote username-based connections
-- Message exchange
-- Connection state management
-- Error handling
-
-Run the demo:
-
-```bash
-cd demo
-npm install
+```sh
 npm run dev
 ```
 
-## Architecture
+In a second terminal, enter `demo/`, copy `.env.example` to `.env`, and configure:
 
-```
-┌─────────────────────────────────────────┐
-│        ConnectionManager                │
-│  (High-level orchestration)             │
-└────────────┬────────────────────────────┘
-             │
-    ┌────────┴─────────┐
-    │                  │
-┌───▼──────────┐  ┌───▼─────────────┐
-│ WebRTC       │  │ MessageProtocol │
-│ Connection   │  │                 │
-└──────┬───────┘  └─────────────────┘
-       │
-┌──────┴──────────────────┐
-│                         │
-│  ┌──────────────────┐  │
-│  │  QRBootstrap     │  │
-│  └──────────────────┘  │
-│                         │
-│  ┌──────────────────┐  │
-│  │ RemoteBootstrap  │  │
-│  └──────────────────┘  │
-└─────────────────────────┘
+| Variable | Purpose |
+| --- | --- |
+| `VITE_SIGNALING_URL` | Browser-reachable signalling origin, default `http://localhost:8080`. |
+| `VITE_TURN_URL` | Optional TURN URL for peers that cannot connect directly. |
+| `VITE_TURN_USERNAME` | TURN username, used with the URL and credential. |
+| `VITE_TURN_CREDENTIAL` | TURN credential. This is delivered to browsers in the frontend bundle. |
+
+```sh
+npm run dev
 ```
 
-## Performance
+Open [localhost:3000](http://localhost:3000). Share the full page URL, including its `#room-id` fragment, with the second participant. The QR code contains this invitation URL. Both peers need the same room; independently opening the bare URL creates separate rooms.
 
-- QR code generation: ~100ms
-- Connection establishment (STUN): ~1-3 seconds
-- Connection establishment (TURN fallback): ~3-5 seconds
-- Message latency: <50ms (direct P2P)
-- QR code size: ~1-2KB (optimized payload)
+Select a peer, accept the connection, then request an amount in satoshis. The payer can accept or decline. Acceptance builds a BRC-29 payment, sends its Atomic BEEF and remittance data over the channel, and lets the recipient wallet import it. The interface tracks pending, paid, declined and expired requests.
 
-## Troubleshooting
+See the [demo README](demo/README.md) for device testing and troubleshooting.
 
-### Connection fails immediately
+## Network configuration
 
-- Check STUN/TURN server configuration
-- Verify network allows WebRTC traffic
-- Check browser WebRTC support
+Localhost works for two browser sessions on one computer. For separate devices, use browser-reachable frontend and signalling URLs, HTTPS for the frontend, and secure signalling. Update `demo/vite.config.ts` if your development hostname is not allowed.
 
-### QR scan not working
+The demo uses public STUN servers by default. Configure all three TURN variables when relay connectivity is needed. `docker compose up -d coturn` starts the supplied local TURN service, but its test credentials and local configuration need to be replaced for a shared deployment. Compose does not start the authenticated signalling server.
 
-- Ensure camera permissions granted
-- Check lighting conditions
-- Verify QR code is not too small/large
-- Try different camera (front/back)
+Rooms and peer membership are in memory. Restarting the server disconnects signalling sessions, and the server is not configured for multiple coordinated instances. The room link identifies a room, rather than defining a persistent access-control policy.
 
-### Messages not received
+## Connection library
 
-- Check connection state is CONNECTED
-- Verify data channel is open: `manager.isReady()`
-- Check message schema validation
+The root package is named `webrtpay` and builds its TypeScript library into `dist/`:
 
-## License
+```sh
+npm run build
+npm run type-check
+```
 
-MIT
+[`src/index.ts`](src/index.ts) exports the connection manager, bootstrap helpers, protocol and types. The main APIs include:
 
-## Contributing
+| API | Purpose |
+| --- | --- |
+| `createConnectionManager(config)` | Create the connection and message manager |
+| `createQRConnection(useTrickleICE)` | Generate an offer and QR data |
+| `joinQRConnection(token)` | Consume an offer and produce the answer in traditional mode |
+| `completeQRConnection(answerToken)` | Apply the answer on the offerer's side |
+| `publishRemoteConnection(username)` / `joinRemoteConnection(username)` | Use separately supplied remote publish and lookup services |
+| `send(type, payload)` / `onMessage(type, handler)` | Exchange structured messages over an established channel |
+| `getState()` / `isReady()` / `close()` | Inspect or close the connection |
 
-Contributions welcome! Please read CONTRIBUTING.md for guidelines.
+The library's default QR mode attempts to return its answer over the data channel that is still being established. It is experimental. The current demo avoids this path by exchanging offers, answers and ICE candidates through `server/`. The remote bootstrap HTTP APIs are also separate from that server's socket room protocol.
 
-## Support
+The library's generic payment messages do not by themselves execute wallet transfers. The actual BRC-29 settlement integration is in `demo/src/App.tsx`.
 
-- GitHub Issues: https://github.com/sirdeggen/webrtpay/issues
+## Checks and known issues
+
+- Root `npm run build` and `npm run type-check` compile the connection library.
+- In `server/`, `bun install --frozen-lockfile` uses the committed dependency versions. A fresh `npm install` currently resolves a newer `@bsv/authsocket` that conflicts with the pinned SDK; there is no server npm lockfile.
+- In `demo/`, `npm run build` bundles successfully, while `npm run type-check` currently reports errors in `App.cp.tsx`, `useSignaling.ts` and the root `WebRTCConnection.ts`. A Vite build alone is not a clean type check.
+- No automated test suite is configured. A full demonstration needs two wallets and a working signalling connection; build checks do not verify settlement or mobile connectivity.
+
+Older guides such as [GETTING_STARTED.md](GETTING_STARTED.md), [EXAMPLES.md](EXAMPLES.md) and [TRICKLE_ICE.md](TRICKLE_ICE.md) describe the earlier library workflow. Use this README and the demo README for the current payment application.
+
+## Licence and contributions
+
+The root `package.json` declares MIT, but no licence file is included. The maintainers need to add the applicable licence text.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the existing contribution guide. Report reproducible problems through the [repository issues](https://github.com/bsv-blockchain-demos/WebRTPay/issues), including which component and commands were involved.
