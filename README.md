@@ -107,8 +107,10 @@ The library's generic payment messages do not by themselves execute wallet trans
 
 Older guides such as [GETTING_STARTED.md](GETTING_STARTED.md), [EXAMPLES.md](EXAMPLES.md) and [TRICKLE_ICE.md](TRICKLE_ICE.md) describe the earlier library workflow. Use this README and the demo README for the current payment application.
 
-## Licence and contributions
+## Licence
 
-The root `package.json` declares MIT, but no licence file is included. The maintainers need to add the applicable licence text.
+**Library licence declaration: MIT.** See the [root package manifest](package.json). The [demo](demo/package.json) and [signalling server](server/package.json) packages have no separate licence declaration. No standalone licence file is included in this repository.
+
+## Contributions
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the existing contribution guide. Report reproducible problems through the [repository issues](https://github.com/bsv-blockchain-demos/WebRTPay/issues), including which component and commands were involved.

@@ -404,9 +404,9 @@ The codebase is structured for easy contribution:
    - Add examples to EXAMPLES.md
    - Update SPECIFICATION.md for protocol changes
 
-## License
+## Licence
 
-MIT License - See LICENSE file for details
+**Library licence declaration: MIT.** The [root package manifest](package.json) declares MIT. No standalone licence file is included in this repository. See the [repository licence section](README.md#licence) for component declarations.
 
 ## Support
 

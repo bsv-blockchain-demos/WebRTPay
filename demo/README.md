@@ -68,4 +68,4 @@ The current Vite build passes, but the TypeScript check fails on unused declarat
 
 ## Licence
 
-See the [root licence note](../README.md#licence-and-contributions).
+The root library declares the **MIT licence**. This demo's [package.json](package.json) has no separate licence declaration. See the [repository licence section](../README.md#licence) for component declarations. No standalone licence file is included in this repository.
