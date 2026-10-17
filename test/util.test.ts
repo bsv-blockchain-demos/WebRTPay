@@ -312,6 +312,32 @@ describe('Emitter', () => {
     expect(errors).toEqual([boom])
   })
 
+  it('reports rejected promises from async once listeners and never leaks them', async () => {
+    const errors: unknown[] = []
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const e = new Emitter<Events>(err => errors.push(err))
+      const boom = new Error('async once boom')
+      e.once('data', async () => {
+        throw boom
+      })
+      e.emit('data', 1)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(errors).toEqual([boom])
+      expect(unhandled).toEqual([])
+      // still delivered exactly once
+      e.emit('data', 2)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(errors).toEqual([boom])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   it('emits to a snapshot: unsubscribing or subscribing mid-emit is safe', () => {
     const e = new Emitter<Events>()
     const calls: string[] = []

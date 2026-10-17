@@ -36,7 +36,8 @@ export class Emitter<E extends Record<string, unknown>> {
   once<K extends keyof E>(k: K, fn: (v: E[K]) => void): () => void {
     const off = this.on(k, v => {
       off()
-      fn(v)
+      // return the listener's result so `emit` can route an async rejection to onListenerError
+      return fn(v)
     })
     return off
   }
