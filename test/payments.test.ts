@@ -373,7 +373,8 @@ describe('parseWireMessage', () => {
     ],
     ['error', { t: 'error', code: 'protocol', message: 'bad frame' }],
     ['error without message', { t: 'error', code: 'busy' }],
-    ['bye', { t: 'bye' }]
+    ['bye', { t: 'bye' }],
+    ['ready', { t: 'ready' }]
   ]
 
   it.each(valid)('accepts %s as a fresh copy', (_name, message) => {

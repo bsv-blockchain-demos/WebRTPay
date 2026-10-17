@@ -34,6 +34,14 @@ export interface Auth {
   signature: string
 }
 
+/**
+ * Last handshake message: I verified your `auth` and accept full-size messages now.
+ * Nothing but `hello`, `auth` and `ready` is sent before both sides have sent it.
+ */
+export interface Ready {
+  t: 'ready'
+}
+
 /** A `PaymentToken` on the wire: the transaction is base64 Atomic BEEF. */
 export interface PaymentWire {
   t: 'payment'
@@ -87,7 +95,15 @@ export interface Bye {
 
 /** Every JSON message carried on the data channel, discriminated by `t`. */
 export type WireMessage =
-  Hello | Auth | PaymentWire | PaymentAck | RequestWire | RequestResponseWire | ErrorWire | Bye
+  | Hello
+  | Auth
+  | Ready
+  | PaymentWire
+  | PaymentAck
+  | RequestWire
+  | RequestResponseWire
+  | ErrorWire
+  | Bye
 
 const NONCE_BYTES = 32
 const NONCE_CHARS = 44 // padded base64 of 32 bytes
@@ -231,6 +247,8 @@ export function parseWireMessage(v: unknown): WireMessage {
       return parseHello(r)
     case 'auth':
       return parseAuth(r)
+    case 'ready':
+      return { t: 'ready' }
     case 'payment':
       return parsePayment(r)
     case 'payment.ack':

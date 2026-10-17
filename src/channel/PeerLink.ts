@@ -14,7 +14,8 @@ export interface RtcOptions {
   iceTransportPolicy?: RTCIceTransportPolicy
   /**
    * Extra fields spread into the `RTCPeerConnection` configuration, for options a platform
-   * adds (node-datachannel's `bindAddress`, for example).
+   * adds (node-datachannel's `bindAddress`, for example). `disableFingerprintVerification`,
+   * `iceServers` and `iceTransportPolicy` here are ignored.
    */
   extraConfig?: Record<string, unknown>
   /** Longest wait for ICE gathering before sending what was gathered; defaults to 5 s. */
@@ -372,14 +373,21 @@ export class PeerLink {
   }
 }
 
+/** `extraConfig` fields that are dropped rather than passed to the peer connection. */
+const IGNORED_EXTRA_CONFIG = ['disableFingerprintVerification', 'iceServers', 'iceTransportPolicy']
+
 function newPeerConnection(o: RtcOptions): RTCPeerConnection {
   const Ctor =
     o.RTCPeerConnection ??
     (globalThis as { RTCPeerConnection?: typeof RTCPeerConnection }).RTCPeerConnection
   if (!Ctor) throw new WebRTPayError('unsupported', 'No RTCPeerConnection implementation')
+  // The identity handshake signs the DTLS fingerprints, so certificate checks stay on, and
+  // ICE settings come only from their own options.
+  const extra: Record<string, unknown> = { ...o.extraConfig }
+  for (const key of IGNORED_EXTRA_CONFIG) delete extra[key]
   // Fresh objects: some implementations normalise the configuration they are given in place.
   const config: RTCConfiguration = {
-    ...o.extraConfig,
+    ...extra,
     iceServers: (o.iceServers ?? []).map(server => ({ ...server }))
   }
   if (o.iceTransportPolicy !== undefined) config.iceTransportPolicy = o.iceTransportPolicy

@@ -452,6 +452,32 @@ describe('PeerLink with a fake peer connection', () => {
     plain.link.close()
   })
 
+  it('drops extraConfig fields that would disable fingerprint checks or replace ICE settings', async () => {
+    const extraConfig = {
+      bindAddress: '127.0.0.1',
+      disableFingerprintVerification: true,
+      iceServers: [{ urls: 'turn:other.example:3478' }],
+      iceTransportPolicy: 'relay'
+    }
+    const offerer = await fakeOfferer({ extraConfig })
+    expect(offerer.pc.config).toEqual({ bindAddress: '127.0.0.1', iceServers: [] })
+    offerer.link.close()
+
+    const { link } = await PeerLink.acceptOffer(FAKE_OFFER, {
+      RTCPeerConnection: FakePeerConnection as unknown as typeof RTCPeerConnection,
+      iceTransportPolicy: 'all',
+      extraConfig
+    })
+    expect(FakePeerConnection.last!.config).toEqual({
+      bindAddress: '127.0.0.1',
+      iceServers: [],
+      iceTransportPolicy: 'all'
+    })
+    link.close()
+    // The caller's object is left as it was.
+    expect(extraConfig.disableFingerprintVerification).toBe(true)
+  })
+
   it('holds frames while more than 1 MiB is queued and resumes on bufferedamountlow', async () => {
     const { link, pc } = await fakeOfferer({ chunkBytes: 1024 })
     pc.channel.open()
