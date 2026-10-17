@@ -3,18 +3,17 @@
  *
  * The sandbox drops UDP to non-loopback addresses, so every peer binds to 127.0.0.1.
  */
+import type { RtcOptions } from '../../src/channel/PeerLink.js'
 
 /**
- * The shape A4's `RtcOptions` will take. Defined locally until that type exists.
+ * {@link RtcOptions} with the fields `nodeRtc` always sets, so tests can pass it to
+ * `PeerLink` or construct a raw peer with `new rtc.RTCPeerConnection(...)`.
  */
-export interface RtcOptionsLike {
-  RTCPeerConnection: typeof globalThis.RTCPeerConnection
-  iceServers: RTCIceServer[]
-  extraConfig: Record<string, unknown>
-}
+export type NodeRtcOptions = RtcOptions &
+  Required<Pick<RtcOptions, 'RTCPeerConnection' | 'iceServers' | 'extraConfig'>>
 
 /** RTC options for a node-datachannel peer bound to loopback, with no STUN or TURN. */
-export async function nodeRtc(): Promise<RtcOptionsLike> {
+export async function nodeRtc(): Promise<NodeRtcOptions> {
   const { RTCPeerConnection } = await import('node-datachannel/polyfill')
   return {
     // The polyfill implements the DOM interface; only its static side differs.

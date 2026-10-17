@@ -275,6 +275,32 @@ describe('FrameDecoder', () => {
     ])
   })
 
+  it('setMaxMessageBytes raises and lowers the cap for the frames that follow', () => {
+    const message = { s: 'a'.repeat(2000 - '{"s":""}'.length) }
+    const d = decoder(1000)
+    d.setMaxMessageBytes(2000)
+    expect(feed(d, encodeMessage(0, message, FRAME_HEADER_BYTES + 500))).toEqual([message])
+
+    d.setMaxMessageBytes(1999)
+    expect(codeOf(() => feed(d, encodeMessage(1, message)))).toBe('too_large')
+  })
+
+  it('setMaxMessageBytes lets a message in progress grow to the raised cap', () => {
+    const message = { s: 'a'.repeat(2000 - '{"s":""}'.length) }
+    const frames = encodeMessage(0, message, FRAME_HEADER_BYTES + 500)
+    const d = decoder(1000)
+    expect(d.push(frames[0])).toBeUndefined()
+    expect(d.push(frames[1])).toBeUndefined()
+    d.setMaxMessageBytes(2000)
+    expect(feed(d, frames.slice(2))).toEqual([message])
+  })
+
+  it('setMaxMessageBytes rejects a value that is not a size', () => {
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      expect(() => decoder().setMaxMessageBytes(bad)).toThrow(RangeError)
+    }
+  })
+
   it('checks sequence before size', () => {
     const d = decoder(10)
     expect(codeOf(() => d.push(rawFrame(5, true, 'a'.repeat(100))))).toBe('protocol')

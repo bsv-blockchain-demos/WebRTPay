@@ -128,6 +128,13 @@ function assertBoundedObject(bytes: Uint8Array): void {
   }
 }
 
+function checkCap(maxMessageBytes: number): number {
+  if (!Number.isSafeInteger(maxMessageBytes) || maxMessageBytes < 0) {
+    throw new RangeError(`Invalid message size cap: ${maxMessageBytes}`)
+  }
+  return maxMessageBytes
+}
+
 function parseMessage(bytes: Uint8Array): unknown {
   assertBoundedObject(bytes)
   const text = utf8Decode(bytes)
@@ -152,7 +159,7 @@ function parseMessage(bytes: Uint8Array): unknown {
  * channel.
  */
 export class FrameDecoder {
-  private readonly maxMessageBytes: number
+  private maxMessageBytes: number
   /** Sequence number the next frame must carry; advances when a message completes. */
   private nextSeq = 0
   /** Payload bytes of the message in progress: `buffer[0, length)`. */
@@ -165,10 +172,20 @@ export class FrameDecoder {
    * bytes excluded) the decoder accepts; a message of exactly this size is accepted.
    */
   constructor(opts: { maxMessageBytes: number }) {
-    if (!Number.isSafeInteger(opts.maxMessageBytes) || opts.maxMessageBytes < 0) {
-      throw new RangeError(`Invalid message size cap: ${opts.maxMessageBytes}`)
-    }
-    this.maxMessageBytes = opts.maxMessageBytes
+    this.maxMessageBytes = checkCap(opts.maxMessageBytes)
+  }
+
+  /**
+   * Change the cap for every frame accepted from now on, including the rest of a message
+   * in progress: a raised cap lets that message grow to the new size, a lowered one
+   * rejects it once its reassembled length passes the new cap. A session raises the cap
+   * once its peer is authenticated.
+   *
+   * @param maxMessageBytes - New largest reassembled message, as for the constructor.
+   * @throws `RangeError` for a value that is not a non-negative safe integer.
+   */
+  setMaxMessageBytes(maxMessageBytes: number): void {
+    this.maxMessageBytes = checkCap(maxMessageBytes)
   }
 
   /**
