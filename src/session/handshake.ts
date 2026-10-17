@@ -5,11 +5,21 @@ import { CHANNEL_PROTOCOL_ID, DEFAULTS } from '../types.js'
 import type { PubKeyHex, WalletLike } from '../types.js'
 import { fromHex, randomBytes, toBase64, toHex, utf8Encode } from '../util/bytes.js'
 import { WebRTPayError } from '../util/errors.js'
-import { AuthenticatedPeer } from './AuthenticatedPeer.js'
+import { AuthenticatedPeer, MAX_BACKLOG } from './AuthenticatedPeer.js'
 
 /** First line of every channel-binding transcript. */
 const BINDING_LABEL = 'webrtpay/1 channel-binding'
 const NONCE_BYTES = 32
+/**
+ * Most peer messages waiting while a handshake step awaits the wallet or the link, until
+ * this side sends `ready`: a compliant peer has sent no more than hello, auth and ready.
+ */
+const MAX_INBOX_BEFORE_READY = 3
+/**
+ * The same once this side has sent `ready`: the peer's ready, then the start of its
+ * session, which the session keeps up to its own backlog limit.
+ */
+const MAX_INBOX_AFTER_READY = 1 + MAX_BACKLOG
 
 /** What one side signs, or checks the other side signed, for a channel. */
 export interface BindingTranscriptInput {
@@ -78,7 +88,9 @@ export interface AuthenticateOptions {
  *
  * @throws `WebRTPayError('auth_failed')` — link closed — when the peer's signature does
  * not verify, its key is not `expectedPeer`, its hello is malformed (a non-canonical key,
- * say) or repeats this side's nonce, it sends anything out of turn, or the wallet fails;
+ * say) or repeats this side's nonce, it sends anything out of turn, it sends more messages
+ * than the handshake can have waiting (more than hello, auth and ready while this side is
+ * still signing or verifying), or the wallet fails;
  * `WebRTPayError('timeout')` — link closed — after `timeoutMs`; the link's close reason
  * (or `closed`) when it closes first; `RangeError` for an invalid `maxMessageBytes`.
  */
@@ -119,6 +131,13 @@ class Handshake {
   ) {
     // Listen before anything else: the link drops messages nobody is listening for.
     this.offMessage = link.onMessage(m => {
+      // Messages wait here unchecked while a step is busy, so a peer that floods before it
+      // has authenticated must not be able to grow the queue.
+      const limit = this.expecting === 'ready' ? MAX_INBOX_AFTER_READY : MAX_INBOX_BEFORE_READY
+      if (this.inbox.length >= limit) {
+        this.fail(authFailed('Peer sent too many messages during the handshake'))
+        return
+      }
       this.inbox.push(m)
       this.pump()
     })

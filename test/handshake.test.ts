@@ -463,6 +463,53 @@ describe('authenticate over loopback', () => {
     expect((await r.session!.waitFor(isPayment, 10000)).id).toBe('right-after')
   })
 
+  /** More messages than a compliant peer can have waiting before it has A's ready. */
+  const flood = (): PaymentWire[] => Array.from({ length: 20 }, (_, i) => payment(`flood-${i}`))
+
+  it.each<[string, (s: Script, gate: Promise<void>) => Promise<object[]>]>([
+    [
+      'signs',
+      async (s, gate) => {
+        const sign = s.A.wallet.createSignature.bind(s.A.wallet)
+        jest.spyOn(s.A.wallet, 'createSignature').mockImplementation(async args => {
+          await gate
+          return sign(args)
+        })
+        return [s.hello, ...flood()]
+      }
+    ],
+    [
+      'verifies',
+      async (s, gate) => {
+        const verify = s.A.wallet.verifySignature.bind(s.A.wallet)
+        jest.spyOn(s.A.wallet, 'verifySignature').mockImplementation(async args => {
+          await gate
+          return verify(args)
+        })
+        return [s.hello, await bAuth(s), ...flood()]
+      }
+    ]
+  ])(
+    'rejects with auth_failed and closes the link when the peer floods while A %s',
+    async (_name, script) => {
+      // A's wallet call stays pending until A has given up, so only the queue limit can end
+      // the handshake before its timeout.
+      let release = (): void => undefined
+      const gate = new Promise<void>(resolve => {
+        release = () => resolve()
+      })
+      try {
+        const r = await scriptedPeer(s => script(s, gate), { timeoutMs: 2000 })
+        expect(r.code).toBe('auth_failed')
+        expect(r.aClose?.code).toBe('auth_failed')
+        expect(r.aClose?.message).toBe('Peer sent too many messages during the handshake')
+        expect(r.seenByB).not.toContainEqual({ t: 'ready' })
+      } finally {
+        release()
+      }
+    }
+  )
+
   it.each<[string, (s: Script) => Promise<object[]> | object[]]>([
     ['a payment instead of a hello', () => [payment('early')]],
     ['ready before auth', s => [s.hello, { t: 'ready' }]],

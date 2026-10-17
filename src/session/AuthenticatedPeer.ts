@@ -6,7 +6,7 @@ import { Emitter } from '../util/emitter.js'
 import { WebRTPayError } from '../util/errors.js'
 
 /** Most messages kept for a session nobody has started reading yet. */
-const MAX_BACKLOG = 64
+export const MAX_BACKLOG = 64
 
 /**
  * A data channel session whose peer proved its identity key (see `authenticate`, which
