@@ -1,0 +1,1093 @@
+import { afterEach, beforeAll, beforeEach, describe, expect, it, jest } from '@jest/globals'
+import { createHmac } from 'node:crypto'
+import { createServer } from 'node:http'
+import type { Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { PrivateKey, ProtoWallet } from '@bsv/sdk'
+import { WebSocket as WsClient } from 'ws'
+import { createRelayServer, turnCredentials } from '../server/index.js'
+import type { RelayServer, RelayServerOptions } from '../server/index.js'
+import { relayOptionsFromEnv } from '../server/env.js'
+import { isLoopbackHost } from '../server/relay.js'
+import { RelaySignaler, relayAuthData } from '../src/signaling/RelaySignaler.js'
+import type { RelaySignalerOptions } from '../src/signaling/RelaySignaler.js'
+import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
+import type { SignalEnvelope } from '../src/signaling/types.js'
+import { RELAY_PROTOCOL_ID } from '../src/types.js'
+import { randomBytes, toBase64, toBase64Url, toHex } from '../src/util/bytes.js'
+import { WebRTPayError } from '../src/util/errors.js'
+
+interface Party {
+  wallet: ProtoWallet
+  key: string
+}
+
+async function party(): Promise<Party> {
+  const wallet = new ProtoWallet(PrivateKey.fromRandom())
+  const { publicKey } = await wallet.getPublicKey({ identityKey: true })
+  return { wallet, key: publicKey }
+}
+
+function newSid(): string {
+  return toBase64Url(randomBytes(16))
+}
+
+function env(ciphertext = toBase64(randomBytes(48))): SignalEnvelope {
+  return { v: 1, sid: newSid(), ciphertext }
+}
+
+/** Collects deliveries from `listen` and hands them out in order. */
+function inbox(): {
+  got: Array<[string, SignalEnvelope]>
+  fn: (from: string, e: SignalEnvelope) => void
+  next(): Promise<[string, SignalEnvelope]>
+} {
+  const got: Array<[string, SignalEnvelope]> = []
+  const waiters: Array<() => void> = []
+  let read = 0
+  return {
+    got,
+    fn(from, e) {
+      got.push([from, e])
+      waiters.shift()?.()
+    },
+    async next() {
+      while (read >= got.length) await new Promise<void>(r => waiters.push(r))
+      return got[read++]
+    }
+  }
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 5000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (!check()) {
+    if (Date.now() > until) throw new Error('condition not met in time')
+    await new Promise(r => setTimeout(r, 20))
+  }
+}
+
+/** A raw `ws` client that records every frame, for driving the wire protocol directly. */
+interface Raw {
+  ws: WsClient
+  next(): Promise<Record<string, unknown>>
+  send(frame: unknown): void
+  closed: Promise<number>
+}
+
+function raw(url: string, o: { headers?: Record<string, string>; autoPong?: boolean } = {}): Raw {
+  const ws = new WsClient(url, { headers: o.headers, autoPong: o.autoPong ?? true })
+  const frames: Array<Record<string, unknown>> = []
+  const waiters: Array<() => void> = []
+  ws.on('message', data => {
+    frames.push(JSON.parse(String(data)) as Record<string, unknown>)
+    waiters.shift()?.()
+  })
+  ws.on('error', () => {})
+  const closed = new Promise<number>(resolve => ws.on('close', code => resolve(code)))
+  return {
+    ws,
+    async next() {
+      while (frames.length === 0) await new Promise<void>(r => waiters.push(r))
+      return frames.shift() as Record<string, unknown>
+    },
+    send(frame) {
+      ws.send(typeof frame === 'string' ? frame : JSON.stringify(frame))
+    },
+    closed
+  }
+}
+
+/** Answer the relay's challenge for `p`, signing `signedUrl`. */
+async function authenticate(r: Raw, p: Party, signedUrl: string): Promise<void> {
+  const challenge = await r.next()
+  expect(challenge.t).toBe('challenge')
+  const nonce = challenge.nonce as string
+  const { signature } = await p.wallet.createSignature({
+    data: relayAuthData(signedUrl, nonce),
+    protocolID: RELAY_PROTOCOL_ID,
+    keyID: nonce,
+    counterparty: 'anyone'
+  })
+  r.send({ t: 'auth', identityKey: p.key, signature: toHex(Uint8Array.from(signature)) })
+}
+
+/** The first message an upgrade to `url` fails with. */
+function upgradeError(url: string): Promise<string> {
+  return new Promise(resolve => {
+    const ws = new WsClient(url)
+    ws.on('error', e => resolve(e.message))
+    ws.on('open', () => {
+      ws.close()
+      resolve('opened')
+    })
+  })
+}
+
+async function freePort(): Promise<number> {
+  const s = createServer()
+  await new Promise<void>(r => s.listen(0, '127.0.0.1', r))
+  const { port } = s.address() as AddressInfo
+  await new Promise(r => s.close(r))
+  return port
+}
+
+function hmacBase64(secret: string, s: string): string {
+  return createHmac('sha1', secret).update(s).digest('base64')
+}
+
+const SDP = 'v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n'
+
+describe('turnCredentials', () => {
+  it('derives coturn REST credentials from the secret and identity key', () => {
+    expect(
+      turnCredentials({ secret: 's', identityKey: '02ab', ttlSeconds: 60, now: 1_000_000_000_000 })
+    ).toEqual({
+      username: '1000000060:02ab',
+      credential: hmacBase64('s', '1000000060:02ab'),
+      expiresAt: 1_000_000_060_000
+    })
+  })
+
+  it('defaults to a one hour ttl from the current time', () => {
+    const before = Math.floor(Date.now() / 1000)
+    const { username, credential, expiresAt } = turnCredentials({
+      secret: 'k',
+      identityKey: '03cd'
+    })
+    const after = Math.floor(Date.now() / 1000)
+    const [expiry, key] = username.split(':')
+    expect(key).toBe('03cd')
+    expect(Number(expiry)).toBeGreaterThanOrEqual(before + 3600)
+    expect(Number(expiry)).toBeLessThanOrEqual(after + 3600)
+    expect(expiresAt).toBe(Number(expiry) * 1000)
+    expect(credential).toBe(hmacBase64('k', username))
+  })
+
+  it('rejects a ttl that is not a positive whole number of seconds and an empty secret', () => {
+    for (const ttlSeconds of [0, -1, 1.5, Number.NaN]) {
+      expect(() => turnCredentials({ secret: 's', identityKey: '02ab', ttlSeconds })).toThrow(
+        RangeError
+      )
+    }
+    expect(() => turnCredentials({ secret: '', identityKey: '02ab' })).toThrow(TypeError)
+  })
+})
+
+describe('relay authentication signature', () => {
+  it('verifies with ProtoWallet("anyone") for the signer and only for the signed url', async () => {
+    const p = await party()
+    const nonce = toBase64Url(randomBytes(32))
+    const { signature } = await p.wallet.createSignature({
+      data: relayAuthData('ws://127.0.0.1:8787', nonce),
+      protocolID: RELAY_PROTOCOL_ID,
+      keyID: nonce,
+      counterparty: 'anyone'
+    })
+    const anyone = new ProtoWallet('anyone')
+    const verify = (url: string): Promise<unknown> =>
+      anyone.verifySignature({
+        data: relayAuthData(url, nonce),
+        signature,
+        protocolID: RELAY_PROTOCOL_ID,
+        keyID: nonce,
+        counterparty: p.key
+      })
+    await expect(verify('ws://127.0.0.1:8787')).resolves.toEqual({ valid: true })
+    await expect(verify('ws://127.0.0.1:8787/')).resolves.toEqual({ valid: true })
+    await expect(verify('ws://127.0.0.1:8788')).rejects.toThrow()
+  })
+
+  it('signs the prefix, the url without trailing slashes and the nonce', () => {
+    const text = new TextDecoder().decode(Uint8Array.from(relayAuthData('wss://r.example//', 'n1')))
+    expect(text).toBe('webrtpay-relay/1|wss://r.example|n1')
+  })
+})
+
+describe('relay', () => {
+  let alice: Party
+  let bob: Party
+  let carol: Party
+  const cleanups: Array<() => unknown> = []
+
+  beforeAll(async () => {
+    ;[alice, bob, carol] = await Promise.all([party(), party(), party()])
+  })
+
+  afterEach(async () => {
+    while (cleanups.length > 0) await cleanups.pop()?.()
+  })
+
+  async function relay(o: Partial<RelayServerOptions> = {}): Promise<RelayServer> {
+    const r = await createRelayServer({ port: 0, host: '127.0.0.1', ...o })
+    cleanups.push(() => r.close())
+    return r
+  }
+
+  function signaler(
+    at: RelayServer | string,
+    p: Party,
+    o: Partial<RelaySignalerOptions> = {}
+  ): RelaySignaler {
+    const s = new RelaySignaler({
+      url: typeof at === 'string' ? at : at.url,
+      wallet: p.wallet,
+      ...o
+    })
+    cleanups.push(() => s.close())
+    return s
+  }
+
+  function rawAt(url: string, o: { headers?: Record<string, string>; autoPong?: boolean } = {}) {
+    const r = raw(url, o)
+    cleanups.push(() => r.ws.terminate())
+    return r
+  }
+
+  describe('server', () => {
+    it('reports its url and port and answers GET /health', async () => {
+      const r = await relay()
+      expect(r.url).toBe(`ws://127.0.0.1:${r.port}`)
+      const res = await fetch(`http://127.0.0.1:${r.port}/health`)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ status: 'ok' })
+      expect((await fetch(`http://127.0.0.1:${r.port}/nope`)).status).toBe(404)
+    })
+
+    it('refuses websocket upgrades on other paths', async () => {
+      const r = await relay({ path: '/relay' })
+      expect(r.url).toBe(`ws://127.0.0.1:${r.port}/relay`)
+      expect(await upgradeError(`ws://127.0.0.1:${r.port}/other`)).toContain('404')
+    })
+
+    it('challenges, then sends ready and ice once the signature verifies', async () => {
+      const r = await relay()
+      const a = rawAt(r.url)
+      await authenticate(a, alice, r.url)
+      expect(await a.next()).toEqual({ t: 'ready', identityKey: alice.key })
+      expect(await a.next()).toEqual({ t: 'ice', iceServers: [] })
+    })
+
+    it('uses a fresh 32-byte base64url nonce for every socket', async () => {
+      const r = await relay()
+      const nonces = await Promise.all(
+        [rawAt(r.url), rawAt(r.url)].map(async c => (await c.next()).nonce)
+      )
+      for (const n of nonces) expect(n).toMatch(/^[A-Za-z0-9_-]{43}$/)
+      expect(nonces[0]).not.toBe(nonces[1])
+    })
+
+    it('closes a client that signed the wrong url with auth_failed', async () => {
+      const r = await relay()
+      const a = rawAt(r.url)
+      await authenticate(a, alice, 'ws://evil.example')
+      expect(await a.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await a.closed).toBe(1008)
+      await waitFor(() => r.stats().sockets === 0)
+      expect(r.stats()).toEqual({ sockets: 0, identities: 0 })
+    })
+
+    it('closes a client whose signature belongs to another key with auth_failed', async () => {
+      const r = await relay()
+      const a = rawAt(r.url)
+      const challenge = await a.next()
+      const nonce = challenge.nonce as string
+      const { signature } = await carol.wallet.createSignature({
+        data: relayAuthData(r.url, nonce),
+        protocolID: RELAY_PROTOCOL_ID,
+        keyID: nonce,
+        counterparty: 'anyone'
+      })
+      a.send({ t: 'auth', identityKey: alice.key, signature: toHex(Uint8Array.from(signature)) })
+      expect(await a.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await a.closed).toBe(1008)
+    })
+
+    it('verifies against the public urls instead of the Host header when they are set', async () => {
+      const r = await relay({ publicUrls: ['wss://relay.example/', 'wss://relay2.example'] })
+      const a = rawAt(r.url)
+      await authenticate(a, alice, 'wss://relay.example')
+      expect(await a.next()).toEqual({ t: 'ready', identityKey: alice.key })
+
+      const b = rawAt(r.url)
+      await authenticate(b, bob, r.url)
+      expect(await b.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await b.closed).toBe(1008)
+    })
+
+    it('expects a wss url behind a proxy that forwards https', async () => {
+      const r = await relay({ path: '/relay/' })
+      const host = `127.0.0.1:${r.port}`
+      const a = rawAt(r.url, { headers: { 'x-forwarded-proto': 'https' } })
+      await authenticate(a, alice, `wss://${host}/relay`)
+      expect(await a.next()).toEqual({ t: 'ready', identityKey: alice.key })
+
+      const b = rawAt(r.url, { headers: { 'x-forwarded-proto': 'https' } })
+      await authenticate(b, bob, `ws://${host}/relay`)
+      expect(await b.next()).toEqual({ t: 'error', code: 'auth_failed' })
+    })
+
+    it('rejects a signature over the url a forged Host names when public urls are set', async () => {
+      // A relay the victim dialed (evil.example) replays this relay's nonce to the
+      // victim, then presents the victim's signature here with a matching Host.
+      const r = await relay({ publicUrls: ['wss://relay.example'] })
+      const headers = { host: 'evil.example', 'x-forwarded-proto': 'https' }
+      const a = rawAt(r.url, { headers })
+      await authenticate(a, alice, 'wss://evil.example')
+      expect(await a.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await a.closed).toBe(1008)
+
+      const b = rawAt(r.url, { headers })
+      await authenticate(b, bob, 'wss://relay.example')
+      expect(await b.next()).toEqual({ t: 'ready', identityKey: bob.key })
+    })
+
+    it('refuses to listen on a non-loopback address without public urls', async () => {
+      const port = await freePort()
+      const logs: string[] = []
+      await expect(
+        createRelayServer({ port, host: '0.0.0.0', log: m => logs.push(m) })
+      ).rejects.toThrow('publicUrls is required')
+      expect(logs).toEqual([])
+      // The port was released: listening on it again succeeds.
+      const again = await relay({ port, host: '127.0.0.1' })
+      expect(again.port).toBe(port)
+    })
+
+    it('listens on a non-loopback address with public urls or trustHostHeader', async () => {
+      const pub = await relay({ host: '0.0.0.0', publicUrls: ['wss://relay.example'] })
+      const a = rawAt(`ws://127.0.0.1:${pub.port}`)
+      await authenticate(a, alice, 'wss://relay.example')
+      expect(await a.next()).toEqual({ t: 'ready', identityKey: alice.key })
+
+      const logs: string[] = []
+      const trusting = await relay({
+        host: '0.0.0.0',
+        trustHostHeader: true,
+        log: m => logs.push(m)
+      })
+      const url = `ws://127.0.0.1:${trusting.port}`
+      const b = rawAt(url)
+      await authenticate(b, bob, url)
+      expect(await b.next()).toEqual({ t: 'ready', identityKey: bob.key })
+      expect(logs[0]).toContain('WARNING: no publicUrls')
+    })
+
+    it('refuses a non-loopback server it is attached to without public urls, leaving it open', async () => {
+      const http = createServer((_req, res) => res.end('app'))
+      await new Promise<void>(r => http.listen(0, '0.0.0.0', r))
+      cleanups.push(() => new Promise(r => http.close(r)))
+      await expect(createRelayServer({ server: http })).rejects.toThrow('publicUrls is required')
+      expect(http.listening).toBe(true)
+      expect(http.listenerCount('upgrade')).toBe(0)
+      const { port } = http.address() as AddressInfo
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe('app')
+    })
+
+    it('treats only loopback hosts as loopback', () => {
+      const loopback = [
+        'localhost',
+        'LOCALHOST',
+        '127.0.0.1',
+        '127.1.2.3',
+        '::1',
+        '::ffff:127.0.0.1'
+      ]
+      const other = [
+        '0.0.0.0',
+        '::',
+        '10.0.0.1',
+        '128.0.0.1',
+        '127.0.0.256',
+        '::ffff:10.0.0.1',
+        'relay.localhost',
+        'example.com',
+        ''
+      ]
+      expect(loopback.filter(isLoopbackHost)).toEqual(loopback)
+      expect(other.filter(isLoopbackHost)).toEqual([])
+    })
+
+    it('rejects a signal sent before authenticating and never forwards it', async () => {
+      const r = await relay()
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+
+      const m = rawAt(r.url)
+      expect((await m.next()).t).toBe('challenge')
+      const e = env()
+      m.send({ t: 'signal', to: bob.key, envelope: e })
+      expect(await m.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await m.closed).toBe(1008)
+
+      const control = env()
+      await signaler(r, alice).send(bob.key, control)
+      expect(await box.next()).toEqual([alice.key, control])
+      expect(box.got).toHaveLength(1)
+    })
+
+    it('closes a socket that does not authenticate in time', async () => {
+      const r = await relay({ limits: { authTimeoutMs: 100 } })
+      const a = rawAt(r.url)
+      expect((await a.next()).t).toBe('challenge')
+      expect(await a.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await a.closed).toBe(1008)
+    })
+
+    it('answers malformed frames from an authenticated socket with bad_request and keeps it open', async () => {
+      const r = await relay()
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+      const a = rawAt(r.url)
+      await authenticate(a, alice, r.url)
+      await a.next()
+      await a.next()
+
+      const e = env()
+      a.send('not json')
+      expect(await a.next()).toEqual({ t: 'error', code: 'bad_request' })
+      a.send({ t: 'signal', to: 'zz', envelope: e })
+      expect(await a.next()).toEqual({ t: 'error', code: 'bad_request', ref: e.sid })
+      a.send({ t: 'signal', to: bob.key, envelope: { v: 2, sid: 's', ciphertext: '' } })
+      expect(await a.next()).toEqual({ t: 'error', code: 'bad_request' })
+      a.send({ t: 'auth', identityKey: alice.key, signature: '00' })
+      expect(await a.next()).toEqual({ t: 'error', code: 'bad_request' })
+      a.ws.send(Uint8Array.of(1, 2, 3))
+      expect(await a.next()).toEqual({ t: 'error', code: 'bad_request' })
+
+      a.send({ t: 'signal', to: bob.key, envelope: e })
+      expect(await a.next()).toEqual({ t: 'sent', ref: e.sid })
+      expect(await box.next()).toEqual([alice.key, e])
+      expect(box.got).toHaveLength(1)
+    })
+
+    it('forwards only the envelope fields with the authenticated sender', async () => {
+      const r = await relay()
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+      const a = rawAt(r.url)
+      await authenticate(a, alice, r.url)
+      await a.next()
+      await a.next()
+
+      const e = env()
+      a.send({ t: 'signal', to: bob.key, from: carol.key, envelope: { ...e, from: carol.key } })
+      expect(await a.next()).toEqual({ t: 'sent', ref: e.sid })
+      const [from, got] = await box.next()
+      expect(from).toBe(alice.key)
+      expect(got).toEqual(e)
+      expect(Object.keys(got).sort()).toEqual(['ciphertext', 'sid', 'v'])
+    })
+
+    it('limits each identity to five sockets, checked after the signature', async () => {
+      const r = await relay()
+      const five = Array.from({ length: 5 }, () => signaler(r, alice))
+      await Promise.all(five.map(s => s.connect()))
+      expect(r.stats()).toEqual({ sockets: 5, identities: 1 })
+
+      const forged = rawAt(r.url)
+      await authenticate(forged, carol, r.url)
+      await forged.next()
+      const impostor = rawAt(r.url)
+      expect((await impostor.next()).t).toBe('challenge')
+      impostor.send({ t: 'auth', identityKey: alice.key, signature: '3006020101020101' })
+      expect(await impostor.next()).toEqual({ t: 'error', code: 'auth_failed' })
+
+      const sixth = rawAt(r.url)
+      await authenticate(sixth, alice, r.url)
+      expect(await sixth.next()).toEqual({ t: 'error', code: 'rate_limited' })
+      expect(await sixth.closed).toBe(1013)
+      await expect(signaler(r, alice).connect()).rejects.toMatchObject({ code: 'rate_limited' })
+      await waitFor(() => r.stats().sockets === 6)
+      expect(r.stats()).toEqual({ sockets: 6, identities: 2 })
+    })
+
+    it('refuses upgrades beyond the global socket cap', async () => {
+      const r = await relay({ limits: { maxSockets: 1 } })
+      await signaler(r, alice).connect()
+      expect(await upgradeError(r.url)).toContain('503')
+      expect(r.stats()).toEqual({ sockets: 1, identities: 1 })
+    })
+
+    it('terminates sockets that stop answering pings', async () => {
+      const r = await relay({ limits: { pingIntervalMs: 250 } })
+      const healthy = signaler(r, bob)
+      await healthy.connect()
+      const silent = rawAt(r.url, { autoPong: false })
+      await authenticate(silent, alice, r.url)
+      expect(await silent.next()).toEqual({ t: 'ready', identityKey: alice.key })
+      expect(await silent.closed).toBe(1006)
+      await new Promise(res => setTimeout(res, 600))
+      expect(r.stats()).toEqual({ sockets: 1, identities: 1 })
+    })
+
+    it('includes STUN urls and TURN REST credentials in ice when configured', async () => {
+      const r = await relay({
+        stunUrls: ['stun:127.0.0.1:3478'],
+        turn: { secret: 'turn-secret', urls: ['turn:127.0.0.1:3478'], ttlSeconds: 600 }
+      })
+      const seen: RTCIceServer[][] = []
+      const s = signaler(r, alice, { onIceServers: servers => seen.push(servers) })
+      expect(s.iceServers()).toBeUndefined()
+      const before = Math.floor(Date.now() / 1000)
+      await s.connect()
+      const servers = s.iceServers() as RTCIceServer[]
+      expect(seen).toEqual([servers])
+      expect(servers).toHaveLength(2)
+      expect(servers[0]).toEqual({ urls: ['stun:127.0.0.1:3478'] })
+      const turn = servers[1]
+      expect(turn.urls).toEqual(['turn:127.0.0.1:3478'])
+      const [expiry, key] = (turn.username as string).split(':')
+      expect(key).toBe(alice.key)
+      expect(Number(expiry)).toBeGreaterThanOrEqual(before + 600)
+      expect(Number(expiry)).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 600)
+      expect(turn.credential).toBe(hmacBase64('turn-secret', turn.username as string))
+    })
+
+    it('attaches to an existing http server without taking over its requests', async () => {
+      const http: Server = createServer((_req, res) => res.end('app'))
+      cleanups.push(
+        () =>
+          new Promise(resolve => {
+            http.closeAllConnections()
+            http.close(resolve)
+          })
+      )
+      const pending = relay({ server: http, path: '/relay' })
+      http.listen(0, '127.0.0.1')
+      const r = await pending
+      const { port } = http.address() as AddressInfo
+      expect(r.port).toBe(port)
+      expect(r.url).toBe(`ws://127.0.0.1:${port}/relay`)
+      expect(await (await fetch(`http://127.0.0.1:${port}/health`)).text()).toBe('app')
+
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+      const e = env()
+      await signaler(r, alice).send(bob.key, e)
+      expect(await box.next()).toEqual([alice.key, e])
+
+      await r.close()
+      expect(http.listening).toBe(true)
+    })
+
+    it('closes every socket and stops listening on close', async () => {
+      const r = await createRelayServer({ port: 0, host: '127.0.0.1' })
+      const a = raw(r.url)
+      await authenticate(a, alice, r.url)
+      await a.next()
+      await r.close()
+      expect(await a.closed).toBe(1001)
+      expect(await upgradeError(r.url)).toContain('ECONNREFUSED')
+    })
+  })
+
+  describe('RelaySignaler', () => {
+    it('delivers an envelope with the authenticated sender', async () => {
+      const r = await relay()
+      const box = inbox()
+      const b = signaler(r, bob)
+      await b.listen(box.fn)
+      const e = env()
+      await signaler(r, alice).send(bob.key, e)
+      expect(await box.next()).toEqual([alice.key, e])
+      expect(r.stats()).toEqual({ sockets: 2, identities: 2 })
+    })
+
+    it('carries a sealed offer and answer end to end', async () => {
+      const r = await relay()
+      const a = signaler(r, alice)
+      const b = signaler(r, bob)
+      const aBox = inbox()
+      const bBox = inbox()
+      await a.listen(aBox.fn)
+      await b.listen(bBox.fn)
+
+      const sid = newSid()
+      const offer = await sealSignal(alice.wallet, {
+        v: 1,
+        kind: 'offer',
+        sid,
+        from: alice.key,
+        to: bob.key,
+        ts: Date.now(),
+        purpose: 'payment',
+        sdp: SDP
+      })
+      await a.send(bob.key, offer)
+      const [offerFrom, offerEnv] = await bBox.next()
+      await expect(
+        openSignal(bob.wallet, offerFrom, offerEnv, { me: bob.key, replay: new ReplayCache() })
+      ).resolves.toMatchObject({ kind: 'offer', sid, from: alice.key, to: bob.key, sdp: SDP })
+
+      const answer = await sealSignal(bob.wallet, {
+        v: 1,
+        kind: 'answer',
+        sid,
+        from: bob.key,
+        to: alice.key,
+        ts: Date.now(),
+        purpose: 'payment',
+        sdp: SDP + 'a=setup:active\r\n'
+      })
+      await b.send(alice.key, answer)
+      const [answerFrom, answerEnv] = await aBox.next()
+      await expect(
+        openSignal(alice.wallet, answerFrom, answerEnv, {
+          me: alice.key,
+          replay: new ReplayCache()
+        })
+      ).resolves.toMatchObject({ kind: 'answer', sid, from: bob.key, to: alice.key })
+    })
+
+    it('delivers to every listener and every socket of the recipient', async () => {
+      const r = await relay()
+      const one = inbox()
+      const two = inbox()
+      const three = inbox()
+      const b1 = signaler(r, bob)
+      await b1.listen(one.fn)
+      await b1.listen(two.fn)
+      await signaler(r, bob).listen(three.fn)
+      const e = env()
+      await signaler(r, alice).send(bob.key, e)
+      for (const box of [one, two, three]) expect(await box.next()).toEqual([alice.key, e])
+    })
+
+    it('rejects peer_unreachable for a recipient that is not connected', async () => {
+      const r = await relay()
+      const p = signaler(r, alice).send(bob.key, env())
+      await expect(p).rejects.toBeInstanceOf(WebRTPayError)
+      await expect(p).rejects.toMatchObject({ code: 'peer_unreachable' })
+    })
+
+    it('goes offline once its last listener unsubscribes', async () => {
+      const r = await relay()
+      const b = signaler(r, bob)
+      const stop = await b.listen(() => {})
+      const a = signaler(r, alice)
+      await a.send(bob.key, env())
+      await stop()
+      // alice only held her socket for the send, so both are gone
+      await waitFor(() => r.stats().sockets === 0)
+      await expect(a.send(bob.key, env())).rejects.toMatchObject({ code: 'peer_unreachable' })
+    })
+
+    it('rejects an envelope over 16384 bytes with too_large and accepts exactly 16384', async () => {
+      const r = await relay()
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+      const a = signaler(r, alice)
+
+      await expect(a.send(bob.key, env('A'.repeat(17 * 1024)))).rejects.toMatchObject({
+        code: 'too_large'
+      })
+      const sid = newSid()
+      const overhead = JSON.stringify({ v: 1, sid, ciphertext: '' }).length
+      const exact = { v: 1 as const, sid, ciphertext: 'A'.repeat(16384 - overhead) }
+      await a.send(bob.key, exact)
+      expect(await box.next()).toEqual([alice.key, exact])
+      expect(box.got).toHaveLength(1)
+    })
+
+    it('rate limits a socket to 20 messages per 10 seconds', async () => {
+      const r = await relay()
+      const box = inbox()
+      await signaler(r, bob).listen(box.fn)
+      const a = signaler(r, alice)
+      await a.connect()
+      const results = await Promise.allSettled(
+        Array.from({ length: 25 }, () => a.send(bob.key, env()))
+      )
+      const sent = results.filter(x => x.status === 'fulfilled')
+      const limited = results.filter(x => x.status === 'rejected')
+      expect(limited.length).toBeGreaterThan(0)
+      for (const x of limited) {
+        expect((x as PromiseRejectedResult).reason).toMatchObject({ code: 'rate_limited' })
+      }
+      // the auth frame spent one of the 20 tokens
+      expect(sent.length).toBeGreaterThanOrEqual(19)
+      expect(sent.length).toBeLessThanOrEqual(20)
+      await waitFor(() => box.got.length === sent.length)
+    })
+
+    it('rejects auth_failed when the relay expects a different public url', async () => {
+      const r = await relay({ publicUrls: ['wss://relay.example'] })
+      await expect(signaler(r, alice).connect()).rejects.toMatchObject({ code: 'auth_failed' })
+      await waitFor(() => r.stats().sockets === 0)
+      expect(r.stats()).toEqual({ sockets: 0, identities: 0 })
+    })
+
+    it('rejects peer_unreachable when no relay is listening', async () => {
+      const url = `ws://127.0.0.1:${await freePort()}`
+      await expect(signaler(url, alice).connect()).rejects.toMatchObject({
+        code: 'peer_unreachable'
+      })
+      await expect(signaler(url, alice).listen(() => {})).rejects.toMatchObject({
+        code: 'peer_unreachable'
+      })
+      await expect(signaler(url, alice).send(bob.key, env())).rejects.toMatchObject({
+        code: 'peer_unreachable'
+      })
+    })
+
+    it('reports empty ice servers when the relay has none configured', async () => {
+      const r = await relay()
+      const s = signaler(r, alice)
+      await s.connect()
+      expect(s.iceServers()).toEqual([])
+    })
+
+    it('reconnects a listener after the relay restarts', async () => {
+      const first = await createRelayServer({ port: 0, host: '127.0.0.1' })
+      const port = first.port
+      const box = inbox()
+      await signaler(first, bob).listen(box.fn)
+      await first.close()
+
+      const second = await relay({ port })
+      await waitFor(() => second.stats().identities === 1)
+      const e = env()
+      await signaler(second, alice).send(bob.key, e)
+      expect(await box.next()).toEqual([alice.key, e])
+    })
+
+    it('is finished after close', async () => {
+      const r = await relay()
+      const s = signaler(r, alice)
+      await s.listen(() => {})
+      await s.close()
+      await waitFor(() => r.stats().sockets === 0)
+      await expect(s.connect()).rejects.toMatchObject({ code: 'closed' })
+      await expect(s.send(bob.key, env())).rejects.toMatchObject({ code: 'closed' })
+      await expect(s.listen(() => {})).rejects.toMatchObject({ code: 'closed' })
+      await s.close()
+    })
+
+    it('isolates a throwing listener', async () => {
+      const r = await relay()
+      const box = inbox()
+      const b = signaler(r, bob)
+      await b.listen(() => {
+        throw new Error('boom')
+      })
+      await b.listen(async () => {
+        throw new Error('async boom')
+      })
+      await b.listen(box.fn)
+      const e = env()
+      await signaler(r, alice).send(bob.key, e)
+      expect(await box.next()).toEqual([alice.key, e])
+    })
+  })
+})
+
+/**
+ * A stand-in for the global `WebSocket` that plays the relay's side of the protocol
+ * on promise jobs (not timers), so fake timers drive only the signaler's own clock.
+ */
+class FakeSocket {
+  static instances: FakeSocket[] = []
+  /** up: full protocol; down: fails to connect; silent: never challenges; mute: never replies to signals. */
+  static mode: 'up' | 'down' | 'silent' | 'mute' = 'up'
+
+  readyState = 0
+  readonly frames: Array<Record<string, unknown>> = []
+  private readonly listeners = new Map<string, Set<(ev: unknown) => void>>()
+
+  constructor(readonly url: string) {
+    FakeSocket.instances.push(this)
+    const mode = FakeSocket.mode
+    void Promise.resolve().then(() => {
+      if (mode === 'down') {
+        this.fire('error', {})
+        this.finish(1006)
+        return
+      }
+      this.readyState = 1
+      this.fire('open', {})
+      if (mode !== 'silent')
+        this.message({ t: 'challenge', nonce: `n${FakeSocket.instances.length}` })
+    })
+  }
+
+  addEventListener(type: string, fn: (ev: unknown) => void): void {
+    let set = this.listeners.get(type)
+    if (set === undefined) this.listeners.set(type, (set = new Set()))
+    set.add(fn)
+  }
+
+  removeEventListener(type: string, fn: (ev: unknown) => void): void {
+    this.listeners.get(type)?.delete(fn)
+  }
+
+  send(data: string): void {
+    const frame = JSON.parse(data) as Record<string, unknown>
+    this.frames.push(frame)
+    void Promise.resolve().then(() => {
+      if (frame.t === 'auth') {
+        this.message({ t: 'ready', identityKey: frame.identityKey })
+        this.message({ t: 'ice', iceServers: [] })
+      } else if (frame.t === 'signal' && FakeSocket.mode !== 'mute') {
+        this.message({ t: 'sent', ref: (frame.envelope as SignalEnvelope).sid })
+      }
+    })
+  }
+
+  close(code = 1000): void {
+    if (this.readyState >= 2) return
+    this.readyState = 2
+    void Promise.resolve().then(() => this.finish(code))
+  }
+
+  /** The connection drops without a closing handshake. */
+  drop(): void {
+    this.finish(1006)
+  }
+
+  private message(frame: unknown): void {
+    if (this.readyState === 1) this.fire('message', { data: JSON.stringify(frame) })
+  }
+
+  private finish(code: number): void {
+    if (this.readyState === 3) return
+    this.readyState = 3
+    this.fire('close', { code, reason: '' })
+  }
+
+  private fire(type: string, ev: unknown): void {
+    for (const fn of [...(this.listeners.get(type) ?? [])]) fn(ev)
+  }
+}
+
+describe('RelaySignaler connection lifecycle', () => {
+  let alice: Party
+  const URL = 'ws://relay.test'
+
+  beforeAll(async () => {
+    alice = await party()
+  })
+
+  beforeEach(() => {
+    FakeSocket.instances = []
+    FakeSocket.mode = 'up'
+    jest.useFakeTimers()
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  function fake(o: Partial<RelaySignalerOptions> = {}): RelaySignaler {
+    return new RelaySignaler({
+      url: URL,
+      wallet: alice.wallet,
+      WebSocket: FakeSocket as unknown as typeof WebSocket,
+      ...o
+    })
+  }
+
+  function last(): FakeSocket {
+    return FakeSocket.instances[FakeSocket.instances.length - 1]
+  }
+
+  it('signs the configured url and sends the hex signature', async () => {
+    const s = fake({ url: `${URL}/` })
+    await s.connect()
+    const auth = FakeSocket.instances[0].frames[0]
+    expect(FakeSocket.instances[0].url).toBe(`${URL}/`)
+    expect(auth).toEqual({ t: 'auth', identityKey: alice.key, signature: expect.any(String) })
+    await expect(
+      new ProtoWallet('anyone').verifySignature({
+        data: relayAuthData(URL, 'n1'),
+        signature: Array.from(Buffer.from(auth.signature as string, 'hex')),
+        protocolID: RELAY_PROTOCOL_ID,
+        keyID: 'n1',
+        counterparty: alice.key
+      })
+    ).resolves.toEqual({ valid: true })
+    await s.close()
+  })
+
+  it('reconnects with backoff doubling from 1 s to 30 s while listening and resets after success', async () => {
+    const connected: number[] = []
+    const s = fake({ onIceServers: () => connected.push(Date.now()) })
+    const stop = await s.listen(() => {})
+    expect(FakeSocket.instances).toHaveLength(1)
+
+    FakeSocket.mode = 'down'
+    last().drop()
+    const delays = [1000, 2000, 4000, 8000, 16000, 30000, 30000]
+    for (const [i, d] of delays.entries()) {
+      await jest.advanceTimersByTimeAsync(d - 1)
+      expect(FakeSocket.instances).toHaveLength(i + 1)
+      await jest.advanceTimersByTimeAsync(1)
+      expect(FakeSocket.instances).toHaveLength(i + 2)
+    }
+
+    FakeSocket.mode = 'up'
+    await jest.advanceTimersByTimeAsync(30000)
+    expect(FakeSocket.instances).toHaveLength(delays.length + 2)
+    await waitForFake(() => connected.length === 2)
+
+    last().drop()
+    await jest.advanceTimersByTimeAsync(999)
+    expect(FakeSocket.instances).toHaveLength(delays.length + 2)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(FakeSocket.instances).toHaveLength(delays.length + 3)
+    await waitForFake(() => connected.length === 3)
+
+    await stop()
+    await s.close()
+  })
+
+  it('stops reconnecting once the last listener unsubscribes', async () => {
+    const s = fake()
+    const stop = await s.listen(() => {})
+    FakeSocket.mode = 'down'
+    last().drop()
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(FakeSocket.instances).toHaveLength(2)
+    await stop()
+    await jest.advanceTimersByTimeAsync(120000)
+    expect(FakeSocket.instances).toHaveLength(2)
+    await s.close()
+  })
+
+  it('closes a connection it only opened to send, and does not reconnect it', async () => {
+    const s = fake()
+    await s.send(alice.key, env())
+    await jest.advanceTimersByTimeAsync(0)
+    expect(FakeSocket.instances).toHaveLength(1)
+    expect(last().readyState).toBe(3)
+    await jest.advanceTimersByTimeAsync(120000)
+    expect(FakeSocket.instances).toHaveLength(1)
+    await s.close()
+  })
+
+  it('keeps an explicit connect open without reconnecting it, and reopens on demand', async () => {
+    const s = fake()
+    await s.connect()
+    await s.send(alice.key, env())
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(1)
+    last().drop()
+    await jest.advanceTimersByTimeAsync(120000)
+    expect(FakeSocket.instances).toHaveLength(1)
+    await s.send(alice.key, env())
+    expect(FakeSocket.instances).toHaveLength(2)
+    await s.close()
+    expect(last().readyState).toBe(3)
+  })
+
+  it('shares one connection between concurrent callers', async () => {
+    const s = fake()
+    await Promise.all([s.connect(), s.listen(() => {}), s.send(alice.key, env())])
+    expect(FakeSocket.instances).toHaveLength(1)
+    await s.close()
+  })
+
+  it('gives up on a relay that does not complete the handshake within 15 s', async () => {
+    FakeSocket.mode = 'silent'
+    const s = fake()
+    const p = s.connect()
+    const settled = expect(p).rejects.toMatchObject({ code: 'peer_unreachable' })
+    await jest.advanceTimersByTimeAsync(14999)
+    expect(last().readyState).toBe(1)
+    await jest.advanceTimersByTimeAsync(1)
+    await settled
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(3)
+    await s.close()
+  })
+
+  it('drops a connection whose relay does not confirm a send within 10 s', async () => {
+    const s = fake()
+    await s.connect()
+    FakeSocket.mode = 'mute'
+    const p = s.send(alice.key, env())
+    const settled = expect(p).rejects.toMatchObject({ code: 'peer_unreachable' })
+    await jest.advanceTimersByTimeAsync(9999)
+    expect(last().readyState).toBe(1)
+    await jest.advanceTimersByTimeAsync(1)
+    await settled
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(3)
+    await s.close()
+  })
+
+  it('rejects pending sends with closed when closed', async () => {
+    const s = fake()
+    await s.connect()
+    FakeSocket.mode = 'mute'
+    const p = s.send(alice.key, env())
+    const settled = expect(p).rejects.toMatchObject({ code: 'closed' })
+    await jest.advanceTimersByTimeAsync(0)
+    await s.close()
+    await settled
+  })
+
+  /** Let promise jobs run until `check` holds (the clock is fake, so no timers advance). */
+  async function waitForFake(check: () => boolean): Promise<void> {
+    for (let i = 0; i < 100 && !check(); i++) await jest.advanceTimersByTimeAsync(0)
+    expect(check()).toBe(true)
+  }
+})
+
+describe('relayOptionsFromEnv', () => {
+  it('refuses a non-loopback HOST, the default 0.0.0.0 included, without PUBLIC_URLS', () => {
+    for (const HOST of [undefined, '', '0.0.0.0', '::', '10.0.0.5', 'relay.example.com']) {
+      expect(() => relayOptionsFromEnv({ HOST })).toThrow('PUBLIC_URLS is required')
+    }
+    expect(() => relayOptionsFromEnv({ PUBLIC_URLS: ' , ' })).toThrow('PUBLIC_URLS is required')
+  })
+
+  it('defaults to port 8787 on all interfaces when PUBLIC_URLS is set', () => {
+    expect(relayOptionsFromEnv({ PUBLIC_URLS: 'wss://relay.example' })).toEqual({
+      port: 8787,
+      host: '0.0.0.0',
+      publicUrls: ['wss://relay.example']
+    })
+  })
+
+  it('allows a loopback HOST without PUBLIC_URLS', () => {
+    for (const HOST of ['127.0.0.1', 'localhost', '::1']) {
+      expect(relayOptionsFromEnv({ HOST })).toEqual({ port: 8787, host: HOST })
+    }
+  })
+
+  it('reads the listen address, public urls, STUN urls and TURN settings', () => {
+    expect(
+      relayOptionsFromEnv({
+        PORT: '9000',
+        HOST: '127.0.0.1',
+        PUBLIC_URLS: 'wss://a.example, wss://b.example/ ,',
+        STUN_URLS: 'stun:a.example:3478',
+        TURN_SECRET: 'secret',
+        TURN_URLS: 'turn:a.example:3478,turns:a.example:5349',
+        TURN_TTL: '600'
+      })
+    ).toEqual({
+      port: 9000,
+      host: '127.0.0.1',
+      publicUrls: ['wss://a.example', 'wss://b.example/'],
+      stunUrls: ['stun:a.example:3478'],
+      turn: {
+        secret: 'secret',
+        urls: ['turn:a.example:3478', 'turns:a.example:5349'],
+        ttlSeconds: 600
+      }
+    })
+  })
+
+  it('rejects an invalid port or ttl and TURN settings without their pair', () => {
+    for (const PORT of ['abc', '-1', '65536', '1.5']) {
+      expect(() => relayOptionsFromEnv({ PORT })).toThrow('PORT')
+    }
+    const at = { HOST: '127.0.0.1' }
+    expect(() => relayOptionsFromEnv({ ...at, TURN_SECRET: 's' })).toThrow('TURN_URLS')
+    expect(() => relayOptionsFromEnv({ ...at, TURN_URLS: 'turn:a:3478' })).toThrow('TURN_SECRET')
+    expect(() =>
+      relayOptionsFromEnv({ ...at, TURN_SECRET: 's', TURN_URLS: 'turn:a:3478', TURN_TTL: '0' })
+    ).toThrow('TURN_TTL')
+  })
+})
