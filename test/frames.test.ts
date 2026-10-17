@@ -1,25 +1,15 @@
-import { describe, expect, it } from '@jest/globals'
-import { FRAME_HEADER_BYTES, FrameDecoder, encodeMessage } from '../src/channel/frames.js'
+import { describe, expect, it, jest } from '@jest/globals'
+import {
+  FRAME_HEADER_BYTES,
+  FrameDecoder,
+  MAX_JSON_DEPTH,
+  encodeMessage
+} from '../src/channel/frames.js'
 import { DEFAULTS } from '../src/types.js'
 import { concatBytes, utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
 import type { WebRTPayErrorCode } from '../src/util/errors.js'
-
-/** Build a raw frame by hand so the tests do not depend on the encoder under test. */
-function rawFrame(
-  seq: number,
-  final: boolean,
-  payload: Uint8Array | string,
-  header: { version?: number; flags?: number } = {}
-): Uint8Array {
-  const body = typeof payload === 'string' ? utf8Encode(payload) : payload
-  const out = new Uint8Array(6 + body.length)
-  out[0] = header.version ?? 1
-  out[1] = header.flags ?? (final ? 1 : 0)
-  new DataView(out.buffer).setUint32(2, seq, false)
-  out.set(body, 6)
-  return out
-}
+import { nestingDepth, rawFrame, rawFramesOf } from './helpers/frames.js'
 
 function codeOf(fn: () => unknown): WebRTPayErrorCode | undefined {
   try {
@@ -353,5 +343,157 @@ describe('FrameDecoder', () => {
       expect(() => new FrameDecoder({ maxMessageBytes })).toThrow(RangeError)
     }
     expect(() => new FrameDecoder({ maxMessageBytes: 0 })).not.toThrow()
+  })
+})
+
+describe('FrameDecoder nesting limit', () => {
+  /** `n` empty arrays inside one another. */
+  const arrays = (n: number): string => '['.repeat(n) + ']'.repeat(n)
+
+  /** An object holding `depth - 1` further levels (arrays, or alternating with objects). */
+  function nested(depth: number, mixed = false): string {
+    const open: string[] = []
+    const close: string[] = []
+    for (let level = 1; level < depth; level++) {
+      const object = mixed && level % 2 === 0
+      open.push(object ? '{"k":' : '[')
+      close.push(object ? '}' : ']')
+    }
+    return `{"a":${open.join('')}1${close.reverse().join('')}}`
+  }
+
+  /** Run `fn` with `JSON.parse` spied on; returns how many times it was called. */
+  function parseCalls(fn: () => void): number {
+    const spy = jest.spyOn(JSON, 'parse')
+    try {
+      fn()
+      return spy.mock.calls.length
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('measures depth the way the limit is documented', () => {
+    expect(nestingDepth(JSON.parse('{"a":1}'))).toBe(1)
+    expect(nestingDepth(JSON.parse('{"a":[{}]}'))).toBe(3)
+    expect(nestingDepth(JSON.parse(nested(MAX_JSON_DEPTH)))).toBe(MAX_JSON_DEPTH)
+    expect(nestingDepth(JSON.parse(nested(MAX_JSON_DEPTH, true)))).toBe(MAX_JSON_DEPTH)
+  })
+
+  it('rejects a deeply nested 1 MiB object as protocol without parsing it', () => {
+    const depth = 524_288
+    const text = '{"a":' + arrays(depth) + '}'
+    expect(text.length).toBeGreaterThan(1024 * 1024)
+    const frames = rawFramesOf(text)
+    expect(frames.length).toBeGreaterThan(60)
+
+    const d = decoder(2 * 1024 * 1024)
+    let error: unknown
+    const started = performance.now()
+    const calls = parseCalls(() => {
+      try {
+        feed(d, frames)
+      } catch (e) {
+        error = e
+      }
+    })
+    const elapsed = performance.now() - started
+
+    expect(error).toBeInstanceOf(WebRTPayError)
+    expect((error as WebRTPayError).code).toBe('protocol')
+    expect(calls).toBe(0)
+    expect(elapsed).toBeLessThan(1000)
+    // The decoder stays failed, like after any other protocol error.
+    expect(() => d.push(rawFrame(1, true, '{}'))).toThrow(error as Error)
+  })
+
+  it('decodes nesting exactly up to the limit and rejects one level more', () => {
+    for (const mixed of [false, true]) {
+      const ok = nested(MAX_JSON_DEPTH, mixed)
+      const tooDeep = nested(MAX_JSON_DEPTH + 1, mixed)
+      expect(nestingDepth(JSON.parse(tooDeep))).toBe(MAX_JSON_DEPTH + 1)
+
+      expect(decoder().push(rawFrame(0, true, ok))).toEqual(JSON.parse(ok))
+      expect(codeOf(() => decoder().push(rawFrame(0, true, tooDeep)))).toBe('protocol')
+
+      // Same texts split into tiny frames, so reassembly feeds the check.
+      expect(feed(decoder(), rawFramesOf(ok, 0, FRAME_HEADER_BYTES + 5))).toEqual([JSON.parse(ok)])
+      expect(codeOf(() => feed(decoder(), rawFramesOf(tooDeep, 0, FRAME_HEADER_BYTES + 5)))).toBe(
+        'protocol'
+      )
+    }
+  })
+
+  it('counts only open containers, not their total', () => {
+    const wide =
+      '{"a":[' + Array.from({ length: 500 }, () => arrays(MAX_JSON_DEPTH - 2)).join(',') + ']}'
+    expect(nestingDepth(JSON.parse(wide))).toBe(MAX_JSON_DEPTH)
+    expect(decoder().push(rawFrame(0, true, wide))).toEqual(JSON.parse(wide))
+  })
+
+  it('rejects nesting that is never closed', () => {
+    const text = '{"a":' + '['.repeat(MAX_JSON_DEPTH + 1)
+    expect(codeOf(() => decoder().push(rawFrame(0, true, text)))).toBe('protocol')
+  })
+
+  it('does not count brackets, braces or quotes inside strings', () => {
+    const strings = [
+      '['.repeat(1000),
+      '{'.repeat(1000) + '}'.repeat(1000),
+      '"',
+      '\\',
+      '\\\\',
+      '\\"',
+      '"[[[[',
+      '\\"[[[['.repeat(50),
+      '\\\\"[[{{'.repeat(50),
+      '€[[{{é'.repeat(100)
+    ]
+    for (const s of strings) {
+      const literal = JSON.stringify(s)
+      const alone = `{"s":${literal}}`
+      expect(decoder().push(rawFrame(0, true, alone))).toEqual({ s })
+
+      // The string must close where JSON says, so nesting after it is still counted, both
+      // when it is within the limit and when it is one level over.
+      const before = (n: number): string => `{"s":${literal},"a":${arrays(n)}}`
+      const after = (n: number): string => `{"a":${arrays(n)},"s":${literal}}`
+      for (const build of [before, after]) {
+        const ok = build(MAX_JSON_DEPTH - 1)
+        expect(decoder().push(rawFrame(0, true, ok))).toEqual(JSON.parse(ok))
+        const tooDeep = build(MAX_JSON_DEPTH)
+        expect(codeOf(() => decoder().push(rawFrame(0, true, tooDeep)))).toBe('protocol')
+      }
+    }
+  })
+
+  it('accepts JSON whitespace around the object', () => {
+    expect(decoder().push(rawFrame(0, true, ' \n\t\r{"a":1} \n'))).toEqual({ a: 1 })
+  })
+
+  it('rejects a top level that is not an object without parsing it', () => {
+    const texts = ['', ' ', '1', '"x"', 'true', 'null', '[]', '[{}]', arrays(MAX_JSON_DEPTH * 100)]
+    const calls = parseCalls(() => {
+      for (const text of texts) {
+        expect(codeOf(() => decoder().push(rawFrame(0, true, text)))).toBe('protocol')
+      }
+      // A byte-order mark is not JSON whitespace.
+      expect(codeOf(() => decoder().push(rawFrame(0, true, '﻿{}')))).toBe('protocol')
+    })
+    expect(calls).toBe(0)
+  })
+
+  it('rejects more closing brackets than opening ones without parsing', () => {
+    const calls = parseCalls(() => {
+      for (const text of ['{}}', '{}]', '{"a":[]]}', '{}' + '}'.repeat(100) + arrays(40)]) {
+        expect(codeOf(() => decoder().push(rawFrame(0, true, text)))).toBe('protocol')
+      }
+    })
+    expect(calls).toBe(0)
+  })
+
+  it('still reports too_large first for an oversized bomb', () => {
+    const text = '{"a":' + arrays(5000) + '}'
+    expect(codeOf(() => decoder(1000).push(rawFrame(0, true, text)))).toBe('too_large')
   })
 })

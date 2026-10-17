@@ -1,9 +1,15 @@
 import { describe, expect, it } from '@jest/globals'
 import fc from 'fast-check'
-import { FRAME_HEADER_BYTES, FrameDecoder, encodeMessage } from '../src/channel/frames.js'
+import {
+  FRAME_HEADER_BYTES,
+  FrameDecoder,
+  MAX_JSON_DEPTH,
+  encodeMessage
+} from '../src/channel/frames.js'
 import { DEFAULTS } from '../src/types.js'
 import { utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
+import { nestingDepth, rawFramesOf } from './helpers/frames.js'
 
 const MIN_PROPERTY_RUNS = 300
 const requestedRuns = Number.parseInt(process.env.FAST_CHECK_NUM_RUNS ?? '', 10)
@@ -146,7 +152,21 @@ describe('frames: hostile input', () => {
       seq: fc.oneof(fc.integer({ min: 0, max: 3 }), fc.integer({ min: 0, max: 0xffffffff })),
       payload: fc.oneof(
         fc.uint8Array({ maxLength: 48 }),
-        fc.constantFrom('{}', '{"a":', '1}', '[]', 'null', '{"a":1}', '').map(utf8Encode)
+        fc
+          .constantFrom(
+            '{}',
+            '{"a":',
+            '1}',
+            '[]',
+            'null',
+            '{"a":1}',
+            '',
+            ' {"a":1} ',
+            '{}}',
+            '{"a":' + '['.repeat(MAX_JSON_DEPTH + 1),
+            '{"a":' + '['.repeat(MAX_JSON_DEPTH + 1) + ']'.repeat(MAX_JSON_DEPTH + 1) + '}'
+          )
+          .map(utf8Encode)
       )
     })
     .map(({ flags, seq, payload }) => {
@@ -240,6 +260,130 @@ describe('frames: hostile input', () => {
           assertOnlyWebRTPayErrors(out, 4096)
         }
       )
+    )
+  })
+})
+
+describe('frames: nesting limit', () => {
+  /** An object whose deepest point has exactly `depth` open containers. */
+  function nestedValue(depth: number, objectLevels: boolean[]): unknown {
+    let inner: unknown = 1
+    for (let level = 1; level < depth; level++) {
+      inner = objectLevels[level % objectLevels.length] ? { k: inner } : [inner]
+    }
+    return { a: inner }
+  }
+
+  // Structural characters and escapes: the strings most likely to confuse a byte scanner.
+  const structural = fc.string({
+    unit: fc.constantFrom('[', ']', '{', '}', '"', '\\', ',', ':', ' ', 'é', '€'),
+    maxLength: 300
+  })
+  const levels = fc.array(fc.boolean(), { minLength: 1, maxLength: 8 })
+  const depth = fc.integer({ min: 1, max: 2 * MAX_JSON_DEPTH })
+
+  it('the limit is exact whatever strings sit next to the nesting', () => {
+    fc.assert(
+      fc.property(
+        depth,
+        levels,
+        structural,
+        fc.boolean(),
+        chunkSize,
+        (d, objectLevels, s, stringFirst, chunk) => {
+          const nest = nestedValue(d, objectLevels) as { a: unknown }
+          const value = stringFirst ? { s, a: nest.a } : { a: nest.a, s }
+          const frames = encodeMessage(0, value, chunk)
+          const result = run(
+            new FrameDecoder({ maxMessageBytes: DEFAULTS.maxMessageBytes }),
+            frames
+          )
+          if (d <= MAX_JSON_DEPTH) {
+            expect(result.error).toBeUndefined()
+            expect(result.messages).toEqual([normalised(value)])
+          } else {
+            expect(result.error?.code).toBe('protocol')
+            expect(result.at).toBe(frames.length - 1)
+            expect(result.messages).toEqual([])
+          }
+        }
+      )
+    )
+  })
+
+  // Any text at all: the decoder must agree with "JSON.parse, top level an object, at most
+  // MAX_JSON_DEPTH deep". A scanner that is too strict rejects good messages; one that is
+  // too lax lets a bomb through.
+  const soup = fc
+    .array(
+      fc.constantFrom(
+        '{',
+        '}',
+        '[',
+        ']',
+        '"',
+        '\\',
+        '\\"',
+        ',',
+        ':',
+        ' ',
+        '\n',
+        '1',
+        'a',
+        '"a":',
+        '{"a":',
+        'null',
+        'é'
+      ),
+      { maxLength: 150 }
+    )
+    .map(parts => parts.join(''))
+  // Runs of brackets that are balanced (depth around the limit) or off by one either way.
+  const brackets = fc
+    .record({
+      open: fc.oneof(
+        fc.integer({ min: MAX_JSON_DEPTH - 3, max: MAX_JSON_DEPTH + 2 }),
+        fc.nat({ max: 80 })
+      ),
+      skew: fc.constantFrom(0, 0, 0, -1, 1),
+      suffix: fc.constantFrom('}', '}', '}', '', '}}')
+    })
+    .map(
+      ({ open, skew, suffix }) =>
+        '{"a":' + '['.repeat(open) + ']'.repeat(Math.max(0, open + skew)) + suffix
+    )
+  const serialised = fc
+    .tuple(depth, levels, fc.constantFrom(undefined, 1, '\t'))
+    .map(([d, objectLevels, indent]) => JSON.stringify(nestedValue(d, objectLevels), null, indent))
+  const anyText = fc.oneof(soup, brackets, serialised)
+
+  function expectedOutcome(textOfMessage: string): { value: unknown } | 'protocol' {
+    let value: unknown
+    try {
+      value = JSON.parse(textOfMessage)
+    } catch {
+      return 'protocol'
+    }
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'protocol'
+    return nestingDepth(value) <= MAX_JSON_DEPTH ? { value } : 'protocol'
+  }
+
+  it('accepts exactly the JSON objects within the depth limit, for any text', () => {
+    fc.assert(
+      fc.property(anyText, chunkSize, (t, chunk) => {
+        const expected = expectedOutcome(t)
+        const result = run(
+          new FrameDecoder({ maxMessageBytes: DEFAULTS.maxMessageBytes }),
+          rawFramesOf(t, 0, chunk)
+        )
+        if (expected === 'protocol') {
+          expect(result.error?.code).toBe('protocol')
+          expect(result.messages).toEqual([])
+        } else {
+          expect(result.error).toBeUndefined()
+          expect(result.messages).toEqual([expected.value])
+        }
+      })
     )
   })
 })

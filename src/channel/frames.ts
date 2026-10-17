@@ -17,6 +17,16 @@ import { WebRTPayError } from '../util/errors.js'
 /** Bytes before the payload in every frame. */
 export const FRAME_HEADER_BYTES = 6
 
+/**
+ * Deepest nesting of objects and arrays a received message may have: the number of
+ * containers open at once, so `{"a":1}` is 1 and `{"a":[{}]}` is 3. Wire messages are
+ * shallow (the spec's deepest is about 5; a payment's transaction is a flat array). The
+ * decoder rejects anything deeper as a `protocol` error before parsing it, because
+ * `JSON.parse` spends memory in proportion to depth, not just byte count: a 16 MiB run of
+ * `[` and `]` costs over 1 GiB and a second of blocked event loop.
+ */
+export const MAX_JSON_DEPTH = 32
+
 const FRAME_VERSION = 1
 const FLAG_FINAL = 0x01
 const MAX_SEQ = 0xffffffff
@@ -72,7 +82,54 @@ function protocolError(message: string, cause?: unknown): WebRTPayError {
   return new WebRTPayError('protocol', message, cause === undefined ? undefined : { cause })
 }
 
+/**
+ * Bound what `JSON.parse` may be asked to build, without allocating anything: require a
+ * top-level object and no more than {@link MAX_JSON_DEPTH} containers open at once.
+ *
+ * It tracks string and escape state, so brackets inside strings do not count, and it works
+ * on the raw bytes: every structural character is ASCII, and UTF-8 never uses a byte below
+ * 0x80 inside a multi-byte sequence. It validates nothing else; `JSON.parse` still decides
+ * whether the text is JSON. On valid JSON the count is exact, and on invalid JSON it agrees
+ * with the parser up to the point where the parser gives up, so whatever the parser builds
+ * is within the bound.
+ */
+function assertBoundedObject(bytes: Uint8Array): void {
+  const end = bytes.length
+  let i = 0
+  while (
+    i < end &&
+    (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)
+  ) {
+    i++
+  }
+  if (i === end || bytes[i] !== 0x7b) throw protocolError('Message is not a JSON object')
+
+  let depth = 0
+  let inString = false
+  for (; i < end; i++) {
+    const b = bytes[i]
+    if (inString) {
+      if (b === 0x5c) {
+        i++ // the byte after a backslash is data, even a quote or another backslash
+      } else if (b === 0x22) {
+        inString = false
+      }
+    } else if (b === 0x22) {
+      inString = true
+    } else if (b === 0x7b || b === 0x5b) {
+      if (++depth > MAX_JSON_DEPTH) {
+        throw protocolError(`Message nests deeper than ${MAX_JSON_DEPTH} levels`)
+      }
+    } else if (b === 0x7d || b === 0x5d) {
+      // More closers than openers is never JSON, and must not let the count sink below
+      // zero and hide the nesting that follows.
+      if (--depth < 0) throw protocolError('Message has unbalanced brackets')
+    }
+  }
+}
+
 function parseMessage(bytes: Uint8Array): unknown {
+  assertBoundedObject(bytes)
   const text = utf8Decode(bytes)
   let value: unknown
   try {
@@ -121,7 +178,8 @@ export class FrameDecoder {
    * @throws `WebRTPayError('protocol')` for a frame shorter than the header, an unknown
    * version or reserved flag bit, a sequence number other than the expected one (first
    * message 0, then +1; every chunk of a message repeats its number), text that is not
-   * UTF-8 JSON, or a top level that is not an object. `WebRTPayError('too_large')` when
+   * UTF-8 JSON, a top level that is not an object, or objects and arrays nested more than
+   * {@link MAX_JSON_DEPTH} deep (rejected before parsing). `WebRTPayError('too_large')` when
    * the reassembled message would pass the cap, checked before the frame is buffered.
    */
   push(frame: Uint8Array): unknown | undefined {
