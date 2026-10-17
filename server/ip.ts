@@ -2,20 +2,20 @@ import type { IncomingMessage } from 'node:http'
 import { isIP } from 'node:net'
 
 /**
- * The address `req` comes from. With a `trustedHeader` (a lowercase header name),
- * that header's value when it is a valid IP address; for a list such as
- * `X-Forwarded-For`, its last entry, the one the nearest proxy added. Otherwise,
- * and when the header is missing or malformed, the socket's peer address ('' once
- * the socket has closed).
+ * The IP address in `req`'s `header` (a lowercase header name) when the header holds
+ * exactly one; undefined when it is missing, is a list (comma-separated, or sent more
+ * than once) or is not an IP address.
+ *
+ * No entry of a list is ever taken. Proxies append the address they saw to a list
+ * such as `X-Forwarded-For`, so which entry is the client depends on how many proxies
+ * the request crossed: behind two (Cloudflare, then Traefik) the last entry is the
+ * first proxy's address for every client, and the first entry is chosen by the client.
  */
-export function clientAddress(req: IncomingMessage, trustedHeader?: string): string {
-  if (trustedHeader !== undefined) {
-    const value = req.headers[trustedHeader]
-    const list = Array.isArray(value) ? value.join(',') : (value ?? '')
-    const last = bare(list.slice(list.lastIndexOf(',') + 1))
-    if (isIP(last) !== 0) return last
-  }
-  return req.socket.remoteAddress ?? ''
+export function headerAddress(req: IncomingMessage, header: string): string | undefined {
+  const value = req.headers[header]
+  if (typeof value !== 'string' || value.includes(',')) return undefined
+  const a = bare(value)
+  return isIP(a) === 0 ? undefined : a
 }
 
 /**

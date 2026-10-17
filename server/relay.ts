@@ -18,7 +18,7 @@ import { RELAY_PROTOCOL_ID, isIdentityKey } from '../src/types.js'
 import type { PubKeyHex } from '../src/types.js'
 import { fromHex } from '../src/util/bytes.js'
 import { TokenBucket } from './bucket.js'
-import { addressGroup, clientAddress } from './ip.js'
+import { addressGroup, headerAddress } from './ip.js'
 import { turnCredentials } from './turn.js'
 
 /** Per-socket, per-source and global limits; sizes in bytes, durations in milliseconds. */
@@ -115,12 +115,19 @@ export interface RelayServerOptions {
    */
   trustHostHeader?: boolean
   /**
-   * Request header that carries the client's address, e.g. `cf-connecting-ip`, for
-   * the per-source limits. Set it only when every connection arrives through a
-   * proxy that overwrites this header; otherwise clients choose their own address.
-   * For a list such as `x-forwarded-for` the last entry is used. Without it, or
-   * when the header is missing or not an IP address, the socket's peer address is
-   * used, which behind a proxy is the proxy's.
+   * Request header that carries the client's address for the per-source limits. It
+   * must be one the outermost proxy sets to a single address, overwriting whatever
+   * the client sent, and that every proxy after it passes on unchanged:
+   * `cf-connecting-ip` behind Cloudflare (also through a tunnel and Traefik), or
+   * e.g. `x-real-ip` behind a single nginx that sets it. Set it only when every
+   * connection arrives through that proxy; otherwise clients choose their own address.
+   *
+   * A value that is not exactly one IP address, such as a list, counts under the
+   * socket's peer address, which behind a proxy is the proxy's, and the first such
+   * connection is logged. So `x-forwarded-for` works only behind exactly one proxy
+   * that overwrites it; proxies append to it, and behind two of them its last entry
+   * is the first proxy's address for every client. Without this option the peer
+   * address is used.
    */
   trustedIpHeader?: string
   /**
@@ -239,6 +246,8 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
   const identities = new Map<PubKeyHex, Identity>()
   const sources = new Map<string, Source>()
   const turnIssued = new TokenBucket(limits.turnPerHour, HOUR_MS)
+  /** Whether a connection without a usable `trustedIpHeader` value was logged. */
+  let headerWarned = false
 
   // Admission runs before the upgrade, so a refused connection costs no WebSocket.
   function onUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -246,7 +255,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       if (owned) refuse(socket, '404 Not Found')
       return
     }
-    const key = addressGroup(clientAddress(req, trustedIpHeader))
+    const key = addressGroup(sourceAddress(req))
     const source = sourceOf(key)
     if (source.sockets >= limits.maxSocketsPerIp || !source.connections.take()) {
       refuse(socket, '429 Too Many Requests')
@@ -262,6 +271,23 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     // ws completes the upgrade synchronously, so no other upgrade runs between these
     // checks and accept() counting the socket.
     wss.handleUpgrade(req, socket, head, ws => accept(ws, req, key))
+  }
+
+  /** The address `req` counts under: `trustedIpHeader`'s, else the socket's peer address. */
+  function sourceAddress(req: IncomingMessage): string {
+    if (trustedIpHeader !== undefined) {
+      const address = headerAddress(req, trustedIpHeader)
+      if (address !== undefined) return address
+      if (!headerWarned) {
+        headerWarned = true
+        log(
+          `webrtpay relay: a connection had no single IP address in ${trustedIpHeader}, so it ` +
+            'counts under its peer address; that header must be set to one address by the ' +
+            'outermost proxy (logged once)'
+        )
+      }
+    }
+    return req.socket.remoteAddress ?? ''
   }
 
   function sourceOf(key: string): Source {

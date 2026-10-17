@@ -34,6 +34,18 @@ describe('relay limits', () => {
     return c
   }
 
+  /**
+   * Resume `c`, which the relay terminated while `c` was paused, and return its close code.
+   * The relay's side closed with data still queued against `c`'s full receive window, and
+   * some kernels (macOS) then never deliver its FIN once `c` reads again; a ping reaches the
+   * closed side, which answers with a reset.
+   */
+  function closeCode(c: Raw): Promise<number> {
+    c.ws.resume()
+    c.ws.ping()
+    return c.closed
+  }
+
   /** Open a raw socket and wait for its challenge, i.e. until the relay accepted it. */
   async function accepted(r: RelayServer, headers?: Record<string, string>): Promise<Raw> {
     const c = rawAt(r.url, { headers })
@@ -72,8 +84,7 @@ describe('relay limits', () => {
       expect(delivered).toBeGreaterThan(0)
       await waitFor(() => r.stats().identities === 1)
       expect(r.stats()).toEqual({ sockets: 1, identities: 1 })
-      b.ws.resume()
-      expect(await b.closed).toBe(1006)
+      expect(await closeCode(b)).toBe(1006)
     })
 
     it('stops answering a client that stops reading and terminates it', async () => {
@@ -95,8 +106,7 @@ describe('relay limits', () => {
       }
       await waitFor(() => r.stats().sockets === 0)
       expect(frames).toBeLessThan(10000)
-      a.ws.resume()
-      expect(await a.closed).toBe(1006)
+      expect(await closeCode(a)).toBe(1006)
     })
 
     it('drops a socket that sends pongs it was not asked for or with the wrong payload', async () => {
@@ -160,15 +170,32 @@ describe('relay limits', () => {
       // Without trustedIpHeader both come from 127.0.0.1, whatever the header says.
       expect(await upgradeError(plain.url, { 'cf-connecting-ip': '203.0.113.2' })).toContain('429')
 
-      const proxied = await relay({ trustedIpHeader: 'CF-Connecting-IP', limits })
+      const logs: string[] = []
+      const warnings = (): string[] => logs.filter(m => m.includes('cf-connecting-ip'))
+      const proxied = await relay({
+        trustedIpHeader: 'CF-Connecting-IP',
+        limits,
+        log: m => logs.push(m)
+      })
       await accepted(proxied, { 'cf-connecting-ip': '203.0.113.1' })
       await accepted(proxied, { 'cf-connecting-ip': '203.0.113.2' })
-      for (const ip of ['203.0.113.1', '::ffff:203.0.113.1', '198.51.100.9, 203.0.113.2']) {
+      for (const ip of ['203.0.113.1', '::ffff:203.0.113.1']) {
         expect(await upgradeError(proxied.url, { 'cf-connecting-ip': ip })).toContain('429')
       }
-      // a missing or malformed header falls back to the peer address
+      expect(warnings()).toEqual([])
+
+      // A missing value, a list or anything but one address counts under the peer address:
+      // no entry of a list is taken, because behind proxies that append to it, as they do to
+      // x-forwarded-for, the last entry can be a proxy's address for every client.
       await accepted(proxied)
-      expect(await upgradeError(proxied.url, { 'cf-connecting-ip': 'nonsense' })).toContain('429')
+      for (const value of ['nonsense', '203.0.113.3, 203.0.113.4', '203.0.113.5,']) {
+        expect(await upgradeError(proxied.url, { 'cf-connecting-ip': value })).toContain('429')
+      }
+      // each address in that list was free
+      await accepted(proxied, { 'cf-connecting-ip': '203.0.113.3' })
+      await accepted(proxied, { 'cf-connecting-ip': '203.0.113.4' })
+      // the operator is told once that the header did not carry one address
+      expect(warnings()).toHaveLength(1)
     })
 
     it('groups IPv6 clients by /64', async () => {

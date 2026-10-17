@@ -5,9 +5,10 @@ import type { RelayServerOptions } from './relay.js'
  * Relay options from environment variables: `PORT` (default 8787), `HOST`
  * (default 0.0.0.0), and comma-separated `PUBLIC_URLS`, `STUN_URLS` and
  * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together, `TURN_TTL` is in
- * seconds (default 600). `TRUSTED_IP_HEADER` names the header a fronting proxy
- * sets to the client's address (e.g. `cf-connecting-ip`; see `trustedIpHeader`).
- * Empty variables count as unset. `PUBLIC_URLS` is required unless `HOST` is a
+ * seconds (default 600). `TRUSTED_IP_HEADER` names the header the outermost proxy
+ * sets to the client's single address: `cf-connecting-ip` behind Cloudflare. A list
+ * value is not used, so `x-forwarded-for` is right only behind exactly one proxy
+ * that overwrites it (see `trustedIpHeader`). Empty variables count as unset. `PUBLIC_URLS` is required unless `HOST` is a
  * loopback address (`localhost`, `127.x.x.x` or `::1`), because without it
  * clients sign a url built from the Host header they send. Throws `Error` naming
  * the variable on an invalid or missing value.
