@@ -1,0 +1,191 @@
+import { DEFAULTS } from '../types.js'
+import { utf8Decode, utf8Encode } from '../util/bytes.js'
+import { WebRTPayError } from '../util/errors.js'
+
+/**
+ * Data channel frame layout:
+ *
+ * ```
+ * [version u8 = 1][flags u8, bit0 = final][message sequence u32 big-endian][payload]
+ * ```
+ *
+ * Every chunk of one message carries that message's sequence number. A message is the
+ * UTF-8 JSON text of one object, split into chunks; the chunk with the final bit set
+ * completes it.
+ */
+
+/** Bytes before the payload in every frame. */
+export const FRAME_HEADER_BYTES = 6
+
+const FRAME_VERSION = 1
+const FLAG_FINAL = 0x01
+const MAX_SEQ = 0xffffffff
+const EMPTY = new Uint8Array(0)
+
+/**
+ * Split one JSON message into frames of at most `chunkBytes` bytes each, header included.
+ *
+ * Always returns at least one frame; only the last has the final bit, and a payload that
+ * is an exact multiple of the chunk size does not get a trailing empty frame. Each frame
+ * owns its buffer, so it can be passed to `RTCDataChannel.send` as is. Receivers reject a
+ * top-level value that is not a JSON object.
+ *
+ * @param seq - The message's sequence number (0 for the first message on a channel, then
+ * one more for each message), an integer in `[0, 2^32)`.
+ * @param json - The message; anything `JSON.stringify` can represent.
+ * @param chunkBytes - Largest frame including the 6-byte header; defaults to 16 KiB.
+ * @throws `RangeError` for a `seq` or `chunkBytes` out of range and `TypeError` for a
+ * value JSON cannot represent. These are caller bugs, not peer input.
+ */
+export function encodeMessage(
+  seq: number,
+  json: unknown,
+  chunkBytes: number = DEFAULTS.chunkBytes
+): Uint8Array[] {
+  if (!Number.isInteger(seq) || seq < 0 || seq > MAX_SEQ) {
+    throw new RangeError(`Invalid message sequence number: ${seq}`)
+  }
+  if (!Number.isInteger(chunkBytes) || chunkBytes <= FRAME_HEADER_BYTES) {
+    throw new RangeError(`Chunk size must leave room for payload: ${chunkBytes}`)
+  }
+  const text = JSON.stringify(json)
+  if (typeof text !== 'string') throw new TypeError('Message is not JSON-serialisable')
+
+  const body = utf8Encode(text)
+  const perFrame = chunkBytes - FRAME_HEADER_BYTES
+  const count = Math.max(1, Math.ceil(body.length / perFrame))
+  const frames: Uint8Array[] = []
+  for (let i = 0; i < count; i++) {
+    const start = i * perFrame
+    const end = Math.min(start + perFrame, body.length)
+    const frame = new Uint8Array(FRAME_HEADER_BYTES + end - start)
+    frame[0] = FRAME_VERSION
+    frame[1] = i === count - 1 ? FLAG_FINAL : 0
+    new DataView(frame.buffer).setUint32(2, seq, false)
+    frame.set(body.subarray(start, end), FRAME_HEADER_BYTES)
+    frames.push(frame)
+  }
+  return frames
+}
+
+function protocolError(message: string, cause?: unknown): WebRTPayError {
+  return new WebRTPayError('protocol', message, cause === undefined ? undefined : { cause })
+}
+
+function parseMessage(bytes: Uint8Array): unknown {
+  const text = utf8Decode(bytes)
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch (cause) {
+    throw protocolError('Message is not valid JSON', cause)
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw protocolError('Message is not a JSON object')
+  }
+  return value
+}
+
+/**
+ * Reassembles framed messages from one peer, enforcing the wire rules.
+ *
+ * Feed it every frame received on a channel, in arrival order. Any violation throws a
+ * {@link WebRTPayError} and leaves the decoder failed: later `push` calls rethrow the same
+ * error, since a stream that lost sync cannot be trusted again. The caller closes the
+ * channel.
+ */
+export class FrameDecoder {
+  private readonly maxMessageBytes: number
+  /** Sequence number the next frame must carry; advances when a message completes. */
+  private nextSeq = 0
+  /** Payload bytes of the message in progress: `buffer[0, length)`. */
+  private buffer: Uint8Array = EMPTY
+  private length = 0
+  private failure: WebRTPayError | undefined
+
+  /**
+   * @param opts.maxMessageBytes - Largest reassembled message (the JSON text, header
+   * bytes excluded) the decoder accepts; a message of exactly this size is accepted.
+   */
+  constructor(opts: { maxMessageBytes: number }) {
+    if (!Number.isSafeInteger(opts.maxMessageBytes) || opts.maxMessageBytes < 0) {
+      throw new RangeError(`Invalid message size cap: ${opts.maxMessageBytes}`)
+    }
+    this.maxMessageBytes = opts.maxMessageBytes
+  }
+
+  /**
+   * Accept one received frame.
+   *
+   * @returns The parsed message when this frame completes one, otherwise `undefined`.
+   * @throws `WebRTPayError('protocol')` for a frame shorter than the header, an unknown
+   * version or reserved flag bit, a sequence number other than the expected one (first
+   * message 0, then +1; every chunk of a message repeats its number), text that is not
+   * UTF-8 JSON, or a top level that is not an object. `WebRTPayError('too_large')` when
+   * the reassembled message would pass the cap, checked before the frame is buffered.
+   */
+  push(frame: Uint8Array): unknown | undefined {
+    if (this.failure) throw this.failure
+    try {
+      return this.accept(frame)
+    } catch (e) {
+      this.buffer = EMPTY
+      this.length = 0
+      this.failure =
+        e instanceof WebRTPayError ? e : protocolError('Frame could not be processed', e)
+      throw this.failure
+    }
+  }
+
+  private accept(input: Uint8Array): unknown | undefined {
+    if (!ArrayBuffer.isView(input)) throw protocolError('Frame is not binary')
+    const frame = new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+    if (frame.length < FRAME_HEADER_BYTES) throw protocolError('Frame shorter than header')
+    if (frame[0] !== FRAME_VERSION) throw protocolError(`Unsupported frame version ${frame[0]}`)
+    const flags = frame[1]
+    if ((flags & ~FLAG_FINAL) !== 0) throw protocolError('Reserved frame flag set')
+    const seq = new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getUint32(2, false)
+    if (seq !== this.nextSeq) {
+      throw protocolError(`Unexpected message sequence ${seq}, expected ${this.nextSeq}`)
+    }
+
+    const payload = frame.subarray(FRAME_HEADER_BYTES)
+    if (this.length + payload.length > this.maxMessageBytes) {
+      throw new WebRTPayError('too_large', `Message exceeds ${this.maxMessageBytes} bytes`)
+    }
+
+    if ((flags & FLAG_FINAL) === 0) {
+      this.append(payload)
+      return undefined
+    }
+
+    // Common case: a message that fits one frame is parsed straight from the frame.
+    let bytes = payload
+    if (this.length > 0) {
+      this.append(payload)
+      bytes = this.buffer.subarray(0, this.length)
+    }
+    this.buffer = EMPTY
+    this.length = 0
+    const message = parseMessage(bytes)
+    this.nextSeq = seq + 1
+    return message
+  }
+
+  /**
+   * Copy `payload` into the growing buffer. One buffer rather than a list of chunks: the
+   * cost is bounded by the cap however many frames a peer sends, including empty ones.
+   */
+  private append(payload: Uint8Array): void {
+    const needed = this.length + payload.length
+    if (needed > this.buffer.length) {
+      const grown = new Uint8Array(
+        Math.min(this.maxMessageBytes, Math.max(needed, this.buffer.length * 2))
+      )
+      grown.set(this.buffer.subarray(0, this.length))
+      this.buffer = grown
+    }
+    this.buffer.set(payload, this.length)
+    this.length = needed
+  }
+}
