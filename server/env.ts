@@ -1,19 +1,30 @@
+import { isLoopbackHost } from './relay.js'
 import type { RelayServerOptions } from './relay.js'
 
 /**
  * Relay options from environment variables: `PORT` (default 8787), `HOST`
  * (default 0.0.0.0), and comma-separated `PUBLIC_URLS`, `STUN_URLS` and
  * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together, `TURN_TTL` is in
- * seconds. Empty variables count as unset. Throws `Error` naming the variable
- * on an invalid value.
+ * seconds. Empty variables count as unset. `PUBLIC_URLS` is required unless
+ * `HOST` is a loopback address (`localhost`, `127.x.x.x` or `::1`), because
+ * without it clients sign a url built from the Host header they send. Throws
+ * `Error` naming the variable on an invalid or missing value.
  */
 export function relayOptionsFromEnv(env: Record<string, string | undefined>): RelayServerOptions {
+  const host = env.HOST?.trim() || '0.0.0.0'
   const o: RelayServerOptions = {
     port: env.PORT ? wholeNumber('PORT', env.PORT, 0, 65535) : 8787,
-    host: env.HOST?.trim() || '0.0.0.0'
+    host
   }
   const publicUrls = list(env.PUBLIC_URLS)
   if (publicUrls.length > 0) o.publicUrls = publicUrls
+  else if (!isLoopbackHost(host)) {
+    throw new Error(
+      `PUBLIC_URLS is required when HOST (${host}) is not a loopback address: list the ` +
+        'wss:// urls clients dial, e.g. PUBLIC_URLS=wss://relay.example.com ' +
+        '(or set HOST=127.0.0.1 for local development)'
+    )
+  }
   const stunUrls = list(env.STUN_URLS)
   if (stunUrls.length > 0) o.stunUrls = stunUrls
 

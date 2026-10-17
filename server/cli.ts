@@ -3,7 +3,8 @@ import { relayOptionsFromEnv } from './env.js'
 import { createRelayServer } from './relay.js'
 
 // webrtpay-relay: configured by PORT, HOST, PUBLIC_URLS, STUN_URLS, TURN_SECRET,
-// TURN_URLS and TURN_TTL (see relayOptionsFromEnv). SIGTERM or SIGINT closes it.
+// TURN_URLS and TURN_TTL (see relayOptionsFromEnv). It refuses to start without
+// PUBLIC_URLS unless HOST is a loopback address. SIGTERM or SIGINT closes it.
 try {
   const relay = await createRelayServer({
     ...relayOptionsFromEnv(process.env),

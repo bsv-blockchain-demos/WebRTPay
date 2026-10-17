@@ -8,6 +8,7 @@ import { WebSocket as WsClient } from 'ws'
 import { createRelayServer, turnCredentials } from '../server/index.js'
 import type { RelayServer, RelayServerOptions } from '../server/index.js'
 import { relayOptionsFromEnv } from '../server/env.js'
+import { isLoopbackHost } from '../server/relay.js'
 import { RelaySignaler, relayAuthData } from '../src/signaling/RelaySignaler.js'
 import type { RelaySignalerOptions } from '../src/signaling/RelaySignaler.js'
 import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
@@ -323,6 +324,87 @@ describe('relay', () => {
       const b = rawAt(r.url, { headers: { 'x-forwarded-proto': 'https' } })
       await authenticate(b, bob, `ws://${host}/relay`)
       expect(await b.next()).toEqual({ t: 'error', code: 'auth_failed' })
+    })
+
+    it('rejects a signature over the url a forged Host names when public urls are set', async () => {
+      // A relay the victim dialed (evil.example) replays this relay's nonce to the
+      // victim, then presents the victim's signature here with a matching Host.
+      const r = await relay({ publicUrls: ['wss://relay.example'] })
+      const headers = { host: 'evil.example', 'x-forwarded-proto': 'https' }
+      const a = rawAt(r.url, { headers })
+      await authenticate(a, alice, 'wss://evil.example')
+      expect(await a.next()).toEqual({ t: 'error', code: 'auth_failed' })
+      expect(await a.closed).toBe(1008)
+
+      const b = rawAt(r.url, { headers })
+      await authenticate(b, bob, 'wss://relay.example')
+      expect(await b.next()).toEqual({ t: 'ready', identityKey: bob.key })
+    })
+
+    it('refuses to listen on a non-loopback address without public urls', async () => {
+      const port = await freePort()
+      const logs: string[] = []
+      await expect(
+        createRelayServer({ port, host: '0.0.0.0', log: m => logs.push(m) })
+      ).rejects.toThrow('publicUrls is required')
+      expect(logs).toEqual([])
+      // The port was released: listening on it again succeeds.
+      const again = await relay({ port, host: '127.0.0.1' })
+      expect(again.port).toBe(port)
+    })
+
+    it('listens on a non-loopback address with public urls or trustHostHeader', async () => {
+      const pub = await relay({ host: '0.0.0.0', publicUrls: ['wss://relay.example'] })
+      const a = rawAt(`ws://127.0.0.1:${pub.port}`)
+      await authenticate(a, alice, 'wss://relay.example')
+      expect(await a.next()).toEqual({ t: 'ready', identityKey: alice.key })
+
+      const logs: string[] = []
+      const trusting = await relay({
+        host: '0.0.0.0',
+        trustHostHeader: true,
+        log: m => logs.push(m)
+      })
+      const url = `ws://127.0.0.1:${trusting.port}`
+      const b = rawAt(url)
+      await authenticate(b, bob, url)
+      expect(await b.next()).toEqual({ t: 'ready', identityKey: bob.key })
+      expect(logs[0]).toContain('WARNING: no publicUrls')
+    })
+
+    it('refuses a non-loopback server it is attached to without public urls, leaving it open', async () => {
+      const http = createServer((_req, res) => res.end('app'))
+      await new Promise<void>(r => http.listen(0, '0.0.0.0', r))
+      cleanups.push(() => new Promise(r => http.close(r)))
+      await expect(createRelayServer({ server: http })).rejects.toThrow('publicUrls is required')
+      expect(http.listening).toBe(true)
+      expect(http.listenerCount('upgrade')).toBe(0)
+      const { port } = http.address() as AddressInfo
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe('app')
+    })
+
+    it('treats only loopback hosts as loopback', () => {
+      const loopback = [
+        'localhost',
+        'LOCALHOST',
+        '127.0.0.1',
+        '127.1.2.3',
+        '::1',
+        '::ffff:127.0.0.1'
+      ]
+      const other = [
+        '0.0.0.0',
+        '::',
+        '10.0.0.1',
+        '128.0.0.1',
+        '127.0.0.256',
+        '::ffff:10.0.0.1',
+        'relay.localhost',
+        'example.com',
+        ''
+      ]
+      expect(loopback.filter(isLoopbackHost)).toEqual(loopback)
+      expect(other.filter(isLoopbackHost)).toEqual([])
     })
 
     it('rejects a signal sent before authenticating and never forwards it', async () => {
@@ -952,8 +1034,25 @@ describe('RelaySignaler connection lifecycle', () => {
 })
 
 describe('relayOptionsFromEnv', () => {
-  it('defaults to port 8787 on all interfaces with nothing else configured', () => {
-    expect(relayOptionsFromEnv({})).toEqual({ port: 8787, host: '0.0.0.0' })
+  it('refuses a non-loopback HOST, the default 0.0.0.0 included, without PUBLIC_URLS', () => {
+    for (const HOST of [undefined, '', '0.0.0.0', '::', '10.0.0.5', 'relay.example.com']) {
+      expect(() => relayOptionsFromEnv({ HOST })).toThrow('PUBLIC_URLS is required')
+    }
+    expect(() => relayOptionsFromEnv({ PUBLIC_URLS: ' , ' })).toThrow('PUBLIC_URLS is required')
+  })
+
+  it('defaults to port 8787 on all interfaces when PUBLIC_URLS is set', () => {
+    expect(relayOptionsFromEnv({ PUBLIC_URLS: 'wss://relay.example' })).toEqual({
+      port: 8787,
+      host: '0.0.0.0',
+      publicUrls: ['wss://relay.example']
+    })
+  })
+
+  it('allows a loopback HOST without PUBLIC_URLS', () => {
+    for (const HOST of ['127.0.0.1', 'localhost', '::1']) {
+      expect(relayOptionsFromEnv({ HOST })).toEqual({ port: 8787, host: HOST })
+    }
   })
 
   it('reads the listen address, public urls, STUN urls and TURN settings', () => {
@@ -984,10 +1083,11 @@ describe('relayOptionsFromEnv', () => {
     for (const PORT of ['abc', '-1', '65536', '1.5']) {
       expect(() => relayOptionsFromEnv({ PORT })).toThrow('PORT')
     }
-    expect(() => relayOptionsFromEnv({ TURN_SECRET: 's' })).toThrow('TURN_URLS')
-    expect(() => relayOptionsFromEnv({ TURN_URLS: 'turn:a:3478' })).toThrow('TURN_SECRET')
+    const at = { HOST: '127.0.0.1' }
+    expect(() => relayOptionsFromEnv({ ...at, TURN_SECRET: 's' })).toThrow('TURN_URLS')
+    expect(() => relayOptionsFromEnv({ ...at, TURN_URLS: 'turn:a:3478' })).toThrow('TURN_SECRET')
     expect(() =>
-      relayOptionsFromEnv({ TURN_SECRET: 's', TURN_URLS: 'turn:a:3478', TURN_TTL: '0' })
+      relayOptionsFromEnv({ ...at, TURN_SECRET: 's', TURN_URLS: 'turn:a:3478', TURN_TTL: '0' })
     ).toThrow('TURN_TTL')
   })
 })

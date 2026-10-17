@@ -63,8 +63,21 @@ export interface RelayServerOptions {
    * URLs clients may sign (`wss://relay.example`). When set, the Host header is
    * not trusted; otherwise the signed URL must be `ws://` (or `wss://` behind
    * `x-forwarded-proto: https`) + Host + path, without trailing slashes.
+   *
+   * Required in production. The Host header and `x-forwarded-proto` are chosen by
+   * the client, so without public urls a relay a victim dialed can replay this
+   * relay's challenge to the victim and log in here as the victim. The relay
+   * therefore refuses to start without public urls unless it listens on a
+   * loopback address or `trustHostHeader` is set. Set them whenever a proxy fronts
+   * the relay, even one that listens on loopback.
    */
   publicUrls?: string[]
+  /**
+   * Accept the Host-header URL on a relay that listens on a non-loopback address
+   * and has no `publicUrls` (development only; see `publicUrls`). Ignored when
+   * `publicUrls` is set.
+   */
+  trustHostHeader?: boolean
   /** Hand authenticated sockets coturn REST credentials for these TURN urls. */
   turn?: { secret: string; urls: string[]; ttlSeconds?: number }
   /** STUN urls handed to authenticated sockets. */
@@ -101,6 +114,8 @@ interface Client {
 const SIGNATURE_HEX = /^(?:[0-9a-f]{2}){1,80}$/
 /** Time `close()` waits for a socket's closing handshake before dropping it. */
 const CLOSE_WAIT_MS = 1000
+/** A dotted-quad IPv4 address in 127.0.0.0/8. */
+const LOOPBACK_V4 = /^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
 
 /**
  * Start a stateless WebSocket rendezvous for {@link RelaySignaler}s. A socket is
@@ -108,7 +123,8 @@ const CLOSE_WAIT_MS = 1000
  * timeout; afterwards it may send `signal` frames, which are forwarded with the
  * authenticated key as `from` to every socket of the recipient. Nothing is stored
  * and payloads are never logged. `GET /health` answers `{"status":"ok"}` on a
- * server the relay created.
+ * server the relay created. Rejects, releasing any port it bound, when it would
+ * listen on a non-loopback address without `publicUrls` or `trustHostHeader`.
  */
 export async function createRelayServer(o: RelayServerOptions = {}): Promise<RelayServer> {
   const limits = relayLimits(o.limits)
@@ -346,9 +362,17 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
   http.on('upgrade', onUpgrade)
   try {
     await listening(http, owned ? { port: o.port ?? 8787, host: o.host } : undefined)
+    if (publicUrls.length === 0 && o.trustHostHeader !== true && !isLoopback(http.address())) {
+      throw new Error(
+        'publicUrls is required when the relay listens on a non-loopback address: without ' +
+          'it clients sign a url taken from the Host header, which the client chooses ' +
+          '(set trustHostHeader: true to accept that in development)'
+      )
+    }
   } catch (err) {
     http.off('upgrade', onUpgrade)
     wss.close()
+    if (owned && http.listening) await new Promise<void>(resolve => http.close(() => resolve()))
     throw err
   }
   const pinger = setInterval(ping, limits.pingIntervalMs)
@@ -358,7 +382,10 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
   const url = `ws://${displayHost(address)}:${address.port}${pathPart}`
   log(
     `webrtpay relay listening on ${url}` +
-      (publicUrls.length > 0 ? ` (public: ${publicUrls.join(', ')})` : '')
+      (publicUrls.length > 0
+        ? ` (public: ${publicUrls.join(', ')})`
+        : ' (WARNING: no publicUrls, so clients sign a url built from the Host header; ' +
+          'set publicUrls in production and whenever a proxy fronts this relay)')
   )
 
   let closing: Promise<void> | undefined
@@ -454,6 +481,22 @@ function listening(http: Server, at?: { port: number; host?: string }): Promise<
     http.once('listening', onListening)
     if (at !== undefined) http.listen(at.port, at.host)
   })
+}
+
+/**
+ * True for a loopback host: `localhost`, `127.0.0.0/8`, `::1` or an IPv4-mapped
+ * `::ffff:127.x.x.x`. Any other name, including one that resolves to loopback,
+ * is false.
+ */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase()
+  const v4 = h.startsWith('::ffff:') ? h.slice('::ffff:'.length) : h
+  return h === 'localhost' || h === '::1' || LOOPBACK_V4.test(v4)
+}
+
+/** True when `http.address()` is a loopback address; false for pipes and other addresses. */
+function isLoopback(address: AddressInfo | string | null): boolean {
+  return typeof address === 'object' && address !== null && isLoopbackHost(address.address)
 }
 
 /** A host to reach `a` from this machine: loopback for the unspecified addresses. */
