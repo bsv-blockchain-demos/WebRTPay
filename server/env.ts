@@ -1,14 +1,16 @@
-import { isLoopbackHost } from './relay.js'
+import { isHeaderName, isLoopbackHost } from './relay.js'
 import type { RelayServerOptions } from './relay.js'
 
 /**
  * Relay options from environment variables: `PORT` (default 8787), `HOST`
  * (default 0.0.0.0), and comma-separated `PUBLIC_URLS`, `STUN_URLS` and
  * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together, `TURN_TTL` is in
- * seconds. Empty variables count as unset. `PUBLIC_URLS` is required unless
- * `HOST` is a loopback address (`localhost`, `127.x.x.x` or `::1`), because
- * without it clients sign a url built from the Host header they send. Throws
- * `Error` naming the variable on an invalid or missing value.
+ * seconds (default 600). `TRUSTED_IP_HEADER` names the header a fronting proxy
+ * sets to the client's address (e.g. `cf-connecting-ip`; see `trustedIpHeader`).
+ * Empty variables count as unset. `PUBLIC_URLS` is required unless `HOST` is a
+ * loopback address (`localhost`, `127.x.x.x` or `::1`), because without it
+ * clients sign a url built from the Host header they send. Throws `Error` naming
+ * the variable on an invalid or missing value.
  */
 export function relayOptionsFromEnv(env: Record<string, string | undefined>): RelayServerOptions {
   const host = env.HOST?.trim() || '0.0.0.0'
@@ -21,9 +23,17 @@ export function relayOptionsFromEnv(env: Record<string, string | undefined>): Re
   else if (!isLoopbackHost(host)) {
     throw new Error(
       `PUBLIC_URLS is required when HOST (${host}) is not a loopback address: list the ` +
-        'wss:// urls clients dial, e.g. PUBLIC_URLS=wss://relay.example.com ' +
-        '(or set HOST=127.0.0.1 for local development)'
+        'wss:// urls clients dial, e.g. PUBLIC_URLS=wss://relay.example.com. A relay ' +
+        'behind a proxy needs it even when it listens on loopback (set HOST=127.0.0.1 ' +
+        'without PUBLIC_URLS only for local development)'
     )
+  }
+  const trustedIpHeader = env.TRUSTED_IP_HEADER?.trim()
+  if (trustedIpHeader) {
+    if (!isHeaderName(trustedIpHeader)) {
+      throw new Error('TRUSTED_IP_HEADER must be an HTTP header name, e.g. cf-connecting-ip')
+    }
+    o.trustedIpHeader = trustedIpHeader
   }
   const stunUrls = list(env.STUN_URLS)
   if (stunUrls.length > 0) o.stunUrls = stunUrls
