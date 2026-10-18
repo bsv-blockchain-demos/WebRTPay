@@ -277,6 +277,26 @@ describe('relay', () => {
       expect(logs[0]).toContain('WARNING: no publicUrls')
     })
 
+    it('warns at startup when public urls are set without a trusted address header (Ruling 28)', async () => {
+      const proxied: string[] = []
+      await relay({ publicUrls: ['wss://relay.example'], log: m => proxied.push(m) })
+      const warning = proxied.filter(m => m.includes('WARNING'))
+      expect(warning).toHaveLength(1)
+      expect(warning[0]).toContain('trustedIpHeader')
+      expect(warning[0]).toContain('TRUSTED_IP_HEADER=cf-connecting-ip')
+
+      const trusted: string[] = []
+      await relay({
+        publicUrls: ['wss://relay.example'],
+        trustedIpHeader: 'cf-connecting-ip',
+        log: m => trusted.push(m)
+      })
+      const local: string[] = []
+      await relay({ log: m => local.push(m) })
+      expect(trusted.join('\n')).not.toContain('WARNING')
+      expect(local.join('\n')).not.toContain('trustedIpHeader')
+    })
+
     it('refuses a non-loopback server it is attached to without public urls, leaving it open', async () => {
       const http = createServer((_req, res) => res.end('app'))
       await new Promise<void>(r => http.listen(0, '0.0.0.0', r))

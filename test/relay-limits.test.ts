@@ -258,17 +258,9 @@ describe('relay limits', () => {
       return c.next()
     }
 
-    it('issues TURN credentials only to a socket that delivered a signal', async () => {
+    it('issues TURN credentials to an authenticated socket that has sent no signal (Ruling 27)', async () => {
       const r = await relay({ stunUrls: stun.urls, turn })
-      await signaler(r, bob).listen(() => {})
       const a = await authed(r, alice)
-      expect(await requestTurn(a)).toEqual({ t: 'error', code: 'forbidden' })
-      const e = env()
-      a.send({ t: 'signal', to: carol.key, envelope: e })
-      expect(await a.next()).toEqual({ t: 'error', code: 'offline', ref: e.sid })
-      expect(await requestTurn(a)).toEqual({ t: 'error', code: 'forbidden' })
-
-      await deliver(a)
       const before = Math.floor(Date.now() / 1000)
       const reply = await requestTurn(a)
       const after = Math.floor(Date.now() / 1000)
@@ -293,8 +285,10 @@ describe('relay limits', () => {
       const seen: RTCIceServer[][] = []
       const a = signaler(r, alice, { onIceServers: s => seen.push(s) })
       await a.connect()
-      await expect(a.requestTurn()).rejects.toMatchObject({ code: 'rejected' })
-      expect(a.iceServers()).toEqual([stun])
+      // no signal has been delivered on this connection yet
+      const first = await a.requestTurn()
+      expect(first).toHaveLength(2)
+      expect(first[1]).toMatchObject({ urls: turn.urls, username: expect.any(String) })
 
       // replies stay matched to requests when a turn request sits between sends
       const [, servers] = await Promise.all([
@@ -303,19 +297,8 @@ describe('relay limits', () => {
         a.send(bob.key, env())
       ])
       expect(servers).toHaveLength(2)
-      expect(servers[1]).toMatchObject({ urls: turn.urls, username: expect.any(String) })
       expect(a.iceServers()).toEqual(servers)
-      expect(seen).toEqual([[stun], servers])
-    })
-
-    it('stops issuing once the last delivered signal is older than the window', async () => {
-      const r = await relay({ turn, limits: { turnAfterSentMs: 300 } })
-      await signaler(r, bob).listen(() => {})
-      const a = await authed(r, alice)
-      await deliver(a)
-      expect((await requestTurn(a)).t).toBe('ice')
-      await new Promise(res => setTimeout(res, 400))
-      expect(await requestTurn(a)).toEqual({ t: 'error', code: 'forbidden' })
+      expect(seen).toEqual([[stun], first, servers])
     })
 
     it('limits issuance per source address and in total', async () => {
@@ -325,17 +308,14 @@ describe('relay limits', () => {
         limits: { turnPerIpPerHour: 2, turnPerHour: 3 }
       })
       await signaler(r, bob).listen(() => {})
-      const from = async (ip: string): Promise<Raw> => {
-        const c = await authed(r, alice, { 'x-client-ip': ip })
-        await deliver(c)
-        return c
-      }
+      const from = (ip: string): Promise<Raw> => authed(r, alice, { 'x-client-ip': ip })
       const one = await from('203.0.113.1')
       expect((await requestTurn(one)).t).toBe('ice')
       expect((await requestTurn(one)).t).toBe('ice')
       expect(await requestTurn(one)).toEqual({ t: 'error', code: 'rate_limited' })
-      // another socket from the same address shares its budget
+      // another socket from the same address shares its budget, and a signal earns nothing
       const sameAddress = await from('203.0.113.1')
+      await deliver(sameAddress)
       expect(await requestTurn(sameAddress)).toEqual({ t: 'error', code: 'rate_limited' })
 
       const two = await from('203.0.113.2')

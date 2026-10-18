@@ -59,8 +59,6 @@ export interface RelayLimits {
   turnPerIpPerHour: number
   /** Sets of TURN credentials the relay issues per hour in total (a token bucket). */
   turnPerHour: number
-  /** A socket gets TURN credentials only this soon after the relay last delivered a signal from it. */
-  turnAfterSentMs: number
 }
 
 export const DEFAULT_RELAY_LIMITS: Readonly<RelayLimits> = Object.freeze({
@@ -77,8 +75,7 @@ export const DEFAULT_RELAY_LIMITS: Readonly<RelayLimits> = Object.freeze({
   maxBufferedBytes: 1048576,
   pingIntervalMs: 30000,
   turnPerIpPerHour: 6,
-  turnPerHour: 600,
-  turnAfterSentMs: 300000
+  turnPerHour: 600
 })
 
 export interface RelayServerOptions {
@@ -132,11 +129,12 @@ export interface RelayServerOptions {
   trustedIpHeader?: string
   /**
    * Issue coturn REST credentials (see `turnCredentials`) for these TURN urls, valid
-   * for `ttlSeconds` (default 600). They go only to a socket that asks with
-   * `{ t: 'turn' }` within `limits.turnAfterSentMs` of a delivered signal, within the
-   * per-source and global hourly budgets, and are never part of the `ice` frame sent
-   * after authentication. Minted credentials cannot be revoked; rotating the secret
-   * is the only way to cut them off early.
+   * for `ttlSeconds` (default 600). They go to an authenticated socket that asks with
+   * `{ t: 'turn' }`, within the per-source and global hourly budgets, and are never
+   * part of the `ice` frame sent after authentication. A first connection needs them
+   * before its offer is gathered, so asking does not wait for a delivered signal.
+   * Minted credentials cannot be revoked; rotating the secret is the only way to cut
+   * them off early.
    */
   turn?: { secret: string; urls: string[]; ttlSeconds?: number }
   /** STUN urls handed to authenticated sockets. */
@@ -171,8 +169,6 @@ interface Client {
   ping: Buffer | undefined
   alive: boolean
   authTimer: ReturnType<typeof setTimeout> | undefined
-  /** When the relay last delivered a signal from this socket, in Unix milliseconds. */
-  sentAt: number | undefined
 }
 
 /** An authenticated identity: its sockets and what may still be forwarded to it. */
@@ -311,8 +307,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       rate: new TokenBucket(limits.rateMessages, limits.rateWindowMs),
       ping: undefined,
       alive: true,
-      authTimer: undefined,
-      sentAt: undefined
+      authTimer: undefined
     }
     clients.add(client)
     unauthenticated.add(client)
@@ -449,7 +444,6 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       for (const peer of recipient.sockets) if (write(peer, frame)) delivered++
     }
     if (delivered > 0) {
-      client.sentAt = Date.now()
       send(client, { t: 'sent', ref })
       return
     }
@@ -464,9 +458,9 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
 
   /**
    * Answer `{ t: 'turn' }` with the STUN servers plus fresh TURN credentials. TURN
-   * relays traffic on our infrastructure and identities are free, so credentials go
-   * only to a socket that delivered a signal recently (it is dialing a peer that is
-   * online) and within an hourly budget per source and in total.
+   * relays traffic on our infrastructure and identities are free, so what limits it is
+   * an hourly budget per source address and one in total, short-lived credentials and
+   * a username coturn can count per identity (Ruling 27).
    */
   function vendTurn(client: Client): void {
     if (turn === undefined) {
@@ -474,10 +468,6 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       return
     }
     const now = Date.now()
-    if (client.sentAt === undefined || now - client.sentAt > limits.turnAfterSentMs) {
-      sendError(client, 'forbidden')
-      return
-    }
     const source = sourceOf(client.source)
     source.turn ??= new TokenBucket(limits.turnPerIpPerHour, HOUR_MS, now)
     if (!source.turn.ready(now) || !turnIssued.ready(now)) {
@@ -601,6 +591,15 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
         : ' (WARNING: no publicUrls, so clients sign a url built from the Host header; ' +
           'set publicUrls in production and whenever a proxy fronts this relay)')
   )
+  // A relay with public urls usually sits behind a proxy, whose address every client then has.
+  if (publicUrls.length > 0 && trustedIpHeader === undefined) {
+    log(
+      'webrtpay relay: WARNING: publicUrls is set but trustedIpHeader is not, so the ' +
+        'per-source limits count each socket under its peer address; behind a proxy every ' +
+        "client then shares the proxy's limits. Set trustedIpHeader to the header the " +
+        'outermost proxy sets (TRUSTED_IP_HEADER=cf-connecting-ip behind Cloudflare)'
+    )
+  }
 
   let closing: Promise<void> | undefined
   async function shutdown(): Promise<void> {
