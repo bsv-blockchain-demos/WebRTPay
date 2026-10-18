@@ -4,10 +4,13 @@ import { PeerLink } from '../src/channel/PeerLink.js'
 import { decodeCode, encodeAnswerCode } from '../src/codec/codes.js'
 import { DirectPayClient } from '../src/client/DirectPayClient.js'
 import type { DirectPayClientOptions, ReceiveHandlers } from '../src/client/DirectPayClient.js'
+import { KeyedBuckets, TokenBucket } from '../src/client/budget.js'
 import { DEFAULT_INBOUND_LIMITS, InboundLimiter } from '../src/client/limits.js'
 import { acceptDirectPayment } from '../src/payments/accept.js'
 import type { SeenStore } from '../src/payments/accept.js'
 import { createPaymentRequestProof } from '../src/payments/requests.js'
+import { MAX_DIRECT_TRANSACTION_BYTES, encodePayment } from '../src/payments/wire.js'
+import type { PaymentAck } from '../src/payments/wire.js'
 import type { AuthenticatedPeer } from '../src/session/AuthenticatedPeer.js'
 import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
 import { createMemoryHub } from '../src/signaling/MemorySignaler.js'
@@ -190,7 +193,7 @@ describe('InboundLimiter', () => {
       offersPerMinutePerSender: 3,
       maxMessageBytes: 16 * 1024 * 1024,
       idleTimeoutMs: 60000,
-      firstMessageTimeoutMs: 15000,
+      firstMessageTimeoutMs: 60000,
       maxSessionMs: 120000
     })
     expect(Object.isFrozen(DEFAULT_INBOUND_LIMITS)).toBe(true)
@@ -277,6 +280,56 @@ describe('InboundLimiter', () => {
     l.release(A)
     expect(l.tryAdmit(B, T0)).toBe(true)
     expect(l.tryAdmit(A, T0)).toBe(false)
+  })
+
+  it('counts its window on the clock it is given, not the wall clock (M24)', () => {
+    let t = 5000
+    const l = new InboundLimiter(
+      { ...DEFAULT_INBOUND_LIMITS, offersPerMinutePerSender: 1 },
+      () => t
+    )
+    const wall = jest.spyOn(Date, 'now').mockReturnValue(T0)
+    try {
+      expect(l.tryAdmit(A)).toBe(true)
+      l.release(A)
+      expect(l.refusal(A)).toBe('sender')
+      // the wall clock steps back an hour; the window still ends a minute later
+      wall.mockReturnValue(T0 - 3_600_000)
+      t += 60_000
+      expect(l.refusal(A)).toBeUndefined()
+      expect(l.tryAdmit(A)).toBe(true)
+    } finally {
+      wall.mockRestore()
+    }
+  })
+
+  it('does not read the wall clock by default (M24)', () => {
+    const wall = jest.spyOn(Date, 'now').mockImplementation(() => {
+      throw new Error('the wall clock was read')
+    })
+    try {
+      const l = new InboundLimiter(DEFAULT_INBOUND_LIMITS)
+      expect(l.tryAdmit(A)).toBe(true)
+      expect(l.refusal(A)).toBe('sender')
+      expect(new TokenBucket(1, 1000).take()).toBe(true)
+      expect(new KeyedBuckets(1, 1000).take(A)).toBe(true)
+    } finally {
+      wall.mockRestore()
+    }
+  })
+
+  it('keeps refilling intake budgets when the wall clock steps back (M24)', async () => {
+    const bucket = new TokenBucket(1, 20)
+    const keyed = new KeyedBuckets(1, 20)
+    expect([bucket.take(), keyed.take(A)]).toEqual([true, true])
+    expect([bucket.take(), keyed.take(A)]).toEqual([false, false])
+    const wall = jest.spyOn(Date, 'now').mockReturnValue(Date.now() - 3_600_000)
+    try {
+      await sleep(60)
+      expect([bucket.take(), keyed.take(A)]).toEqual([true, true])
+    } finally {
+      wall.mockRestore()
+    }
   })
 
   it('rejects invalid limits with RangeError', () => {
@@ -510,9 +563,14 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
     const pay = async (token: PaymentToken) =>
       sender.sendPayment(await sender.connect(payee.identityKey), token)
 
-    // decodePayment refuses it before the handler sees it
+    // decodePayment refuses it before the handler sees it (sendPayment would refuse to send
+    // it at all, so it goes out by hand)
     const { token: valid } = await makeToken(payer, payee.identityKey, 1000)
-    const zero = await pay({ ...valid, amount: 0 })
+    const peer = await sender.connect(payee.identityKey)
+    const acked = peer.waitFor((m): m is PaymentAck => m.t === 'payment.ack', 10000)
+    await peer.send(encodePayment('zero', { ...valid, amount: 0 }))
+    const zero = await acked
+    peer.close()
     expect(zero).toMatchObject({ status: 'rejected', reason: expect.any(String) })
     expect(zero.reason!.length).toBeGreaterThan(0)
     expect(handled).toEqual([])
@@ -615,6 +673,49 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
 
     const again = await sender.connect(payee.identityKey)
     expect(again.peerIdentityKey).toBe(payee.identityKey)
+  })
+
+  it('refuses an invalid or oversize token before sending anything, leaving the session open (M19, M20)', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const handled: number[] = []
+    await hubClient(hub, payee).startReceiving({
+      onPayment: async p => {
+        handled.push(p.token.amount)
+        await acceptDirectPayment(payee.wallet, p)
+        return 'accepted'
+      }
+    })
+    const sender = hubClient(hub, payer)
+    const peer = await sender.connect(payee.identityKey)
+    const sent = jest.spyOn(peer, 'send')
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+
+    const refusals = [
+      await failure(sender.sendPayment(peer, { ...token, amount: 999 })),
+      await failure(sender.sendPayment(peer, { ...token, outputIndex: 1 })),
+      await failure(sender.sendPayment(peer, token, { note: 'x'.repeat(501) })),
+      await failure(
+        sender.sendPayment(peer, {
+          ...token,
+          transaction: new Uint8Array(MAX_DIRECT_TRANSACTION_BYTES + 1)
+        })
+      )
+    ]
+    expect(refusals.map(e => e.code)).toEqual([
+      'invalid_payment',
+      'invalid_payment',
+      'invalid_payment',
+      'too_large'
+    ])
+    expect(sent).not.toHaveBeenCalled()
+    expect(peer.isOpen).toBe(true)
+
+    // the same session still delivers a good token, also as a Uint8Array
+    const bytes = { ...token, transaction: Uint8Array.from(token.transaction) }
+    expect(await sender.sendPayment(peer, bytes)).toMatchObject({ status: 'accepted', txid })
+    expect(handled).toEqual([1000])
   })
 
   it('sendPayment rejects timeout and closes the session when no ack comes', async () => {
@@ -1104,6 +1205,115 @@ describe('DirectPayClient inbound limits (MemoryHub, loopback WebRTC)', () => {
     expect((await failure(c.connect(payee.identityKey, { timeoutMs: 1000 }))).code).toBe('rejected')
   })
 
+  it('caps what a dialer sends before it authenticates at 64 KiB, and says so (M12, M14)', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const errors: unknown[] = []
+    await hubClient(hub, payee).startReceiving({
+      ...accepting(payee),
+      onError: e => errors.push(e)
+    })
+    const dialer = await makeWallet()
+    const { link, answer } = await rawDial(hub, dialer, payee.identityKey)
+    const refused = new Promise<unknown>(resolve =>
+      link.onMessage(m => {
+        if ((m as { t?: unknown }).t === 'error') resolve(m)
+      })
+    )
+    await link.acceptAnswer(answer)
+    await link.waitOpen(10000)
+    const nonce = toBase64(randomBytes(32))
+    await link.send({
+      t: 'hello',
+      v: 1,
+      identityKey: dialer.identityKey,
+      nonce,
+      pad: 'x'.repeat(65536)
+    })
+    expect(await refused).toEqual({
+      t: 'error',
+      code: 'too_large',
+      message: 'Message exceeds 65536 bytes'
+    })
+    await waitFor(() => errors.length === 1)
+    expect(errors[0]).toMatchObject({ code: 'too_large' })
+  })
+
+  it('rejects sendPayment too_large when the payee says the payment is over its cap (M14)', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const errors: unknown[] = []
+    await hubClient(hub, payee, { limits: { maxMessageBytes: 100_000 } }).startReceiving({
+      ...accepting(payee),
+      onError: e => errors.push(e)
+    })
+    const sender = hubClient(hub, payer)
+    const { token } = await makeToken(payer, payee.identityKey, 1000, 200_000)
+    const peer = await sender.connect(payee.identityKey)
+    const e = await failure(sender.sendPayment(peer, token))
+    expect(e.code).toBe('too_large')
+    expect(e.message).toContain('100000')
+    expect(payee.internalizeAction).not.toHaveBeenCalled()
+    expect((await closeOf(peer))?.code).toBe('too_large')
+  })
+
+  it('rejects sendPayment closed when the payee reports another error before the ack', async () => {
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    let session: AuthenticatedPeer | undefined
+    const offer = await client(payee, { chain: 'main' }).createOfferCode({
+      handlers: {
+        onPayment: async () => {
+          await session!.send({ t: 'error', code: 'storage', message: 'disk full' })
+          return new Promise<never>(() => undefined)
+        }
+      }
+    })
+    const sender = client(payer, { chain: 'main' })
+    const answer = await sender.answerOfferCode(offer.code)
+    const [payeeSide, peer] = await Promise.all([
+      offer.complete(answer.answerCode),
+      answer.connected
+    ])
+    session = payeeSide
+    const { token } = await makeToken(payer, payee.identityKey, 1000)
+    const e = await failure(sender.sendPayment(peer, token))
+    expect(e.code).toBe('closed')
+    expect(e.message).toContain('storage')
+  })
+
+  it('reports signals it cannot open to onError, at most once every 10 s (M23)', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const errors: unknown[] = []
+    await hubClient(hub, payee).startReceiving({
+      ...accepting(payee),
+      onError: e => errors.push(e)
+    })
+    const junk = hub.signaler(key())
+    for (let i = 0; i < 5; i++) await junk.send(payee.identityKey, junkEnvelope())
+    await waitFor(() => errors.length > 0)
+    await sleep(200)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({ code: 'invalid_signal' })
+
+    // a wallet that cannot decrypt (locked, or refusing the app) is visible the same way
+    const locked = await makeWallet()
+    const refusal = new Error('wallet is locked')
+    jest.spyOn(locked.wallet, 'decrypt').mockRejectedValue(refusal)
+    const lockedErrors: unknown[] = []
+    await hubClient(hub, locked).startReceiving({
+      ...accepting(locked),
+      onError: e => lockedErrors.push(e)
+    })
+    const dialer = hubClient(hub, await makeWallet())
+    const dial = failure(dialer.connect(locked.identityKey, { timeoutMs: 1000 }))
+    await waitFor(() => lockedErrors.length > 0)
+    expect(lockedErrors[0]).toMatchObject({ code: 'invalid_signal', cause: refusal })
+    expect((await dial).code).toBe('peer_unreachable')
+  })
+
   it('frees the slot as soon as an inbound handshake fails', async () => {
     const hub = createMemoryHub()
     const payee = await makeWallet()
@@ -1215,6 +1425,30 @@ describe('DirectPayClient inbound limits (MemoryHub, loopback WebRTC)', () => {
     await sleep(1000)
     const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
     expect(await sender.sendPayment(chatty, token)).toMatchObject({ status: 'accepted', txid })
+  })
+
+  it('fails sendPayment fast with closed once the payee has hung up, and a re-dial delivers (R2, M15)', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    await hubClient(hub, payee, {
+      limits: { firstMessageTimeoutMs: 300 }
+    }).startReceiving(accepting(payee, memorySeen()))
+    const sender = hubClient(hub, payer)
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+
+    const slow = await sender.connect(payee.identityKey)
+    expect(slow.isOpen).toBe(true)
+    // the payer takes longer than the payee's first-message window to prepare
+    await closeOf(slow)
+    expect(slow.isOpen).toBe(false)
+    const sent = jest.spyOn(slow, 'send')
+    const e = await failure(sender.sendPayment(slow, token))
+    expect(e.code).toBe('closed')
+    expect(sent).not.toHaveBeenCalled()
+
+    const again = await sender.connect(payee.identityKey)
+    expect(await sender.sendPayment(again, token)).toMatchObject({ status: 'accepted', txid })
   })
 
   it('ends an inbound session after maxSessionMs however busy it is', async () => {

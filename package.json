@@ -43,6 +43,7 @@
     "@bsv/sdk": "^2.8.6 || ^3.0.0"
   },
   "devDependencies": {
+    "@bsv/message-box-client": "2.6.0",
     "@bsv/sdk": "2.8.11",
     "@jest/globals": "^30",
     "@types/jest": "^30",

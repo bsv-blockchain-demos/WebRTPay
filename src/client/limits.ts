@@ -1,5 +1,6 @@
 import { DEFAULTS } from '../types.js'
 import type { PubKeyHex } from '../types.js'
+import { monotonicNow } from './budget.js'
 
 /**
  * What a payee allows from peers that dial it by identity key (spec §6). Each sender may
@@ -18,7 +19,8 @@ export interface InboundLimits {
   idleTimeoutMs: number
   /**
    * An inbound session whose peer has sent nothing this long after the handshake is closed,
-   * in milliseconds (the idle timeout applies from its first message on).
+   * in milliseconds (the idle timeout applies from its first message on). It is the payer's
+   * window to create, broadcast and send the payment after `connect` resolves.
    */
   firstMessageTimeoutMs: number
   /** An inbound session is closed this long after the handshake, however busy, in ms. */
@@ -27,7 +29,9 @@ export interface InboundLimits {
 
 /**
  * 3 sessions (1 per sender), 10 offers a minute (3 per sender), 16 MiB messages, 60 s idle
- * timeout, 15 s for the first message, 2 minutes per session.
+ * timeout, 60 s for the first message, 2 minutes per session. The first-message window is
+ * that long because a payer connects before it spends: creating and broadcasting the
+ * transaction (permission prompts included) happens inside it (Ruling 33).
  */
 export const DEFAULT_INBOUND_LIMITS: Readonly<InboundLimits> = Object.freeze({
   maxConcurrent: 3,
@@ -35,7 +39,7 @@ export const DEFAULT_INBOUND_LIMITS: Readonly<InboundLimits> = Object.freeze({
   offersPerMinutePerSender: 3,
   maxMessageBytes: DEFAULTS.inboundMaxMessageBytes,
   idleTimeoutMs: 60000,
-  firstMessageTimeoutMs: 15000,
+  firstMessageTimeoutMs: 60000,
   maxSessionMs: 120000
 })
 
@@ -56,9 +60,14 @@ const MAX_TIMER_MS = 2 ** 31 - 1
  * limit; it then takes a slot (and the sender's one session) until {@link release}. The
  * sender's limits are checked first, and refused offers count against nothing, so a sender
  * that keeps being refused cannot use up anyone else's budget.
+ *
+ * Times are read from `clock`, by default one that never steps backwards
+ * (`performance.now()` where there is one), so setting the wall clock back cannot hold the
+ * window shut.
  */
 export class InboundLimiter {
   private readonly limits: InboundLimits
+  private readonly clock: () => number
   private active = 0
   /** Senders with a session open. */
   private readonly sessions = new Set<PubKeyHex>()
@@ -66,8 +75,11 @@ export class InboundLimiter {
   private readonly admitted: number[] = []
   private readonly bySender = new Map<PubKeyHex, number[]>()
 
-  /** @throws `RangeError` for a limit that is not a positive integer (or timer length). */
-  constructor(l: InboundLimits) {
+  /**
+   * @param clock - Milliseconds; only differences between readings matter.
+   * @throws `RangeError` for a limit that is not a positive integer (or timer length).
+   */
+  constructor(l: InboundLimits, clock: () => number = monotonicNow) {
     for (const name of ['maxConcurrent', 'offersPerMinute', 'offersPerMinutePerSender'] as const) {
       if (!Number.isSafeInteger(l[name]) || l[name] < 1) {
         throw new RangeError(`${name} must be a positive integer`)
@@ -82,10 +94,11 @@ export class InboundLimiter {
       }
     }
     this.limits = { ...l }
+    this.clock = clock
   }
 
-  /** Why an offer from `sender` at `now` (ms) would be refused, or `undefined`. */
-  refusal(sender: PubKeyHex, now: number = Date.now()): InboundRefusal | undefined {
+  /** Why an offer from `sender` at `now` (on the clock) would be refused, or `undefined`. */
+  refusal(sender: PubKeyHex, now: number = this.clock()): InboundRefusal | undefined {
     this.prune(now)
     if (
       this.sessions.has(sender) ||
@@ -102,8 +115,8 @@ export class InboundLimiter {
     return undefined
   }
 
-  /** Admit an offer from `sender` at `now` (ms) and take a session slot, or refuse it. */
-  tryAdmit(sender: PubKeyHex, now: number = Date.now()): boolean {
+  /** Admit an offer from `sender` at `now` (on the clock) and take a session slot, or refuse it. */
+  tryAdmit(sender: PubKeyHex, now: number = this.clock()): boolean {
     if (this.refusal(sender, now) !== undefined) return false
     this.active++
     this.sessions.add(sender)

@@ -4,8 +4,19 @@ import { decodeCode, encodeAnswerCode, encodeOfferCode } from '../codec/codes.js
 import type { OfferCode } from '../codec/codes.js'
 import { paymentKey } from '../payments/accept.js'
 import { normalizePaymentRequest, verifyPaymentRequestProof } from '../payments/requests.js'
-import { decodePayment, encodePayment } from '../payments/wire.js'
-import type { PaymentAck, PaymentWire, RequestWire, WireMessage } from '../payments/wire.js'
+import {
+  MAX_DIRECT_TRANSACTION_BYTES,
+  decodePayment,
+  encodePayment,
+  validatePaymentToken
+} from '../payments/wire.js'
+import type {
+  ErrorWire,
+  PaymentAck,
+  PaymentWire,
+  RequestWire,
+  WireMessage
+} from '../payments/wire.js'
 import type { AuthenticatedPeer } from '../session/AuthenticatedPeer.js'
 import { authenticate } from '../session/handshake.js'
 import { ReplayCache, openSignal, sealSignal } from '../signaling/envelope.js'
@@ -15,7 +26,7 @@ import type {
   IncomingPayment,
   IncomingPaymentRequest,
   PaymentRequestMessage,
-  PaymentToken,
+  PaymentTokenInput,
   PubKeyHex,
   WalletLike
 } from '../types.js'
@@ -45,7 +56,11 @@ export interface ReceiveHandlers {
    * on, nor is anything when this handler is absent.
    */
   onPaymentRequest?(r: IncomingPaymentRequest & { proofValid: boolean }): Promise<void>
-  /** Failures of inbound sessions and handlers; never thrown back into the client. */
+  /**
+   * Failures of inbound sessions and handlers; never thrown back into the client. Signals
+   * that cannot be opened (`invalid_signal`: a wallet that will not decrypt, a clock more
+   * than 120 s off, junk) are reported too, at most one every 10 s.
+   */
   onError?(e: unknown): void
   /** A peer finished the identity handshake and its session is being served. */
   onSession?(peerIdentityKey: PubKeyHex): void
@@ -126,14 +141,17 @@ export interface AnswerHandle {
   offer: OfferCode
   /** The `webrtpay1:` answer code to show the payee. */
   answerCode: string
-  /** Resolves once the payee applied the answer and proved the identity in the offer. */
+  /**
+   * Resolves once the payee applied the answer and proved the identity in the offer. Its
+   * clock started when `answerOfferCode` was called: ICE checks toward the payee run from
+   * then, a Chromium answerer gives up after about 15 s without the payee, and `connected`
+   * rejects after `connectMs` (30 s) at the latest. Show the answer code at once.
+   */
   connected: Promise<AuthenticatedPeer>
   /** Close the link; `connected` rejects `closed`. */
   cancel(): void
 }
 
-/** Cap on a link until its peer has authenticated (Ruling 16); handshake messages are tiny. */
-const PRE_AUTH_MAX_MESSAGE_BYTES = 65536
 /**
  * Signals opened (decrypted) per second from everyone, at most, with bursts of up to 40.
  * Bounds the wallet work junk can cause, and the replay cache: a sid is kept at most 300 s,
@@ -146,6 +164,8 @@ const SENDER_INTAKE_PER_MINUTE = 10
 const SENDER_INTAKE_BURST = 10
 /** Each refusal costs an encryption and a send: at most one per second is answered. */
 const REJECTS_PER_SECOND = 1
+/** Signals that could not be opened are reported to `onError` at most this often. */
+const UNOPENED_REPORT_MS = 10000
 /** Longest reject reason from a peer passed on in an error message. */
 const MAX_REJECT_REASON_CHARS = 200
 /** Longest reason a `payment.ack` may carry. */
@@ -174,7 +194,11 @@ interface Dial {
  * Payer: {@link connect} dials a payee by identity key through the signaler (or
  * {@link answerOfferCode} answers a payee's offer code), then {@link sendPayment} delivers
  * a `PaymentToken` and returns the payee's ack. Connect before creating the transaction:
- * if the payee cannot be reached nothing has been spent.
+ * if the payee cannot be reached nothing has been spent. A payee that answered a dial
+ * closes the session unless the payment (or any message) arrives within its
+ * first-message timeout, 60 s by default, of the connection: prepare the transaction
+ * promptly after `connect` (or connect only once the user has confirmed), check
+ * `peer.isOpen` before broadcasting and send right after.
  *
  * Payee: {@link startReceiving} answers offers that arrive through the signaler, within
  * the inbound limits, and serves each authenticated session with the handlers;
@@ -207,6 +231,7 @@ export class DirectPayClient {
     60000 / SENDER_INTAKE_PER_MINUTE
   )
   private readonly rejects = new TokenBucket(1, 1000 / REJECTS_PER_SECOND)
+  private readonly unopenedReports = new TokenBucket(1, UNOPENED_REPORT_MS)
   /** Payment decisions in progress by `paymentKey`, so concurrent deliveries share one. */
   private readonly deciding = new Map<string, Promise<PaymentDecision>>()
   private readonly dials = new Map<string, Dial>()
@@ -266,7 +291,8 @@ export class DirectPayClient {
    * no reply; one refused because the payee is busy gets a sealed `reject` (`busy`), but
    * refusals are answered at most once a second and the rest go unanswered. A session must
    * open and authenticate within `connectMs` of its answer being sent, send its first
-   * message within `firstMessageTimeoutMs`, and ends after `maxSessionMs` regardless.
+   * message within `firstMessageTimeoutMs` (60 s by default: the payer creates and
+   * broadcasts the transaction in that window), and ends after `maxSessionMs` regardless.
    *
    * @throws `WebRTPayError('unsupported')` without a signaler; `closed` after
    * {@link close}; whatever the signaler's `listen` throws (receiving is then off).
@@ -301,13 +327,19 @@ export class DirectPayClient {
    * Dial `recipient` through the signaler and authenticate it: send an encrypted offer,
    * wait for the answer, open the channel and run the handshake pinned to `recipient`.
    *
+   * The payee then waits for the first message only for its `firstMessageTimeoutMs` (60 s
+   * by default) before it closes the session: create the transaction right after this
+   * resolves, check `peer.isOpen` before broadcasting it, and send it at once (see
+   * {@link sendPayment}).
+   *
    * @throws `WebRTPayError`: `unsupported` without a signaler; `peer_unreachable` when the
    * carrier cannot deliver or no answer arrives within `timeoutMs` (default `connectMs`,
-   * 30 s); `rejected` when the recipient refused (the reason, at most 200 characters, is in
-   * the message: `busy`, `not_receiving`); `timeout` when the answer came but the channel
-   * and handshake did not finish in time; `auth_failed`, `closed` or `protocol` from the
-   * channel and handshake; `closed` when the client closes first. `TypeError` for a
-   * recipient that is not an identity key, `RangeError` for an invalid `timeoutMs`.
+   * 30 s); `rate_limited` when the carrier refuses for its limits; `rejected` when the
+   * recipient refused (the reason, at most 200 characters, is in the message: `busy`,
+   * `not_receiving`); `timeout` when the answer came but the channel and handshake did not
+   * finish in time; `auth_failed`, `closed` or `protocol` from the channel and handshake;
+   * `closed` when the client closes first. `TypeError` for a recipient that is not an
+   * identity key, `RangeError` for an invalid `timeoutMs`.
    */
   connect(recipient: PubKeyHex, o: { timeoutMs?: number } = {}): Promise<AuthenticatedPeer> {
     if (this.closing !== undefined) return Promise.reject(closedError())
@@ -425,23 +457,55 @@ export class DirectPayClient {
   /**
    * Send `token` as a `payment` and wait for the matching `payment.ack`. Once the ack is
    * in, the session is ended (bye, then close); a `rejected` ack resolves like any other,
-   * the caller decides. A failure closes the session too.
+   * the caller decides. A failure after sending closes the session too.
    *
-   * @throws `WebRTPayError`: `closed` (or the close reason) when the session closes before
-   * the ack; `timeout` after `timeoutMs` (default `ackMs`, 45 s).
+   * Before anything is sent, the token is checked with `validatePaymentToken` and against
+   * `MAX_DIRECT_TRANSACTION_BYTES`, and the session must still be open; these failures leave
+   * the session as it was. A payee that dialed in closes the session when no message comes
+   * within its first-message timeout (60 s by default) of `connect` resolving, so prepare
+   * the payment promptly, check `peer.isOpen` before broadcasting, and send right after.
+   *
+   * Keep the token until the ack is `accepted` or `received`. When this throws after the
+   * transaction was broadcast, or the ack is `rejected` with a `txid`, the payee may hold an
+   * output it cannot find without the derivation values: deliver the same token again
+   * (directly or through MessageBox) rather than paying again; a payee acknowledges a
+   * payment it already has without taking it twice.
+   *
+   * @throws `WebRTPayError`: `invalid_payment` for a token the payee would refuse;
+   * `too_large` for a transaction over `MAX_DIRECT_TRANSACTION_BYTES`, or when the payee
+   * answers that the message is over its cap; `closed` when the session has already closed
+   * or closes before the ack (or the close reason); `timeout` after `timeoutMs` (default
+   * `ackMs`, 45 s). `RangeError` for an invalid `timeoutMs`.
    */
   async sendPayment(
     peer: AuthenticatedPeer,
-    token: PaymentToken,
+    token: PaymentTokenInput,
     o: { note?: string; timeoutMs?: number } = {}
   ): Promise<PaymentAck> {
     const timeoutMs = timerMs(o.timeoutMs, this.ackMs, 'timeoutMs')
+    // Size first: a junk megabyte array should not be parsed to be refused.
+    const transaction: unknown = (token as { transaction?: unknown } | null)?.transaction
+    if (
+      (Array.isArray(transaction) || transaction instanceof Uint8Array) &&
+      transaction.length > MAX_DIRECT_TRANSACTION_BYTES
+    ) {
+      throw new WebRTPayError(
+        'too_large',
+        `The transaction is ${transaction.length} bytes; a direct payment carries at most ` +
+          `${MAX_DIRECT_TRANSACTION_BYTES}`
+      )
+    }
+    validatePaymentToken(token, o.note)
+    if (!peer.isOpen) {
+      throw new WebRTPayError('closed', 'The session has closed; connect again to send')
+    }
     const id = newId()
     const wire = encodePayment(id, token, o.note)
-    const acked = peer.waitFor(
-      (m): m is PaymentAck => m.t === 'payment.ack' && m.id === id,
-      timeoutMs
-    )
+    // An `error` from the payee ends the wait: it is about to close the session.
+    const acked = peer.waitFor((m): m is PaymentAck => {
+      if (m.t === 'error') throw peerReported(m)
+      return m.t === 'payment.ack' && m.id === id
+    }, timeoutMs)
     let ack: PaymentAck
     try {
       ;[, ack] = await Promise.all([peer.send(wire), acked])
@@ -557,6 +621,12 @@ export class DirectPayClient {
    * an answer code to show the payee (it does not name this identity; the handshake proves
    * it). `connected` authenticates the payee against the identity in the offer.
    *
+   * Gathering, the ICE checks toward the payee and the `connectMs` timer of `connected` all
+   * start when this is called, and a Chromium answerer gives up after about 15 s if the
+   * payee has not applied the answer. So let the user review the payee and amount first,
+   * with `decodeCode(code, { expectedChain })`, and call this only once they have confirmed;
+   * then show the answer code at once. Call `cancel()` if the payment is abandoned.
+   *
    * @throws `WebRTPayError('invalid_code')` for a malformed or expired code, an answer
    * code, or an offer for another network than `expectedChain` (default: the client's
    * `chain`; no check when neither is set); `closed` after {@link close}.
@@ -664,11 +734,10 @@ export class DirectPayClient {
    */
   private admitSignal(from: PubKeyHex, e: SignalEnvelope): boolean {
     if (this.dials.get(e.sid)?.recipient === from) return true
-    const now = Date.now()
-    if (this.limiter.refusal(from, now) === 'sender') return false
+    if (this.limiter.refusal(from) === 'sender') return false
     // Spent overall: drop before keeping any per-sender state for it.
-    if (!this.intake.has(now)) return false
-    return this.senderIntake.take(from, now) && this.intake.take(now)
+    if (!this.intake.has()) return false
+    return this.senderIntake.take(from) && this.intake.take()
   }
 
   private async handleSignal(from: PubKeyHex, e: SignalEnvelope): Promise<void> {
@@ -684,8 +753,12 @@ export class DirectPayClient {
         // otherwise make the genuine answer look like a replay.
         wanted: s => s.kind === 'offer' || this.dials.get(s.sid)?.recipient === s.from
       })
-    } catch {
-      return // undecryptable, stale, replayed, misaddressed or unwanted: dropped
+    } catch (error) {
+      // Undecryptable, stale, replayed, misaddressed or unwanted: dropped. A wallet that
+      // cannot decrypt would otherwise drop every offer silently, so it is reported, but
+      // rarely enough that junk cannot flood the app.
+      if (this.unopenedReports.take()) this.report(this.handlers, error)
+      return
     }
     if (this.closing !== undefined) return
     if (p.kind === 'offer') {
@@ -951,13 +1024,17 @@ export class DirectPayClient {
 
   // ------------------------------------------------------------ helpers
 
-  /** Options for a new link: the RTC options with the provider's ICE servers merged in. */
+  /**
+   * Options for a new link: the RTC options with the provider's ICE servers merged in.
+   * `authenticate`, which every path runs before the peer can connect, caps messages at
+   * 64 KiB until the peer has authenticated.
+   */
   private async linkOptions(): Promise<PeerLinkOptions> {
     const provided = await this.providedIceServers()
     const rtc = this.rtc
     const iceServers =
       provided.length === 0 ? rtc.iceServers : mergeIceServers(rtc.iceServers ?? [], provided)
-    return { ...rtc, iceServers, maxMessageBytes: PRE_AUTH_MAX_MESSAGE_BYTES }
+    return { ...rtc, iceServers }
   }
 
   /**
@@ -1066,6 +1143,14 @@ function truncate(s: string, max: number): string {
 
 function asError(e: unknown): WebRTPayError | undefined {
   return e instanceof WebRTPayError ? e : undefined
+}
+
+/** What a payee's `error` message means to the payer waiting for its ack. */
+function peerReported(m: ErrorWire): WebRTPayError {
+  const detail = m.message === undefined ? m.code : `${m.code}: ${m.message}`
+  return m.code === 'too_large'
+    ? new WebRTPayError('too_large', `The payee refused the message as too large (${detail})`)
+    : new WebRTPayError('closed', `The payee reported an error: ${detail}`)
 }
 
 /** A reason safe to show the peer: our own error messages only. */
