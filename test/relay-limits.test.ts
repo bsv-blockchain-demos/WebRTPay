@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it } from '@jest/globals'
+import { DEFAULT_RELAY_LIMITS } from '../server/index.js'
 import type { RelayServer } from '../server/index.js'
-import { addressGroup } from '../server/ip.js'
+import { addressGroup, ipv6Block48 } from '../server/ip.js'
 import {
   authenticate,
   env,
@@ -17,10 +18,11 @@ describe('relay limits', () => {
   let alice: Party
   let bob: Party
   let carol: Party
+  let dave: Party
   const { relay, signaler, rawAt, defer, cleanup } = relayFixtures()
 
   beforeAll(async () => {
-    ;[alice, bob, carol] = await Promise.all([party(), party(), party()])
+    ;[alice, bob, carol, dave] = await Promise.all([party(), party(), party(), party()])
   })
 
   afterEach(cleanup)
@@ -53,12 +55,97 @@ describe('relay limits', () => {
     return c
   }
 
+  /** Every frame `c` receives from now on, parsed, besides what `c.next()` hands out. */
+  function record(c: Raw): Array<Record<string, unknown>> {
+    const got: Array<Record<string, unknown>> = []
+    c.ws.on('message', data => got.push(JSON.parse(String(data)) as Record<string, unknown>))
+    return got
+  }
+
+  describe('frames over the rate (R3)', () => {
+    it('answers each frame over the rate until maxOverRateFrames in a row, then closes with 1008', async () => {
+      const r = await relay({ limits: { rateMessages: 5, maxOverRateFrames: 3 } })
+      const a = await authed(r, alice)
+      const got = record(a)
+      // the auth frame took one of the 5 frames
+      for (let i = 0; i < 12; i++) a.send({})
+      expect(await a.closed).toBe(1008)
+      expect(got.map(f => f.code)).toEqual([
+        ...new Array<string>(4).fill('bad_request'),
+        ...new Array<string>(3).fill('rate_limited')
+      ])
+      await waitFor(() => r.stats().sockets === 0)
+    })
+
+    it('counts only frames over the rate in a row', async () => {
+      // one frame a second, 3 at most; the auth frame took one
+      const r = await relay({
+        limits: { rateMessages: 3, rateWindowMs: 3000, maxOverRateFrames: 2 }
+      })
+      const a = await authed(r, alice)
+      const got = record(a)
+      const codes = async (n: number): Promise<unknown[]> => {
+        await waitFor(() => got.length >= n)
+        return got.splice(0, n).map(f => f.code)
+      }
+      for (let i = 0; i < 4; i++) a.send({})
+      expect(await codes(4)).toEqual(['bad_request', 'bad_request', 'rate_limited', 'rate_limited'])
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      a.send({}) // within the rate again: the count starts over
+      a.send({})
+      a.send({})
+      expect(await codes(3)).toEqual(['bad_request', 'rate_limited', 'rate_limited'])
+      expect(a.ws.readyState).toBe(a.ws.OPEN)
+      a.send({})
+      expect(await a.closed).toBe(1008)
+    })
+
+    it('charges pings to the rate: pongs within it, closes a socket that keeps pinging', async () => {
+      const r = await relay({ limits: { rateMessages: 4, maxOverRateFrames: 2 } })
+      let pongs = 0
+      // before authenticating
+      const early = rawAt(r.url)
+      expect((await early.next()).t).toBe('challenge')
+      early.ws.on('pong', () => pongs++)
+      for (let i = 0; i < 20; i++) early.ws.ping()
+      expect(await early.closed).toBe(1008)
+      expect(pongs).toBe(4)
+
+      // after authenticating (the auth frame took one)
+      pongs = 0
+      const a = await authed(r, alice)
+      a.ws.on('pong', () => pongs++)
+      for (let i = 0; i < 20; i++) a.ws.ping()
+      expect(await a.closed).toBe(1008)
+      expect(pongs).toBe(3)
+    })
+
+    it('closes a flooder that reads its replies while another client authenticates', async () => {
+      const r = await relay()
+      const a = await authed(r, alice)
+      const got = record(a)
+      for (let i = 0; i < 2000; i++) a.send({})
+      const pinger = rawAt(r.url)
+      expect((await pinger.next()).t).toBe('challenge')
+      for (let i = 0; i < 2000; i++) pinger.ws.ping()
+      const started = Date.now()
+      await authed(r, carol)
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(await a.closed).toBe(1008)
+      expect(await pinger.closed).toBe(1008)
+      // 19 frames within the rate, then the default 20 over it are answered
+      expect(got).toHaveLength(39)
+      expect(DEFAULT_RELAY_LIMITS.maxOverRateFrames).toBe(20)
+    })
+  })
+
   describe('write buffers and liveness', () => {
     it('terminates a recipient that stops reading and reports the signal it could not take as not delivered', async () => {
       const r = await relay({
         limits: {
           maxBufferedBytes: 64 * 1024,
           rateMessages: 100000,
+          signalsPerPairPerMinute: 100000,
           signalsPerRecipientPerMinute: 100000
         }
       })
@@ -222,23 +309,90 @@ describe('relay limits', () => {
       await accepted(r, { 'x-client-ip': '203.0.113.3' })
     })
 
-    it('limits signals to one recipient per minute across senders and reports the excess as not delivered', async () => {
-      const r = await relay({ limits: { signalsPerRecipientPerMinute: 3 } })
+    it('limits signals per sender to a recipient, and to a recipient in total (R4)', async () => {
+      const r = await relay({
+        limits: { signalsPerPairPerMinute: 2, signalsPerRecipientPerMinute: 3 }
+      })
       const bobBox = inbox()
       await signaler(r, bob).listen(bobBox.fn)
       const carolBox = inbox()
       await signaler(r, carol).listen(carolBox.fn)
-      const a = signaler(r, alice)
-      const c = signaler(r, carol)
+      const a = await authed(r, alice)
+      const deliver = async (c: Raw, to: Party): Promise<Record<string, unknown>> => {
+        const e = env()
+        c.send({ t: 'signal', to: to.key, envelope: e })
+        const reply = await c.next()
+        expect(reply.ref).toBe(e.sid)
+        return reply
+      }
 
-      await a.send(bob.key, env())
-      await a.send(bob.key, env())
+      expect((await deliver(a, bob)).t).toBe('sent')
+      expect((await deliver(a, bob)).t).toBe('sent')
+      // alice has spent her share of bob's budget, and only hers
+      expect(await deliver(a, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
+      const c = signaler(r, carol)
       await c.send(bob.key, env())
-      await expect(a.send(bob.key, env())).rejects.toMatchObject({ code: 'peer_unreachable' })
-      await expect(c.send(bob.key, env())).rejects.toMatchObject({ code: 'peer_unreachable' })
-      await a.send(carol.key, env())
+      // bob's total of 3 is spent: anyone else is told he is not reachable
+      await expect(signaler(r, dave).send(bob.key, env())).rejects.toMatchObject({
+        code: 'peer_unreachable'
+      })
+      // alice's share of carol's budget is her own
+      expect((await deliver(a, carol)).t).toBe('sent')
       await waitFor(() => carolBox.got.length === 1)
       expect(bobBox.got).toHaveLength(3)
+      expect(DEFAULT_RELAY_LIMITS.signalsPerPairPerMinute).toBe(6)
+      expect(DEFAULT_RELAY_LIMITS.signalsPerRecipientPerMinute).toBe(120)
+    })
+
+    it('lets one identity at the default rate no longer lock other senders out (R4)', async () => {
+      const r = await relay()
+      const bobBox = inbox()
+      await signaler(r, bob).listen(bobBox.fn)
+      const mallory = await authed(r, alice)
+      // one junk signal every frame mallory may send: her share is gone after 6
+      const replies: unknown[] = []
+      for (let i = 0; i < 15; i++) {
+        mallory.send({ t: 'signal', to: bob.key, envelope: env() })
+        replies.push((await mallory.next()).t)
+      }
+      expect(replies.filter(t => t === 'sent')).toHaveLength(6)
+      for (const p of [carol, dave]) await signaler(r, p).send(bob.key, env())
+      expect(bobBox.got).toHaveLength(8)
+    })
+
+    it('also counts IPv6 sources by /48, at 4 times the /64 limits by default (R5)', async () => {
+      expect(DEFAULT_RELAY_LIMITS).toMatchObject({
+        maxSocketsPer48: 4 * DEFAULT_RELAY_LIMITS.maxSocketsPerIp,
+        connectionsPer48PerMinute: 4 * DEFAULT_RELAY_LIMITS.connectionsPerIpPerMinute,
+        turnPer48PerHour: 4 * DEFAULT_RELAY_LIMITS.turnPerIpPerHour
+      })
+      const r = await relay({
+        trustedIpHeader: 'x-client-ip',
+        limits: { maxSocketsPerIp: 2, maxSocketsPer48: 3 }
+      })
+      const from = (ip: string): Record<string, string> => ({ 'x-client-ip': ip })
+      await accepted(r, from('2001:db8:aa:1::1'))
+      await accepted(r, from('2001:db8:aa:1::2'))
+      expect(await upgradeError(r.url, from('2001:db8:aa:1::3'))).toContain('429')
+      await accepted(r, from('2001:db8:aa:2::1'))
+      // the /48 is full, whichever /64 inside it asks
+      expect(await upgradeError(r.url, from('2001:db8:aa:3::1'))).toContain('429')
+      expect(await upgradeError(r.url, from('2001:db8:aa:ffff::1'))).toContain('429')
+      // another /48, and IPv4, are not affected
+      await accepted(r, from('2001:db8:bb:1::1'))
+      for (const ip of ['203.0.113.1', '203.0.113.2', '203.0.113.3']) await accepted(r, from(ip))
+    })
+
+    it('limits new connections per /48 per minute (R5)', async () => {
+      const r = await relay({
+        trustedIpHeader: 'x-client-ip',
+        limits: { connectionsPer48PerMinute: 3 }
+      })
+      for (let i = 1; i <= 3; i++) {
+        ;(await accepted(r, { 'x-client-ip': `2001:db8:aa:${i}::1` })).ws.close()
+      }
+      expect(await upgradeError(r.url, { 'x-client-ip': '2001:db8:aa:4::1' })).toContain('429')
+      await accepted(r, { 'x-client-ip': '2001:db8:bb:1::1' })
     })
   })
 
@@ -325,11 +479,43 @@ describe('relay limits', () => {
       expect(await requestTurn(three)).toEqual({ t: 'error', code: 'rate_limited' })
     })
 
+    it('limits issuance per /48 too (R5)', async () => {
+      const r = await relay({
+        turn,
+        trustedIpHeader: 'x-client-ip',
+        limits: { turnPerIpPerHour: 6, turnPer48PerHour: 2 }
+      })
+      const from = (ip: string): Promise<Raw> => authed(r, alice, { 'x-client-ip': ip })
+      expect((await requestTurn(await from('2001:db8:aa:1::1'))).t).toBe('ice')
+      expect((await requestTurn(await from('2001:db8:aa:2::1'))).t).toBe('ice')
+      expect(await requestTurn(await from('2001:db8:aa:3::1'))).toEqual({
+        t: 'error',
+        code: 'rate_limited'
+      })
+      expect((await requestTurn(await from('2001:db8:bb:1::1'))).t).toBe('ice')
+    })
+
     it('answers turn with the STUN servers when no TURN is configured', async () => {
       const r = await relay({ stunUrls: stun.urls })
       const a = await authed(r, alice)
       expect(await requestTurn(a)).toEqual({ t: 'ice', iceServers: [stun] })
     })
+  })
+})
+
+describe('ipv6Block48', () => {
+  it('names the /48 of an IPv6 address, and nothing for IPv4 or IPv4-mapped addresses', () => {
+    const cases: Array<[string, string | undefined]> = [
+      ['2001:db8:1:2::1', '2001:db8:1::/48'],
+      ['2001:DB8:1:ffff:ffff:ffff:ffff:ffff', '2001:db8:1::/48'],
+      ['[2001:db8::5]', '2001:db8:0::/48'],
+      ['::1', '0:0:0::/48'],
+      ['203.0.113.7', undefined],
+      ['::ffff:203.0.113.7', undefined],
+      ['not an address', undefined]
+    ]
+    for (const [address, block] of cases)
+      expect([address, ipv6Block48(address)]).toEqual([address, block])
   })
 })
 

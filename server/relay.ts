@@ -7,7 +7,11 @@ import type { TLSSocket } from 'node:tls'
 import { ProtoWallet } from '@bsv/sdk'
 import { WebSocketServer, WebSocket as WsSocket } from 'ws'
 import type { RawData } from 'ws'
-import { isSignalEnvelope } from '../src/signaling/envelope.js'
+import {
+  MAX_SIGNAL_CIPHERTEXT_CHARS,
+  MAX_SIGNAL_SID_CHARS,
+  isSignalEnvelope
+} from '../src/signaling/envelope.js'
 import { normalizeRelayUrl, relayAuthData } from '../src/signaling/RelaySignaler.js'
 import type {
   RelayErrorCode,
@@ -18,18 +22,31 @@ import { RELAY_PROTOCOL_ID, isIdentityKey } from '../src/types.js'
 import type { PubKeyHex } from '../src/types.js'
 import { fromHex } from '../src/util/bytes.js'
 import { TokenBucket } from './bucket.js'
-import { addressGroup, headerAddress } from './ip.js'
+import { addressGroup, headerAddress, ipv6Block48 } from './ip.js'
 import { turnCredentials } from './turn.js'
 
 /** Per-socket, per-source and global limits; sizes in bytes, durations in milliseconds. */
 export interface RelayLimits {
-  /** Largest envelope forwarded, measured as the UTF-8 JSON of `{ v, sid, ciphertext }`. */
+  /**
+   * Largest envelope forwarded, measured as the UTF-8 JSON of `{ v, sid, ciphertext }`. The
+   * default, 24672, is the largest well-formed envelope: a 64-character sid and a ciphertext
+   * of 24576 characters, room for a signal with a 16384-character SDP.
+   */
   maxEnvelopeBytes: number
   /** Time a new socket has to authenticate. */
   authTimeoutMs: number
-  /** Frames a socket may send per `rateWindowMs` (a token bucket refilled continuously). */
+  /**
+   * Frames a socket may send per `rateWindowMs` (a token bucket refilled continuously).
+   * WebSocket pings count too.
+   */
   rateMessages: number
   rateWindowMs: number
+  /**
+   * Frames over the rate a socket may send in a row, each answered `rate_limited` (pings get
+   * no pong); one more closes it with 1008. Clients match replies to frames in order, so a
+   * client briefly over the rate keeps its socket, while one that floods is cut off.
+   */
+  maxOverRateFrames: number
   /** Authenticated sockets one identity may hold at once. */
   maxSocketsPerIdentity: number
   /** Sockets the relay holds at once, authenticated or not. */
@@ -40,6 +57,16 @@ export interface RelayLimits {
   maxSocketsPerIp: number
   /** New connections one source address may open per minute (a token bucket). */
   connectionsPerIpPerMinute: number
+  /** Sockets all the IPv6 sources of one /48 may hold at once, together. */
+  maxSocketsPer48: number
+  /** New connections all the IPv6 sources of one /48 may open per minute, together. */
+  connectionsPer48PerMinute: number
+  /**
+   * Signals forwarded from one sender identity to one recipient per minute (a token bucket);
+   * the rest are answered `rate_limited`. It keeps one identity from spending a recipient's
+   * whole budget.
+   */
+  signalsPerPairPerMinute: number
   /**
    * Signals forwarded to one identity per minute, from all senders together (a token
    * bucket); the rest are answered `offline`, as if the identity were not connected.
@@ -57,24 +84,37 @@ export interface RelayLimits {
   pingIntervalMs: number
   /** Sets of TURN credentials one source address may get per hour (a token bucket). */
   turnPerIpPerHour: number
+  /** Sets of TURN credentials all the IPv6 sources of one /48 may get per hour, together. */
+  turnPer48PerHour: number
   /** Sets of TURN credentials the relay issues per hour in total (a token bucket). */
   turnPerHour: number
 }
 
+/** The largest well-formed envelope as the relay measures it (see `maxEnvelopeBytes`). */
+const MAX_ENVELOPE_BYTES =
+  JSON.stringify({ v: 1, sid: '', ciphertext: '' }).length +
+  MAX_SIGNAL_SID_CHARS +
+  MAX_SIGNAL_CIPHERTEXT_CHARS
+
 export const DEFAULT_RELAY_LIMITS: Readonly<RelayLimits> = Object.freeze({
-  maxEnvelopeBytes: 16384,
+  maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
   authTimeoutMs: 10000,
   rateMessages: 20,
   rateWindowMs: 10000,
+  maxOverRateFrames: 20,
   maxSocketsPerIdentity: 5,
   maxSockets: 10000,
   maxUnauthenticatedSockets: 1000,
   maxSocketsPerIp: 20,
   connectionsPerIpPerMinute: 30,
-  signalsPerRecipientPerMinute: 30,
+  maxSocketsPer48: 80,
+  connectionsPer48PerMinute: 120,
+  signalsPerPairPerMinute: 6,
+  signalsPerRecipientPerMinute: 120,
   maxBufferedBytes: 1048576,
   pingIntervalMs: 30000,
   turnPerIpPerHour: 6,
+  turnPer48PerHour: 24,
   turnPerHour: 600
 })
 
@@ -161,10 +201,12 @@ interface Client {
   nonce: string
   /** URLs this socket may have signed. */
   authUrls: string[]
-  /** The source this socket counts against (see `addressGroup`). */
-  source: string
+  /** The sources this socket counts against: its address group, and an IPv6 address's /48. */
+  sources: Source[]
   /** Frames this socket may still send. */
   rate: TokenBucket
+  /** Frames over the rate sent in a row. */
+  overRate: number
   /** Payload of the last ping sent; only a pong echoing it proves the socket is alive. */
   ping: Buffer | undefined
   alive: boolean
@@ -174,13 +216,18 @@ interface Client {
 /** An authenticated identity: its sockets and what may still be forwarded to it. */
 interface Identity {
   sockets: Set<Client>
+  /** Signals it may still receive from everyone together. */
   budget: TokenBucket
+  /** Signals it may still receive from each sender identity; full buckets are swept out. */
+  pairs: Map<PubKeyHex, TokenBucket>
 }
 
-/** A source address (an IPv6 /64): its sockets and budgets. */
+/** A source (an IPv4 address, an IPv6 /64 or /48): its sockets and budgets. */
 interface Source {
   sockets: number
+  maxSockets: number
   connections: TokenBucket
+  turnPerHour: number
   turn: TokenBucket | undefined
 }
 
@@ -235,7 +282,12 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
 
   const owned = o.server === undefined
   const http = o.server ?? createServer(health)
-  const wss = new WebSocketServer({ noServer: true, maxPayload: limits.maxEnvelopeBytes * 4 })
+  // Pings are answered by onPing, within the socket's rate (autoPong would answer them all).
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: limits.maxEnvelopeBytes * 4,
+    autoPong: false
+  })
   const verifier = new ProtoWallet('anyone')
   const clients = new Set<Client>()
   const unauthenticated = new Set<Client>()
@@ -251,9 +303,8 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       if (owned) refuse(socket, '404 Not Found')
       return
     }
-    const key = addressGroup(sourceAddress(req))
-    const source = sourceOf(key)
-    if (source.sockets >= limits.maxSocketsPerIp || !source.connections.take()) {
+    const sources = sourcesOf(sourceAddress(req))
+    if (sources.some(s => s.sockets >= s.maxSockets || !s.connections.ready())) {
       refuse(socket, '429 Too Many Requests')
       return
     }
@@ -264,9 +315,10 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       refuse(socket, '503 Service Unavailable')
       return
     }
+    for (const s of sources) s.connections.take()
     // ws completes the upgrade synchronously, so no other upgrade runs between these
     // checks and accept() counting the socket.
-    wss.handleUpgrade(req, socket, head, ws => accept(ws, req, key))
+    wss.handleUpgrade(req, socket, head, ws => accept(ws, req, sources))
   }
 
   /** The address `req` counts under: `trustedIpHeader`'s, else the socket's peer address. */
@@ -286,33 +338,70 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     return req.socket.remoteAddress ?? ''
   }
 
-  function sourceOf(key: string): Source {
+  /**
+   * The sources an address counts against: its address group (see `addressGroup`) with the
+   * per-IP limits and, for IPv6, also its /48 with the per-/48 limits.
+   */
+  function sourcesOf(address: string): Source[] {
+    const out = [
+      sourceOf(addressGroup(address), {
+        maxSockets: limits.maxSocketsPerIp,
+        connectionsPerMinute: limits.connectionsPerIpPerMinute,
+        turnPerHour: limits.turnPerIpPerHour
+      })
+    ]
+    const block = ipv6Block48(address)
+    if (block !== undefined) {
+      out.push(
+        sourceOf(block, {
+          maxSockets: limits.maxSocketsPer48,
+          connectionsPerMinute: limits.connectionsPer48PerMinute,
+          turnPerHour: limits.turnPer48PerHour
+        })
+      )
+    }
+    return out
+  }
+
+  function sourceOf(
+    key: string,
+    caps: { maxSockets: number; connectionsPerMinute: number; turnPerHour: number }
+  ): Source {
     let source = sources.get(key)
     if (source === undefined) {
-      const connections = new TokenBucket(limits.connectionsPerIpPerMinute, MINUTE_MS)
-      source = { sockets: 0, connections, turn: undefined }
+      const connections = new TokenBucket(caps.connectionsPerMinute, MINUTE_MS)
+      source = {
+        sockets: 0,
+        maxSockets: caps.maxSockets,
+        connections,
+        turnPerHour: caps.turnPerHour,
+        turn: undefined
+      }
       sources.set(key, source)
     }
     return source
   }
 
-  function accept(ws: WsSocket, req: IncomingMessage, key: string): void {
+  function accept(ws: WsSocket, req: IncomingMessage, from: Source[]): void {
     const client: Client = {
       ws,
       stage: 'auth',
       identityKey: undefined,
       nonce: randomBytes(32).toString('base64url'),
       authUrls: publicUrls.length > 0 ? publicUrls : requestUrls(req),
-      source: key,
+      sources: from,
       rate: new TokenBucket(limits.rateMessages, limits.rateWindowMs),
+      overRate: 0,
       ping: undefined,
       alive: true,
       authTimer: undefined
     }
     clients.add(client)
     unauthenticated.add(client)
-    sourceOf(key).sockets++
+    // sourcesOf registered them and the upgrade was synchronous, so none was swept out
+    for (const source of from) source.sockets++
     ws.on('error', () => {})
+    ws.on('ping', data => onPing(client, data))
     ws.on('pong', data => {
       // RFC 6455 allows unsolicited pongs, so only an echo of our latest ping counts.
       if (client.ping !== undefined && data.equals(client.ping)) client.alive = true
@@ -340,6 +429,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
   }
 
   function onFrame(client: Client, data: RawData, isBinary: boolean): void {
+    if (client.stage === 'closed') return
     const allowed = client.rate.take()
     switch (client.stage) {
       case 'auth':
@@ -349,18 +439,45 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
         refuseAuth(client)
         return
       case 'open': {
-        // A frame over the limit is still answered: clients match replies to frames in
-        // order. A client that floods without reading is cut off by maxBufferedBytes.
+        // A frame over the limit is answered, as clients match replies to frames in order,
+        // until the socket has sent maxOverRateFrames of them in a row (see overRate).
         if (!allowed) {
-          sendError(client, 'rate_limited')
+          if (overRate(client)) sendError(client, 'rate_limited')
           return
         }
+        client.overRate = 0
         const f = isBinary ? undefined : parseJson(data)
         if (isRecord(f) && f.t === 'turn') vendTurn(client)
         else relaySignal(client, f)
         return
       }
     }
+  }
+
+  /**
+   * A ping costs a frame of the socket's rate, authenticated or not: `ws` would otherwise
+   * answer every ping with a pong, a write per frame that no limit covers. Over the rate
+   * it gets no pong.
+   */
+  function onPing(client: Client, data: Buffer): void {
+    if (client.stage === 'closed') return
+    if (!client.rate.take()) {
+      overRate(client)
+      return
+    }
+    client.overRate = 0
+    if (client.ws.readyState === WsSocket.OPEN) client.ws.pong(data)
+  }
+
+  /**
+   * Count one more frame over the rate. Every reply costs a write, so a socket that keeps
+   * sending over the rate while it reads the replies could keep the relay busy writing to
+   * it: after `maxOverRateFrames` in a row it is closed with 1008. False once it is closed.
+   */
+  function overRate(client: Client): boolean {
+    if (++client.overRate <= limits.maxOverRateFrames) return true
+    closeClient(client, 1008, 'rate_limited')
+    return false
   }
 
   async function authenticate(client: Client, data: RawData, isBinary: boolean): Promise<void> {
@@ -412,7 +529,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     if (identity !== undefined) identity.sockets.add(client)
     else {
       const budget = new TokenBucket(limits.signalsPerRecipientPerMinute, MINUTE_MS)
-      identities.set(identityKey, { sockets: new Set([client]), budget })
+      identities.set(identityKey, { sockets: new Set([client]), budget, pairs: new Map() })
     }
     send(client, { t: 'ready', identityKey })
     // TURN credentials are never handed out here, only on request (see vendTurn).
@@ -435,17 +552,33 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       sendError(client, 'too_large', ref)
       return
     }
-    const frame = JSON.stringify({ t: 'signal', from: client.identityKey, envelope: forward })
+    // set when the socket authenticated, before any frame reaches here
+    const sender = client.identityKey as PubKeyHex
+    const frame = JSON.stringify({ t: 'signal', from: sender, envelope: forward })
     const recipient = identities.get(f.to)
-    let delivered = 0
-    // One budget per recipient for all senders together: fresh identities cost nothing,
-    // so a per-sender limit alone would not stop many of them flooding one victim.
-    if (recipient !== undefined && recipient.budget.take()) {
-      for (const peer of recipient.sockets) if (write(peer, frame)) delivered++
-    }
-    if (delivered > 0) {
-      send(client, { t: 'sent', ref })
-      return
+    if (recipient !== undefined) {
+      // Each sender has its own share of the recipient's budget, checked first, so one
+      // identity cannot spend everyone's. The total still bounds what fresh identities,
+      // which cost nothing, can send together. Tokens go only for a signal delivered.
+      let pair = recipient.pairs.get(sender)
+      if (pair === undefined) {
+        pair = new TokenBucket(limits.signalsPerPairPerMinute, MINUTE_MS)
+        recipient.pairs.set(sender, pair)
+      }
+      if (!pair.ready()) {
+        sendError(client, 'rate_limited', ref)
+        return
+      }
+      if (recipient.budget.ready()) {
+        let delivered = 0
+        for (const peer of recipient.sockets) if (write(peer, frame)) delivered++
+        if (delivered > 0) {
+          pair.take()
+          recipient.budget.take()
+          send(client, { t: 'sent', ref })
+          return
+        }
+      }
     }
     // `offline` tells any authenticated key whether `to` is connected right now (and
     // within its budget): a presence oracle (audit F15). It is kept on purpose (Ruling
@@ -468,14 +601,17 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       return
     }
     const now = Date.now()
-    const source = sourceOf(client.source)
-    source.turn ??= new TokenBucket(limits.turnPerIpPerHour, HOUR_MS, now)
-    if (!source.turn.ready(now) || !turnIssued.ready(now)) {
+    // a source holding this socket is never swept out, so its budget is the current one
+    const buckets = client.sources.map(source => {
+      source.turn ??= new TokenBucket(source.turnPerHour, HOUR_MS, now)
+      return source.turn
+    })
+    buckets.push(turnIssued)
+    if (!buckets.every(b => b.ready(now))) {
       sendError(client, 'rate_limited')
       return
     }
-    source.turn.take(now)
-    turnIssued.take(now)
+    for (const b of buckets) b.take(now)
     const { username, credential } = turnCredentials({
       secret: turn.secret,
       // set when the socket authenticated, before any frame reaches here
@@ -531,8 +667,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     clearTimeout(client.authTimer)
     clients.delete(client)
     unauthenticated.delete(client)
-    const source = sources.get(client.source)
-    if (source !== undefined) source.sockets--
+    for (const source of client.sources) source.sockets--
     if (client.identityKey === undefined) return
     const identity = identities.get(client.identityKey)
     identity?.sockets.delete(client)
@@ -554,12 +689,15 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     sweep()
   }
 
-  /** Forget sources that hold no socket and whose budgets are full again. */
+  /** Forget sources that hold no socket and sender shares, whose budgets are full again. */
   function sweep(): void {
     const now = Date.now()
     for (const [key, source] of sources) {
       const turnFull = source.turn === undefined || source.turn.full(now)
       if (source.sockets === 0 && turnFull && source.connections.full(now)) sources.delete(key)
+    }
+    for (const identity of identities.values()) {
+      for (const [sender, pair] of identity.pairs) if (pair.full(now)) identity.pairs.delete(sender)
     }
   }
 

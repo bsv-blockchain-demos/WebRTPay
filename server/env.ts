@@ -1,19 +1,44 @@
 import { isHeaderName, isLoopbackHost } from './relay.js'
-import type { RelayServerOptions } from './relay.js'
+import type { RelayLimits, RelayServerOptions } from './relay.js'
+
+/**
+ * Limits read from the environment, each a whole number of at least 1 (see
+ * `RelayLimits`); unset ones keep `DEFAULT_RELAY_LIMITS`. The TURN ones need TURN.
+ */
+const LIMIT_VARIABLES: ReadonlyArray<[string, keyof RelayLimits, { turn?: boolean }?]> = [
+  ['MAX_SOCKETS', 'maxSockets'],
+  ['MAX_UNAUTHENTICATED_SOCKETS', 'maxUnauthenticatedSockets'],
+  ['SOCKETS_PER_IP', 'maxSocketsPerIp'],
+  ['CONNECTIONS_PER_IP_PER_MINUTE', 'connectionsPerIpPerMinute'],
+  ['SOCKETS_PER_48', 'maxSocketsPer48'],
+  ['CONNECTIONS_PER_48_PER_MINUTE', 'connectionsPer48PerMinute'],
+  ['SIGNALS_PER_RECIPIENT_PER_MINUTE', 'signalsPerRecipientPerMinute'],
+  ['SIGNALS_PER_PAIR_PER_MINUTE', 'signalsPerPairPerMinute'],
+  ['MAX_OVER_RATE_FRAMES', 'maxOverRateFrames'],
+  ['TURN_PER_IP_PER_HOUR', 'turnPerIpPerHour', { turn: true }],
+  ['TURN_PER_48_PER_HOUR', 'turnPer48PerHour', { turn: true }],
+  ['TURN_PER_HOUR', 'turnPerHour', { turn: true }]
+]
 
 /**
  * Relay options from environment variables: `PORT` (default 8787), `HOST`
  * (default 0.0.0.0), and comma-separated `PUBLIC_URLS`, `STUN_URLS` and
- * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together, `TURN_TTL` is in
- * seconds (default 600) and `TURN_PER_IP_PER_HOUR` is the number of TURN credential
- * sets one source address may get an hour (default 6, `limits.turnPerIpPerHour`); both
- * need TURN configured. `TRUSTED_IP_HEADER` names the header the outermost proxy
+ * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together and `TURN_TTL` is in
+ * seconds (default 600). `TRUSTED_IP_HEADER` names the header the outermost proxy
  * sets to the client's single address: `cf-connecting-ip` behind Cloudflare. A list
  * value is not used, so `x-forwarded-for` is right only behind exactly one proxy
  * that overwrites it (see `trustedIpHeader`). Empty variables count as unset.
  * `PUBLIC_URLS` is required unless `HOST` is a loopback address (`localhost`,
  * `127.x.x.x` or `::1`), because without it clients sign a url built from the Host
- * header they send. Throws `Error` naming the variable on an invalid or missing value.
+ * header they send.
+ *
+ * Limits (whole numbers, `limits.*`): `MAX_SOCKETS`, `MAX_UNAUTHENTICATED_SOCKETS`,
+ * `SOCKETS_PER_IP`, `CONNECTIONS_PER_IP_PER_MINUTE`, `SOCKETS_PER_48`,
+ * `CONNECTIONS_PER_48_PER_MINUTE`, `SIGNALS_PER_RECIPIENT_PER_MINUTE`,
+ * `SIGNALS_PER_PAIR_PER_MINUTE`, `MAX_OVER_RATE_FRAMES`, and, with TURN configured,
+ * `TURN_PER_IP_PER_HOUR`, `TURN_PER_48_PER_HOUR` and `TURN_PER_HOUR`.
+ *
+ * Throws `Error` naming the variable on an invalid or missing value.
  */
 export function relayOptionsFromEnv(env: Record<string, string | undefined>): RelayServerOptions {
   const host = env.HOST?.trim() || '0.0.0.0'
@@ -43,20 +68,27 @@ export function relayOptionsFromEnv(env: Record<string, string | undefined>): Re
 
   const secret = env.TURN_SECRET ?? ''
   const turnUrls = list(env.TURN_URLS)
-  const perIp = env.TURN_PER_IP_PER_HOUR?.trim()
-  if (secret !== '' || turnUrls.length > 0 || env.TURN_TTL || perIp) {
+  const turnLimits = LIMIT_VARIABLES.filter(([name, , o]) => o?.turn === true && env[name]?.trim())
+  if (secret !== '' || turnUrls.length > 0 || env.TURN_TTL || turnLimits.length > 0) {
     if (secret === '') {
-      throw new Error(
-        'TURN_SECRET is required when TURN_URLS, TURN_TTL or TURN_PER_IP_PER_HOUR is set'
-      )
+      const set = [
+        ...(turnUrls.length > 0 ? ['TURN_URLS'] : []),
+        ...(env.TURN_TTL ? ['TURN_TTL'] : []),
+        ...turnLimits.map(([name]) => name)
+      ]
+      throw new Error(`TURN_SECRET is required when ${set.join(' or ')} is set`)
     }
     if (turnUrls.length === 0) throw new Error('TURN_URLS is required when TURN_SECRET is set')
     o.turn = { secret, urls: turnUrls }
     if (env.TURN_TTL) o.turn.ttlSeconds = wholeNumber('TURN_TTL', env.TURN_TTL, 1, 2 ** 31 - 1)
-    if (perIp) {
-      o.limits = { turnPerIpPerHour: wholeNumber('TURN_PER_IP_PER_HOUR', perIp, 1, 2 ** 31 - 1) }
-    }
   }
+
+  const limits: Partial<RelayLimits> = {}
+  for (const [name, limit] of LIMIT_VARIABLES) {
+    const value = env[name]?.trim()
+    if (value) limits[limit] = wholeNumber(name, value, 1, 2 ** 31 - 1)
+  }
+  if (Object.keys(limits).length > 0) o.limits = limits
   return o
 }
 

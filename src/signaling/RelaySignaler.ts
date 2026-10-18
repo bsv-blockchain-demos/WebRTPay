@@ -84,6 +84,12 @@ export interface RelaySignalerOptions {
    * needs the connection any more, or after `close()`, passes none.
    */
   onStateChange?: (state: RelayConnectionState, error?: WebRTPayError) => void
+  /**
+   * Called with what `onIceServers` or `onStateChange` threw. Such a throw never reaches the
+   * connection: signaling goes on as if the callback had returned. Anything this throws is
+   * ignored.
+   */
+  onCallbackError?: (e: unknown) => void
   /** Source of reconnect jitter, uniform in [0, 1); defaults to `Math.random`. */
   random?: () => number
 }
@@ -146,6 +152,7 @@ export class RelaySignaler implements Signaler {
   private readonly onIceServers: ((servers: RTCIceServer[]) => void) | undefined
   private readonly onStateChange:
     ((state: RelayConnectionState, error?: WebRTPayError) => void) | undefined
+  private readonly onCallbackError: ((e: unknown) => void) | undefined
   private readonly random: () => number
   private readonly subs = new Set<SignalSubscription>()
   private conn: RelayConnection | undefined
@@ -176,6 +183,7 @@ export class RelaySignaler implements Signaler {
     this.WS = WS
     this.onIceServers = o.onIceServers
     this.onStateChange = o.onStateChange
+    this.onCallbackError = o.onCallbackError
     this.random = o.random ?? Math.random
   }
 
@@ -309,7 +317,8 @@ export class RelaySignaler implements Signaler {
       onSignal: (from, e) => dispatchSignal(this.subs, from, e),
       onIce: servers => {
         this.ice = servers
-        this.onIceServers?.(copyIceServers(servers))
+        const callback = this.onIceServers
+        if (callback !== undefined) this.callback(() => callback(copyIceServers(servers)))
       },
       onOpen: () => {
         if (this.conn === conn) this.setState('online')
@@ -363,10 +372,24 @@ export class RelaySignaler implements Signaler {
   private setState(state: RelayConnectionState, error?: WebRTPayError): void {
     if (this.state === state) return
     this.state = state
+    const callback = this.onStateChange
+    if (callback !== undefined) this.callback(() => callback(state, error))
+  }
+
+  /**
+   * Run an app callback. A faulty one must not break signaling: what it throws would
+   * otherwise leave the handshake (or a `turn` request) unfinished and escape into the
+   * socket's event handler, an uncaught exception in Node. It goes to `onCallbackError`.
+   */
+  private callback(run: () => void): void {
     try {
-      this.onStateChange?.(state, error)
-    } catch {
-      // a faulty callback must not break signaling
+      run()
+    } catch (e) {
+      try {
+        this.onCallbackError?.(e)
+      } catch {
+        // an error hook that throws changes nothing
+      }
     }
   }
 }

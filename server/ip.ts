@@ -39,6 +39,22 @@ export function addressGroup(address: string): string {
     .join(':')}::/64`
 }
 
+/**
+ * The /48 an IPv6 address belongs to, e.g. `2001:db8:1::/48`: the coarser group per-source
+ * limits also count, because a /48 (one free tunnel-broker allocation) holds 65,536 /64s.
+ * Undefined for IPv4, IPv4-mapped IPv6 and anything that is not an IP address.
+ */
+export function ipv6Block48(address: string): string | undefined {
+  const a = bare(address)
+  if (isIP(a) !== 6) return undefined
+  const g = ipv6Groups(a)
+  if (g.slice(0, 5).every(x => x === 0) && g[5] === 0xffff) return undefined
+  return `${g
+    .slice(0, 3)
+    .map(x => x.toString(16))
+    .join(':')}::/48`
+}
+
 /** `address` trimmed, without IPv6 brackets or a zone index. */
 function bare(address: string): string {
   let a = address.trim()

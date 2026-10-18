@@ -9,7 +9,13 @@ import { relayOptionsFromEnv } from '../server/env.js'
 import { isLoopbackHost } from '../server/relay.js'
 import { RelaySignaler, relayAuthData } from '../src/signaling/RelaySignaler.js'
 import type { RelaySignalerOptions } from '../src/signaling/RelaySignaler.js'
-import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
+import {
+  MAX_SIGNAL_CIPHERTEXT_CHARS,
+  MAX_SIGNAL_SDP_CHARS,
+  ReplayCache,
+  openSignal,
+  sealSignal
+} from '../src/signaling/envelope.js'
 import type { SignalEnvelope } from '../src/signaling/types.js'
 import { RELAY_PROTOCOL_ID } from '../src/types.js'
 import { randomBytes, toBase64Url, toHex } from '../src/util/bytes.js'
@@ -592,25 +598,55 @@ describe('relay', () => {
       await expect(a.send(bob.key, env())).rejects.toMatchObject({ code: 'peer_unreachable' })
     })
 
-    it('rejects an envelope over 16384 bytes with too_large and accepts exactly 16384', async () => {
+    it('forwards the largest envelope a signal may carry and refuses more bytes (M25)', async () => {
       const r = await relay()
       const box = inbox()
       await signaler(r, bob).listen(box.fn)
       const a = signaler(r, alice)
 
-      await expect(a.send(bob.key, env('A'.repeat(17 * 1024)))).rejects.toMatchObject({
+      // the largest well-formed envelope: a 64-character sid and the longest ciphertext
+      const largest = {
+        v: 1 as const,
+        sid: 's'.repeat(64),
+        ciphertext: 'A'.repeat(MAX_SIGNAL_CIPHERTEXT_CHARS)
+      }
+      expect(DEFAULT_RELAY_LIMITS.maxEnvelopeBytes).toBe(JSON.stringify(largest).length)
+      await a.send(bob.key, largest)
+      expect(await box.next()).toEqual([alice.key, largest])
+
+      // an offer with the longest SDP a signal allows
+      const lines = ['v=0', 'o=- 1 2 IN IP4 127.0.0.1', 's=-', 't=0 0']
+      while (lines.join('\r\n').length < MAX_SIGNAL_SDP_CHARS - 64) {
+        lines.push(`a=candidate:${lines.length} 1 udp 2130706431 192.0.2.1 50000 typ host`)
+      }
+      const sdp = (lines.join('\r\n') + '\r\na=x:').padEnd(MAX_SIGNAL_SDP_CHARS, 'x')
+      expect(sdp).toHaveLength(MAX_SIGNAL_SDP_CHARS)
+      const offer = await sealSignal(alice.wallet, {
+        v: 1,
+        kind: 'offer',
+        sid: newSid(),
+        from: alice.key,
+        to: bob.key,
+        ts: Date.now(),
+        purpose: 'payment',
+        sdp
+      })
+      await a.send(bob.key, offer)
+      expect((await box.next())[1]).toEqual(offer)
+
+      // as many characters, more bytes: a sid of two-byte characters
+      await expect(a.send(bob.key, { ...largest, sid: 'é'.repeat(64) })).rejects.toMatchObject({
         code: 'too_large'
       })
-      const sid = newSid()
-      const overhead = JSON.stringify({ v: 1, sid, ciphertext: '' }).length
-      const exact = { v: 1 as const, sid, ciphertext: 'A'.repeat(16384 - overhead) }
-      await a.send(bob.key, exact)
-      expect(await box.next()).toEqual([alice.key, exact])
-      expect(box.got).toHaveLength(1)
+      // a ciphertext one character longer is not an envelope at all
+      await expect(
+        a.send(bob.key, { ...largest, ciphertext: `${largest.ciphertext}A` })
+      ).rejects.toMatchObject({ code: 'protocol' })
+      expect(box.got).toHaveLength(2)
     })
 
     it('rate limits a socket to 20 messages per 10 seconds', async () => {
-      const r = await relay()
+      const r = await relay({ limits: { signalsPerPairPerMinute: 100 } })
       const box = inbox()
       await signaler(r, bob).listen(box.fn)
       const a = signaler(r, alice)
@@ -1014,6 +1050,37 @@ describe('RelaySignaler connection lifecycle', () => {
     expect(states).toHaveLength(9)
   })
 
+  it('keeps signaling when onIceServers or onStateChange throws, and reports it (R6)', async () => {
+    const reported: unknown[] = []
+    const iceBug = new Error('app bug in onIceServers')
+    const stateBug = new Error('app bug in onStateChange')
+    const expiry = Math.floor(Date.now() / 1000) + 600
+    FakeSocket.turnServers = [
+      { urls: 'turn:turn.test:3478', username: `${expiry}:u`, credential: 'c' }
+    ]
+    const s = fake({
+      onIceServers: () => {
+        throw iceBug
+      },
+      onStateChange: () => {
+        throw stateBug
+      },
+      onCallbackError: e => {
+        reported.push(e)
+        throw new Error('a throwing error hook changes nothing either')
+      }
+    })
+    let listening = false
+    void s.listen(() => {}).then(() => (listening = true))
+    await waitForFake(() => listening)
+    expect(s.iceServers()).toEqual([])
+    await s.send(alice.key, env())
+    expect(await s.requestTurn()).toEqual(FakeSocket.turnServers)
+    expect(reported.filter(e => e === iceBug)).toHaveLength(2) // on connecting and on turn
+    expect(reported).toContain(stateBug)
+    await s.close()
+  })
+
   it('passes onStateChange the error that ended the connection when it goes offline on its own', async () => {
     const changes: Array<[string, unknown]> = []
     const s = fake({
@@ -1359,6 +1426,66 @@ describe('relayOptionsFromEnv', () => {
       await expect(s.requestTurn()).rejects.toMatchObject({ code: 'rate_limited' })
     } finally {
       await s.close()
+      await r.close()
+    }
+  })
+
+  it('reads the per-source, per-recipient and relay-wide limits (M26)', () => {
+    const at = { HOST: '127.0.0.1' }
+    expect(
+      relayOptionsFromEnv({
+        ...at,
+        MAX_SOCKETS: '20000',
+        MAX_UNAUTHENTICATED_SOCKETS: ' 2000 ',
+        SOCKETS_PER_IP: '200',
+        CONNECTIONS_PER_IP_PER_MINUTE: '300',
+        SOCKETS_PER_48: '800',
+        CONNECTIONS_PER_48_PER_MINUTE: '1200',
+        SIGNALS_PER_RECIPIENT_PER_MINUTE: '240',
+        SIGNALS_PER_PAIR_PER_MINUTE: '12',
+        MAX_OVER_RATE_FRAMES: '5'
+      }).limits
+    ).toEqual({
+      maxSockets: 20000,
+      maxUnauthenticatedSockets: 2000,
+      maxSocketsPerIp: 200,
+      connectionsPerIpPerMinute: 300,
+      maxSocketsPer48: 800,
+      connectionsPer48PerMinute: 1200,
+      signalsPerRecipientPerMinute: 240,
+      signalsPerPairPerMinute: 12,
+      maxOverRateFrames: 5
+    })
+    const turn = { ...at, TURN_SECRET: 's', TURN_URLS: 'turn:a.example:3478' }
+    expect(
+      relayOptionsFromEnv({
+        ...turn,
+        TURN_PER_IP_PER_HOUR: '12',
+        TURN_PER_48_PER_HOUR: '48',
+        TURN_PER_HOUR: '6000'
+      }).limits
+    ).toEqual({ turnPerIpPerHour: 12, turnPer48PerHour: 48, turnPerHour: 6000 })
+    for (const name of ['TURN_PER_48_PER_HOUR', 'TURN_PER_HOUR']) {
+      expect(() => relayOptionsFromEnv({ ...at, [name]: '10' })).toThrow('TURN_SECRET is required')
+    }
+    for (const value of ['0', '-1', '1.5', 'many']) {
+      expect(() => relayOptionsFromEnv({ ...at, SOCKETS_PER_IP: value })).toThrow(
+        'SOCKETS_PER_IP must be a whole number'
+      )
+    }
+  })
+
+  it('passes the limits to the relay', async () => {
+    const r = await createRelayServer({
+      ...relayOptionsFromEnv({ HOST: '127.0.0.1', PORT: '0', SOCKETS_PER_IP: '1' }),
+      log: () => {}
+    })
+    const first = raw(r.url)
+    try {
+      expect((await first.next()).t).toBe('challenge')
+      expect(await upgradeError(r.url)).toContain('429')
+    } finally {
+      first.ws.terminate()
       await r.close()
     }
   })
