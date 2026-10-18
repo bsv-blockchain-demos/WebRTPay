@@ -1,5 +1,6 @@
 import { isHeaderName, isLoopbackHost } from './relay.js'
 import type { RelayLimits, RelayServerOptions } from './relay.js'
+import type { TurnProvider } from './turn.js'
 
 /**
  * Limits read from the environment, each a whole number of at least 1 (see
@@ -22,9 +23,16 @@ const LIMIT_VARIABLES: ReadonlyArray<[string, keyof RelayLimits, { turn?: boolea
 
 /**
  * Relay options from environment variables: `PORT` (default 8787), `HOST`
- * (default 0.0.0.0), and comma-separated `PUBLIC_URLS`, `STUN_URLS` and
- * `TURN_URLS`; `TURN_SECRET` and `TURN_URLS` go together and `TURN_TTL` is in
- * seconds (default 600). `TRUSTED_IP_HEADER` names the header the outermost proxy
+ * (default 0.0.0.0), and comma-separated `PUBLIC_URLS` and `STUN_URLS`.
+ *
+ * TURN: `TURN_PROVIDER` is `coturn` (the default) or `cloudflare`. coturn REST needs
+ * `TURN_SECRET` and comma-separated `TURN_URLS`, together; Cloudflare needs
+ * `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN`, together, and takes no
+ * `TURN_SECRET` or `TURN_URLS`. A half-configured or mixed provider is refused rather than
+ * started without TURN. `TURN_TTL` is in seconds (default 600; Cloudflare caps it at 48
+ * hours).
+ *
+ * `TRUSTED_IP_HEADER` names the header the outermost proxy
  * sets to the client's single address: `cf-connecting-ip` behind Cloudflare. A list
  * value is not used, so `x-forwarded-for` is right only behind exactly one proxy
  * that overwrites it (see `trustedIpHeader`). Empty variables count as unset.
@@ -65,23 +73,8 @@ export function relayOptionsFromEnv(env: Record<string, string | undefined>): Re
   }
   const stunUrls = list(env.STUN_URLS)
   if (stunUrls.length > 0) o.stunUrls = stunUrls
-
-  const secret = env.TURN_SECRET ?? ''
-  const turnUrls = list(env.TURN_URLS)
-  const turnLimits = LIMIT_VARIABLES.filter(([name, , o]) => o?.turn === true && env[name]?.trim())
-  if (secret !== '' || turnUrls.length > 0 || env.TURN_TTL || turnLimits.length > 0) {
-    if (secret === '') {
-      const set = [
-        ...(turnUrls.length > 0 ? ['TURN_URLS'] : []),
-        ...(env.TURN_TTL ? ['TURN_TTL'] : []),
-        ...turnLimits.map(([name]) => name)
-      ]
-      throw new Error(`TURN_SECRET is required when ${set.join(' or ')} is set`)
-    }
-    if (turnUrls.length === 0) throw new Error('TURN_URLS is required when TURN_SECRET is set')
-    o.turn = { secret, urls: turnUrls }
-    if (env.TURN_TTL) o.turn.ttlSeconds = wholeNumber('TURN_TTL', env.TURN_TTL, 1, 2 ** 31 - 1)
-  }
+  const turn = turnFromEnv(env)
+  if (turn !== undefined) o.turn = turn
 
   const limits: Partial<RelayLimits> = {}
   for (const [name, limit] of LIMIT_VARIABLES) {
@@ -90,6 +83,85 @@ export function relayOptionsFromEnv(env: Record<string, string | undefined>): Re
   }
   if (Object.keys(limits).length > 0) o.limits = limits
   return o
+}
+
+/** The TURN provider the variables configure (see `relayOptionsFromEnv`), if any. */
+function turnFromEnv(env: Record<string, string | undefined>): TurnProvider | undefined {
+  const provider = env.TURN_PROVIDER?.trim() ?? ''
+  if (provider !== '' && provider !== 'coturn' && provider !== 'cloudflare') {
+    throw new Error('TURN_PROVIDER must be coturn or cloudflare')
+  }
+  const secret = env.TURN_SECRET ?? ''
+  const turnUrls = list(env.TURN_URLS)
+  const keyId = env.CLOUDFLARE_TURN_KEY_ID?.trim() ?? ''
+  const apiToken = env.CLOUDFLARE_TURN_API_TOKEN?.trim() ?? ''
+  const ttl = env.TURN_TTL?.trim() ?? ''
+  const ttlSeconds = ttl === '' ? undefined : wholeNumber('TURN_TTL', ttl, 1, 2 ** 31 - 1)
+  const cloudflareSet = [
+    ...(keyId !== '' ? ['CLOUDFLARE_TURN_KEY_ID'] : []),
+    ...(apiToken !== '' ? ['CLOUDFLARE_TURN_API_TOKEN'] : [])
+  ]
+
+  if (provider === 'cloudflare') {
+    const coturnSet = [
+      ...(secret !== '' ? ['TURN_SECRET'] : []),
+      ...(turnUrls.length > 0 ? ['TURN_URLS'] : [])
+    ]
+    if (coturnSet.length > 0) {
+      throw new Error(
+        `${coturnSet.join(' and ')} ${coturnSet.length > 1 ? 'are' : 'is'} for ` +
+          'TURN_PROVIDER=coturn; Cloudflare chooses its own urls, so unset ' +
+          `${coturnSet.length > 1 ? 'them' : 'it'} with TURN_PROVIDER=cloudflare`
+      )
+    }
+    const missing = ['CLOUDFLARE_TURN_KEY_ID', 'CLOUDFLARE_TURN_API_TOKEN'].filter(
+      name => !cloudflareSet.includes(name)
+    )
+    if (missing.length > 0) {
+      throw new Error(
+        `${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} required when ` +
+          'TURN_PROVIDER=cloudflare'
+      )
+    }
+    return {
+      kind: 'cloudflare',
+      keyId,
+      apiToken,
+      ...(ttlSeconds === undefined ? {} : { ttlSeconds })
+    }
+  }
+
+  if (cloudflareSet.length > 0) {
+    throw new Error(
+      `TURN_PROVIDER=cloudflare is required when ${cloudflareSet.join(' or ')} is set`
+    )
+  }
+  const turnLimits = LIMIT_VARIABLES.filter(([name, , o]) => o?.turn === true && env[name]?.trim())
+  if (provider === '' && secret === '' && turnUrls.length === 0) {
+    if (ttlSeconds === undefined && turnLimits.length === 0) return undefined
+    // only settings that every provider takes: name both ways to configure one
+    const set = [...(ttlSeconds !== undefined ? ['TURN_TTL'] : []), ...turnLimits.map(([n]) => n)]
+    throw new Error(
+      `TURN_SECRET is required when ${set.join(' or ')} is set (or set ` +
+        'TURN_PROVIDER=cloudflare with CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_API_TOKEN)'
+    )
+  }
+  if (secret === '') {
+    const set = [
+      ...(provider === 'coturn' ? ['TURN_PROVIDER'] : []),
+      ...(turnUrls.length > 0 ? ['TURN_URLS'] : []),
+      ...(ttlSeconds !== undefined ? ['TURN_TTL'] : []),
+      ...turnLimits.map(([name]) => name)
+    ]
+    throw new Error(`TURN_SECRET is required when ${set.join(' or ')} is set`)
+  }
+  if (turnUrls.length === 0) throw new Error('TURN_URLS is required when TURN_SECRET is set')
+  return {
+    kind: 'coturn-rest',
+    secret,
+    urls: turnUrls,
+    ...(ttlSeconds === undefined ? {} : { ttlSeconds })
+  }
 }
 
 function list(v: string | undefined): string[] {
