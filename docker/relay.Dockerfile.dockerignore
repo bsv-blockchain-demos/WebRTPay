@@ -1,0 +1,8 @@
+# The relay image is built from the package root; send only what it is built from.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!src
+!server
