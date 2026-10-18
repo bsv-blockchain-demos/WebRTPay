@@ -88,11 +88,26 @@ TLV:    [tag u8][length varint][value, length bytes]
 - `expiresAt` in the API is milliseconds; it is written as `floor(ms / 1000)` and read back as
   `seconds × 1000`.
 
-A decoder rejects with `invalid_code`: a body shorter than its header, a version other than 1,
-a kind other than 1 or 2, an invalid identity key, a TLV running past the end, a bad varint, a
-missing sdp, an answer with any of tags `0x01`–`0x03`, an amount of 0, an expiry above
-`floor((2^53 − 1) / 1000)` seconds, an offer that has expired (now ≥ expiresAt), and, when the
-caller expects a network, an offer whose chain is missing or different.
+A decoder rejects with `invalid_code`, checking in this order:
+
+1. input that is not a string, or text longer than 4000 characters;
+2. text that, with surrounding whitespace removed, does not start with `webrtpay1:`;
+3. text after the prefix that is not strict base64url (§1);
+4. a body shorter than the 18-byte answer header;
+5. a version other than 1, then a kind other than 1 or 2;
+6. an offer shorter than its 51-byte header, then one whose identity key is not a valid
+   identity key (§1);
+7. in body order, a TLV whose length is a bad varint (§1: truncated, longer than 8 bytes,
+   above 2^53 − 1 or not minimally encoded) or whose value runs past the end of the body, and
+   a known tag that appears a second time;
+8. no sdp TLV, then an sdp the §3.4 decoder rejects;
+9. an answer with any of tags `0x01`–`0x03`;
+10. an offer chain that is not valid UTF-8;
+11. an amount that is a bad varint, does not fill its value exactly or is 0, then an expiresAt
+    that is a bad varint, does not fill its value exactly or is above `floor((2^53 − 1) / 1000)`
+    seconds;
+12. an offer that has expired (now ≥ expiresAt);
+13. when the caller expects a network, an offer whose chain is missing or different.
 
 ### 3.3 Session identifiers
 
@@ -777,9 +792,9 @@ Each client frame gets exactly one reply, in the order the frames were sent.
 `turn`:
 
 - Without TURN configured: `ice` with the STUN servers.
-- Otherwise, within the source's budget (6 an hour) and the relay's (600 an hour): `ice` with
-  the STUN servers followed by `{ urls: TURN_URLS, username, credential }`; past either budget,
-  `rate_limited`.
+- Otherwise, within the source's budget (6 an hour unless `TURN_PER_IP_PER_HOUR` says otherwise)
+  and the relay's (600 an hour): `ice` with the STUN servers followed by
+  `{ urls: TURN_URLS, username, credential }`; past either budget, `rate_limited`.
 
 A frame over the socket's rate (20 per 10 s, refilled continuously) gets `rate_limited` and is
 dropped.
@@ -831,6 +846,13 @@ so coturn's `--user-quota` still counts per identity. The relay's TTL is 600 s (
 - While listening it reconnects after a random delay in `[0, cap)`, `cap = min(1 s × 2^failures,
   30 s)`, where `failures` counts the connections that failed or ended within 30 s of
   authenticating, this one included; one that stayed authenticated for 30 s resets it to 0.
+  `onStateChange` reports each `offline` caused by a failure with the error that ended the
+  connection or the attempt (for example `auth_failed` from the relay).
+- Treats a TURN server whose REST username (`<expiry>:…`) expires within 30 s as expired.
+  `iceServers()` is the list from the latest `ice` frame (a new connection's STUN-only frame
+  replaces an earlier TURN answer). `turnProvider()` keeps the last `turn` answer across
+  connections and sends a new `turn` only when that answer holds no TURN server with more than
+  30 s left; concurrent callers share one request, and a refused one is not kept.
 
 ## 9. Timers and limits
 
@@ -863,7 +885,9 @@ so coturn's `--user-quota` still counts per identity. The relay's TTL is 600 s (
 | Relay: connections per source | 30 a minute |
 | Relay: signals to one identity | 30 a minute |
 | Relay: queued bytes per socket / ping interval | 1 MiB / 30 s |
-| Relay: TURN credentials per source / in total / lifetime | 6 an hour / 600 an hour / 600 s |
+| Relay: TURN credentials per source / in total / lifetime | 6 an hour (`TURN_PER_IP_PER_HOUR`) / 600 an hour / 600 s |
+| `RelaySignaler`: TURN servers count as expired | 30 s before their expiry |
+| `iceServersProvider` wait before gathering without it | 5 s |
 
 ## 10. Error codes
 

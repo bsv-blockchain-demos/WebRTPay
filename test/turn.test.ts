@@ -86,19 +86,20 @@ const PRE_AUTH_BYTES = 65536
     expectRelayed(peers)
   })
 
-  it('pays through RelaySignalers over TURN from RelaySignaler.requestTurn as iceServersProvider', async () => {
+  it('pays through RelaySignalers over TURN with RelaySignaler.turnProvider as iceServersProvider', async () => {
     const relay = await fixtures.relay({ turn: { secret: SECRET, urls: [TURN_URL] } })
     const { rtc, peers } = await turnRtc()
     let provided = 0
     const party = (w: TestWallet): DirectPayClient => {
       const signaler = new RelaySignaler({ url: relay.url, wallet: w.wallet })
+      const turn = signaler.turnProvider()
       const c = new DirectPayClient({
         wallet: w.wallet,
         signaler,
         rtc: { ...rtc, iceTransportPolicy: 'relay' },
         iceServersProvider: () => {
           provided++
-          return signaler.requestTurn()
+          return turn()
         }
       })
       fixtures.defer(() => signaler.close())
@@ -139,8 +140,9 @@ const PRE_AUTH_BYTES = 65536
     } catch (e) {
       if (e instanceof WebRTPayError && e.code === 'rate_limited') {
         throw new Error(
-          'The compose relay issues 6 sets of TURN credentials per hour to one address; ' +
-            'run `docker compose -f docker/docker-compose.yml restart relay` to start over',
+          'The compose relay issues TURN_PER_IP_PER_HOUR (600) sets of TURN credentials per ' +
+            'hour to one address; run `docker compose -f docker/docker-compose.yml restart ' +
+            'relay` to start over, or `up -d --build` if the image predates that setting',
           { cause: e }
         )
       }

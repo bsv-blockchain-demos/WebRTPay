@@ -4,7 +4,7 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { ProtoWallet } from '@bsv/sdk'
-import { createRelayServer, turnCredentials } from '../server/index.js'
+import { DEFAULT_RELAY_LIMITS, createRelayServer, turnCredentials } from '../server/index.js'
 import { relayOptionsFromEnv } from '../server/env.js'
 import { isLoopbackHost } from '../server/relay.js'
 import { RelaySignaler, relayAuthData } from '../src/signaling/RelaySignaler.js'
@@ -637,6 +637,21 @@ describe('relay', () => {
       expect(r.stats()).toEqual({ sockets: 0, identities: 0 })
     })
 
+    it('tells onStateChange why a listener is offline: auth_failed for a public url it did not dial', async () => {
+      const r = await relay({ publicUrls: ['wss://relay.example'] })
+      const changes: Array<[string, unknown]> = []
+      const b = signaler(r, bob, {
+        random: () => 0.99,
+        onStateChange: (state, error) => changes.push([state, error])
+      })
+      await b.listen(() => {})
+      expect(changes).toEqual([
+        ['connecting', undefined],
+        ['offline', expect.objectContaining({ code: 'auth_failed' })]
+      ])
+      expect(changes[1][1]).toBeInstanceOf(WebRTPayError)
+    })
+
     it('rejects peer_unreachable when no relay is listening', async () => {
       const url = `ws://127.0.0.1:${await freePort()}`
       await expect(signaler(url, alice).connect()).rejects.toMatchObject({
@@ -738,6 +753,8 @@ class FakeSocket {
   static mode: 'up' | 'down' | 'silent' | 'mute' | 'confused' = 'up'
   /** The servers a `turn` request is answered with. */
   static turnServers: RTCIceServer[] = []
+  /** When set, a `turn` request is answered with this error code instead. */
+  static turnError: string | undefined
 
   readyState = 0
   readonly frames: Array<Record<string, unknown>> = []
@@ -777,7 +794,9 @@ class FakeSocket {
         this.message({ t: 'ready', identityKey: frame.identityKey })
         this.message({ t: 'ice', iceServers: [] })
       } else if (frame.t === 'turn') {
-        this.message({ t: 'ice', iceServers: FakeSocket.turnServers })
+        if (FakeSocket.turnError !== undefined) {
+          this.message({ t: 'error', code: FakeSocket.turnError })
+        } else this.message({ t: 'ice', iceServers: FakeSocket.turnServers })
       } else if (frame.t === 'signal' && FakeSocket.mode === 'confused') {
         this.message({ t: 'ice', iceServers: [] })
       } else if (frame.t === 'signal' && FakeSocket.mode !== 'mute') {
@@ -825,6 +844,7 @@ describe('RelaySignaler connection lifecycle', () => {
     FakeSocket.instances = []
     FakeSocket.mode = 'up'
     FakeSocket.turnServers = []
+    FakeSocket.turnError = undefined
     jest.useFakeTimers()
   })
 
@@ -994,6 +1014,39 @@ describe('RelaySignaler connection lifecycle', () => {
     expect(states).toHaveLength(9)
   })
 
+  it('passes onStateChange the error that ended the connection when it goes offline on its own', async () => {
+    const changes: Array<[string, unknown]> = []
+    const s = fake({
+      random: () => 0,
+      onStateChange: (state, error) => changes.push([state, error])
+    })
+    const ended = (message: string) => [
+      'offline',
+      expect.objectContaining({ code: 'peer_unreachable', message })
+    ]
+    FakeSocket.mode = 'down'
+    const stop = await s.listen(() => {})
+    expect(changes).toEqual([['connecting', undefined], ended('Could not connect to the relay')])
+    expect(changes[1][1]).toBeInstanceOf(WebRTPayError)
+
+    FakeSocket.mode = 'up'
+    await waitForFake(() => changes.length === 4)
+    expect(changes.slice(2)).toEqual([
+      ['connecting', undefined],
+      ['online', undefined]
+    ])
+    last().drop()
+    expect(changes[4]).toEqual(ended('Relay connection closed'))
+    await waitForFake(() => changes.at(-1)?.[0] === 'online')
+
+    // a connection closed on purpose ended with no error
+    await stop()
+    expect(changes.at(-1)).toEqual(['offline', undefined])
+    await s.connect()
+    await s.close()
+    expect(changes.at(-1)).toEqual(['offline', undefined])
+  })
+
   it('ends the connection with protocol when a reply does not match the request it answers', async () => {
     const s = fake()
     await s.connect()
@@ -1017,27 +1070,109 @@ describe('RelaySignaler connection lifecycle', () => {
     await s.close()
   })
 
-  it('drops TURN servers from iceServers() once their REST credentials have expired', async () => {
-    jest.setSystemTime(1_790_000_000_000)
+  describe('TURN credentials', () => {
     const stun = { urls: ['stun:relay.test:3478'] }
+    /** TURN with a coturn REST username that expires at `expiry` (Unix seconds). */
     const turn = (expiry: number): RTCIceServer => ({
       urls: ['turn:relay.test:3478'],
       username: `${expiry}:pseudonym`,
       credential: 'c'
     })
-    const unparsed = { urls: 'turns:relay.test:5349', username: 'static', credential: 'c' }
-    FakeSocket.turnServers = [stun, turn(1_790_000_060), unparsed]
-    const s = fake()
-    await s.connect()
-    expect(await s.requestTurn()).toEqual(FakeSocket.turnServers)
-    expect(s.iceServers()).toEqual(FakeSocket.turnServers)
+    const T0 = 1_790_000_000_000
 
-    await jest.advanceTimersByTimeAsync(59_999)
-    expect(s.iceServers()).toEqual(FakeSocket.turnServers)
-    // coturn refuses the credentials from their expiry second on
-    await jest.advanceTimersByTimeAsync(1)
-    expect(s.iceServers()).toEqual([stun, unparsed])
-    await s.close()
+    /** `turn` requests sent over every connection so far. */
+    function turnRequests(): number {
+      return FakeSocket.instances.flatMap(i => i.frames).filter(f => f.t === 'turn').length
+    }
+
+    beforeEach(() => {
+      jest.setSystemTime(T0)
+    })
+
+    it('drops TURN servers from iceServers() 30 s before their REST credentials expire', async () => {
+      const unparsed = { urls: 'turns:relay.test:5349', username: 'static', credential: 'c' }
+      FakeSocket.turnServers = [stun, turn(1_790_000_060), unparsed]
+      const s = fake()
+      await s.connect()
+      expect(await s.requestTurn()).toEqual(FakeSocket.turnServers)
+      expect(s.iceServers()).toEqual(FakeSocket.turnServers)
+
+      await jest.advanceTimersByTimeAsync(29_999)
+      expect(s.iceServers()).toEqual(FakeSocket.turnServers)
+      // a gather and the allocation it starts must fit before coturn refuses the credentials
+      await jest.advanceTimersByTimeAsync(1)
+      expect(s.iceServers()).toEqual([stun, unparsed])
+      await s.close()
+    })
+
+    it('turnProvider asks the relay once for concurrent calls and reuses the servers until 30 s before they expire', async () => {
+      FakeSocket.turnServers = [stun, turn(1_790_000_600)]
+      const s = fake()
+      const provide = s.turnProvider()
+      const [a, b] = await Promise.all([provide(), provide()])
+      expect(turnRequests()).toBe(1)
+      expect(a).toEqual(FakeSocket.turnServers)
+      expect(b).toEqual(FakeSocket.turnServers)
+      // callers get copies they may change
+      a[0].urls = 'stun:changed.test'
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(1)
+
+      await jest.advanceTimersByTimeAsync(569_999)
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(1)
+      await jest.advanceTimersByTimeAsync(1)
+      FakeSocket.turnServers = [stun, turn(1_790_001_170)]
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(2)
+      // every provider of a signaler shares its servers
+      expect(await s.turnProvider()()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(2)
+      await s.close()
+    })
+
+    it('turnProvider keeps its TURN servers across connections, which reset iceServers() to STUN', async () => {
+      FakeSocket.turnServers = [stun, turn(1_790_000_600)]
+      const s = fake()
+      const provide = s.turnProvider()
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      // the connection opened only for the request is closed again
+      await jest.advanceTimersByTimeAsync(0)
+      expect(last().readyState).toBe(3)
+
+      // a dial opens a new connection, whose ice frame lists STUN only
+      await s.send(alice.key, env())
+      expect(FakeSocket.instances).toHaveLength(2)
+      expect(s.iceServers()).toEqual([])
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(1)
+      await s.close()
+    })
+
+    it('turnProvider asks again after a failed request, and rejects closed after close', async () => {
+      FakeSocket.turnServers = [stun, turn(1_790_000_600)]
+      FakeSocket.turnError = 'rate_limited'
+      const s = fake()
+      const provide = s.turnProvider()
+      const failed = await Promise.allSettled([provide(), provide()])
+      expect(failed.map(r => r.status)).toEqual(['rejected', 'rejected'])
+      expect((failed[0] as PromiseRejectedResult).reason).toMatchObject({ code: 'rate_limited' })
+      expect(turnRequests()).toBe(1)
+
+      FakeSocket.turnError = undefined
+      expect(await provide()).toEqual(FakeSocket.turnServers)
+      expect(turnRequests()).toBe(2)
+      // a relay without TURN answers with STUN only: nothing to keep, so it is asked each time
+      FakeSocket.turnServers = [stun]
+      jest.setSystemTime(T0 + 600_000)
+      expect(await provide()).toEqual([stun])
+      expect(await provide()).toEqual([stun])
+      expect(turnRequests()).toBe(4)
+
+      await s.close()
+      await expect(provide()).rejects.toMatchObject({ code: 'closed' })
+      expect(turnRequests()).toBe(4)
+    })
   })
 
   it('stops reconnecting once the last listener unsubscribes', async () => {
@@ -1181,6 +1316,51 @@ describe('relayOptionsFromEnv', () => {
         ttlSeconds: 600
       }
     })
+  })
+
+  it('reads the per-source TURN budget from TURN_PER_IP_PER_HOUR, leaving the default 6 when unset', () => {
+    const turn = { HOST: '127.0.0.1', TURN_SECRET: 's', TURN_URLS: 'turn:a.example:3478' }
+    expect(relayOptionsFromEnv({ ...turn, TURN_PER_IP_PER_HOUR: ' 600 ' })).toMatchObject({
+      turn: { secret: 's', urls: ['turn:a.example:3478'] },
+      limits: { turnPerIpPerHour: 600 }
+    })
+    for (const unset of [undefined, '']) {
+      expect(relayOptionsFromEnv({ ...turn, TURN_PER_IP_PER_HOUR: unset })).not.toHaveProperty(
+        'limits'
+      )
+    }
+    expect(DEFAULT_RELAY_LIMITS.turnPerIpPerHour).toBe(6)
+    for (const TURN_PER_IP_PER_HOUR of ['0', '-1', '1.5', 'many']) {
+      expect(() => relayOptionsFromEnv({ ...turn, TURN_PER_IP_PER_HOUR })).toThrow(
+        'TURN_PER_IP_PER_HOUR must be a whole number'
+      )
+    }
+    // a TURN budget without TURN to spend it on is a configuration mistake
+    expect(() => relayOptionsFromEnv({ HOST: '127.0.0.1', TURN_PER_IP_PER_HOUR: '600' })).toThrow(
+      'TURN_SECRET is required'
+    )
+  })
+
+  it('passes TURN_PER_IP_PER_HOUR to the relay, which then issues that many per address', async () => {
+    const r = await createRelayServer({
+      ...relayOptionsFromEnv({
+        HOST: '127.0.0.1',
+        PORT: '0',
+        TURN_SECRET: 's',
+        TURN_URLS: 'turn:a.example:3478',
+        TURN_PER_IP_PER_HOUR: '7'
+      }),
+      log: () => {}
+    })
+    const p = await party()
+    const s = new RelaySignaler({ url: r.url, wallet: p.wallet })
+    try {
+      for (let i = 0; i < 7; i++) await s.requestTurn()
+      await expect(s.requestTurn()).rejects.toMatchObject({ code: 'rate_limited' })
+    } finally {
+      await s.close()
+      await r.close()
+    }
   })
 
   it('rejects an invalid port or ttl and TURN settings without their pair', () => {

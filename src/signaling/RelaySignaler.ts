@@ -76,8 +76,14 @@ export interface RelaySignalerOptions {
   WebSocket?: typeof WebSocket
   /** Called with the ICE servers the relay hands out on every (re)connection and `requestTurn`. */
   onIceServers?: (servers: RTCIceServer[]) => void
-  /** Called whenever the connection state changes; see {@link RelayConnectionState}. */
-  onStateChange?: (state: RelayConnectionState) => void
+  /**
+   * Called whenever the connection state changes; see {@link RelayConnectionState}. Going
+   * `offline` because the connection or the attempt to open it failed passes the error that
+   * ended it (such as `auth_failed` when the relay expects another url, or `peer_unreachable`
+   * when it cannot be reached), so an app can show why; going `offline` because nothing
+   * needs the connection any more, or after `close()`, passes none.
+   */
+  onStateChange?: (state: RelayConnectionState, error?: WebRTPayError) => void
   /** Source of reconnect jitter, uniform in [0, 1); defaults to `Math.random`. */
   random?: () => number
 }
@@ -98,6 +104,11 @@ const CLOSED = 3
 const RELAY_URL_RE = /^wss?:\/\/[^/?#\s]+/i
 /** A coturn REST username, `<unix expiry seconds>:<user>`. */
 const TURN_REST_USERNAME_RE = /^(\d{1,15}):/
+/**
+ * TURN credentials this close to their expiry count as expired: the gather and the
+ * connection that use them have to fit before coturn refuses them.
+ */
+const TURN_EXPIRY_MARGIN_MS = 30000
 
 const RELAY_ERRORS: Record<RelayErrorCode, [WebRTPayErrorCode, string]> = {
   offline: ['peer_unreachable', 'Peer is not connected to the relay'],
@@ -133,11 +144,16 @@ export class RelaySignaler implements Signaler {
   private readonly originator: string | undefined
   private readonly WS: typeof WebSocket
   private readonly onIceServers: ((servers: RTCIceServer[]) => void) | undefined
-  private readonly onStateChange: ((state: RelayConnectionState) => void) | undefined
+  private readonly onStateChange:
+    ((state: RelayConnectionState, error?: WebRTPayError) => void) | undefined
   private readonly random: () => number
   private readonly subs = new Set<SignalSubscription>()
   private conn: RelayConnection | undefined
   private ice: RTCIceServer[] | undefined
+  /** The servers of the last successful `requestTurn`, kept across connections. */
+  private turn: RTCIceServer[] | undefined
+  /** The `requestTurn` that `turnProvider` callers are waiting for. */
+  private turnRequest: Promise<RTCIceServer[]> | undefined
   private explicit = false
   /** `send` and `requestTurn` calls in progress; each holds the connection open. */
   private inFlight = 0
@@ -184,14 +200,13 @@ export class RelaySignaler implements Signaler {
 
   /**
    * The ICE servers the relay handed out most recently, on connecting (STUN only) or
-   * on `requestTurn`, without TURN servers whose credentials have expired (the expiry
-   * is the Unix seconds before the `:` of a coturn REST username); undefined before
-   * the first connection.
+   * on `requestTurn`, without TURN servers whose credentials expire within 30 s (the
+   * expiry is the Unix seconds before the `:` of a coturn REST username); undefined
+   * before the first connection. Every new connection resets it to the relay's STUN
+   * servers; {@link turnProvider} keeps TURN servers across connections.
    */
   iceServers(): RTCIceServer[] | undefined {
-    if (this.ice === undefined) return undefined
-    const now = Date.now()
-    return copyIceServers(this.ice.filter(s => !turnExpired(s, now)))
+    return this.ice === undefined ? undefined : liveIceServers(this.ice, Date.now())
   }
 
   /** Forward `e` to every socket of `to`; resolves once the relay confirms. */
@@ -208,22 +223,38 @@ export class RelaySignaler implements Signaler {
 
   /**
    * Ask the relay for TURN credentials. Resolves with its full ICE server list
-   * (STUN, then TURN), which `iceServers()` returns from then on; a relay without
-   * TURN answers with its STUN servers only. It rejects `rate_limited` when the
-   * relay's hourly budget for this address, or in total, is spent. Suits
-   * `DirectPayClient`'s `iceServersProvider`; as every call spends one of this
-   * address's credentials (6 an hour by default), a provider may return
-   * `iceServers()` instead while that still holds a TURN server.
+   * (STUN, then TURN), which `iceServers()` returns until the next connection; a relay
+   * without TURN answers with its STUN servers only. It rejects `rate_limited` when the
+   * relay's hourly budget for this address, or in total, is spent. Every call spends
+   * one of this address's credentials (6 an hour by default): for
+   * `DirectPayClient`'s `iceServersProvider` use {@link turnProvider}, which reuses them.
    */
   async requestTurn(): Promise<RTCIceServer[]> {
     this.inFlight++
     try {
       const conn = await this.open()
-      return copyIceServers(await conn.requestTurn())
+      const servers = await conn.requestTurn()
+      this.turn = servers
+      return copyIceServers(servers)
     } finally {
       this.inFlight--
       void this.release()
     }
+  }
+
+  /**
+   * The recommended `iceServersProvider` for a `DirectPayClient` that signals through this
+   * relay. The function it returns resolves with the servers of the last `requestTurn`
+   * (STUN, then TURN) while one of their TURN servers has more than 30 s left, and calls
+   * `requestTurn` only otherwise; calls made while a request is in flight share it, and a
+   * failed request is not remembered. A payee gathers for every inbound offer it admits and
+   * identities are free, so a provider that asked the relay each time would let strangers
+   * spend this address's TURN budget. A relay without TURN answers with STUN only, which
+   * leaves nothing to reuse: each call then asks again (one frame, no budget). After
+   * `close()` it rejects `closed`.
+   */
+  turnProvider(): () => Promise<RTCIceServer[]> {
+    return () => this.heldTurn()
   }
 
   /**
@@ -250,6 +281,18 @@ export class RelaySignaler implements Signaler {
     }
   }
 
+  private heldTurn(): Promise<RTCIceServer[]> {
+    if (this.closing !== undefined) return Promise.reject(closedError())
+    if (this.turn !== undefined) {
+      const live = liveIceServers(this.turn, Date.now())
+      if (live.some(isTurnServer)) return Promise.resolve(live)
+    }
+    this.turnRequest ??= this.requestTurn().finally(() => {
+      this.turnRequest = undefined
+    })
+    return this.turnRequest.then(copyIceServers)
+  }
+
   private open(): Promise<RelayConnection> {
     if (this.closing !== undefined) return Promise.reject(closedError())
     const conn = this.conn ?? this.start()
@@ -271,7 +314,7 @@ export class RelaySignaler implements Signaler {
       onOpen: () => {
         if (this.conn === conn) this.setState('online')
       },
-      onEnd: openedAt => this.ended(conn, openedAt)
+      onEnd: (openedAt, err) => this.ended(conn, openedAt, err)
     })
     this.conn = conn
     this.setState('connecting')
@@ -280,14 +323,14 @@ export class RelaySignaler implements Signaler {
   }
 
   /**
-   * The current connection ended; reconnect while anyone is listening. Only a
+   * The current connection ended with `err`; reconnect while anyone is listening. Only a
    * connection that stayed authenticated for 30 s resets the backoff, so a relay or
    * proxy that drops sockets right after the handshake does not get hit every second.
    */
-  private ended(conn: RelayConnection, openedAt: number | undefined): void {
+  private ended(conn: RelayConnection, openedAt: number | undefined, err: WebRTPayError): void {
     if (this.conn !== conn) return
     this.conn = undefined
-    this.setState('offline')
+    this.setState('offline', err)
     if (openedAt !== undefined && Date.now() - openedAt >= STABLE_MS) this.failures = 0
     else this.failures++
     if (this.closing !== undefined || this.subs.size === 0) return
@@ -317,11 +360,11 @@ export class RelaySignaler implements Signaler {
     this.timer = undefined
   }
 
-  private setState(state: RelayConnectionState): void {
+  private setState(state: RelayConnectionState, error?: WebRTPayError): void {
     if (this.state === state) return
     this.state = state
     try {
-      this.onStateChange?.(state)
+      this.onStateChange?.(state, error)
     } catch {
       // a faulty callback must not break signaling
     }
@@ -339,9 +382,9 @@ interface ConnectionHooks {
   onOpen(): void
   /**
    * Called once when the connection ends, with the time (Unix milliseconds) its
-   * handshake completed, or undefined when it never did.
+   * handshake completed, or undefined when it never did, and the error that ended it.
    */
-  onEnd(openedAt: number | undefined): void
+  onEnd(openedAt: number | undefined, err: WebRTPayError): void
 }
 
 /**
@@ -592,7 +635,7 @@ class RelayConnection {
         // already closing
       }
     }
-    this.h.onEnd(this.openedAt)
+    this.h.onEnd(this.openedAt, err)
   }
 }
 
@@ -628,12 +671,24 @@ function iceServersOf(x: unknown): RTCIceServer[] | undefined {
   return out
 }
 
-/** True for a TURN server whose coturn REST username says its credentials have expired. */
-function turnExpired(server: RTCIceServer, now: number): boolean {
-  const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
-  if (!urls.some(u => /^turns?:/i.test(u))) return false
+/** A copy of `servers` without TURN servers whose credentials expire within 30 s of `now`. */
+function liveIceServers(servers: RTCIceServer[], now: number): RTCIceServer[] {
+  return copyIceServers(servers.filter(s => !turnExpiring(s, now)))
+}
+
+/**
+ * True for a TURN server whose coturn REST username says its credentials expire within
+ * 30 s of `now`, or have expired; coturn refuses them from their expiry second on.
+ */
+function turnExpiring(server: RTCIceServer, now: number): boolean {
+  if (!isTurnServer(server)) return false
   const expiry = TURN_REST_USERNAME_RE.exec(server.username ?? '')
-  return expiry !== null && now >= Number(expiry[1]) * 1000
+  return expiry !== null && now + TURN_EXPIRY_MARGIN_MS >= Number(expiry[1]) * 1000
+}
+
+function isTurnServer(server: RTCIceServer): boolean {
+  const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
+  return urls.some(u => /^turns?:/i.test(u))
 }
 
 function copyIceServers(servers: RTCIceServer[]): RTCIceServer[] {

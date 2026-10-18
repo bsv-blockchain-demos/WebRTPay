@@ -7,7 +7,9 @@ A payer hands the payee the same `PaymentToken` that PeerPay sends through Messa
 BEEF plus the BRC-29 derivation prefix and suffix), but over an encrypted peer-to-peer data
 channel: no server stores it or can read it (when two networks need a TURN relay, the relay
 carries only DTLS ciphertext). Both sides prove their identity key bound to the DTLS session,
-so whoever carries the signaling cannot read, change, withhold or redirect a payment.
+so whoever carries the signaling cannot read, change or redirect a payment. A carrier can still
+drop signals, which stops a direct payment from happening (a denial of service), but it can
+never take or divert the funds: the payer connects before it creates the transaction.
 
 - Browser-safe root entry: no Node builtins; `RTCPeerConnection` from the platform or injected
   (node-datachannel in Node, react-native-webrtc in React Native).
@@ -161,10 +163,11 @@ version 10 or so). An answer code carries only the session id and the SDP: the p
 identity comes from the handshake.
 
 A runnable version of the remote flow is [examples/demo-node.ts](examples/demo-node.ts): two
-wallets in one process, a real WebRTC channel, an in-memory signaler.
+wallets in one process, a real WebRTC channel, an in-memory signaler. It uses node-datachannel,
+a development dependency, so run it from a clone of the repository:
 
 ```sh
-npm run build && node --experimental-strip-types examples/demo-node.ts
+npm ci && npm run build && node --experimental-strip-types examples/demo-node.ts
 ```
 
 ## Signalers
@@ -194,12 +197,19 @@ while subscribed, while a send is in flight, or after `connect()`. Options: `url
 - `listen()` resolves once the connection is authenticated or the first attempt has failed. The
   subscription stays either way, and while it lasts a lost or refused connection is retried in
   the background after a random delay whose cap doubles with each failure, up to 30 s.
-  `onStateChange` reports `connecting`, `online` and `offline` (`RelayConnectionState`); use it
-  for a "receiving" indicator.
+- `onStateChange(state, error?)` reports `connecting`, `online` and `offline`
+  (`RelayConnectionState`); use it for a "receiving" indicator. When it goes `offline` because
+  the connection or an attempt to open it failed, `error` is the `WebRTPayError` that ended it,
+  so the app can say why: `auth_failed` when the relay expects another url (its `PUBLIC_URLS`
+  does not list the one dialed), `rate_limited`, or `peer_unreachable` when the relay cannot be
+  reached or dropped the connection. Going `offline` on purpose (nothing needs the connection,
+  or `close()`) passes no error.
 - The relay answers each frame in order; a reply that does not match ends the connection with
   `protocol` rather than being matched to a later frame.
-- `requestTurn()` asks for TURN credentials and resolves with the full ICE server list;
-  `iceServers()` returns the latest list without expired TURN entries.
+- `requestTurn()` asks for TURN credentials, spending one of this address's credentials, and
+  resolves with the full ICE server list. `iceServers()` returns the latest list without TURN
+  entries that expire within 30 s; every new connection resets it to the relay's STUN servers.
+  `turnProvider()` returns the `iceServersProvider` to give a `DirectPayClient` (below).
 
 Anything with `send`, `listen` and optionally `setActive` can be a signaler; see `Signaler` in
 `src/signaling/types.ts`.
@@ -208,7 +218,8 @@ Anything with `send`, `listen` and optionally `setActive` can be a signaler; see
 
 `rtc.iceServers` (STUN and TURN servers) applies to every link; `updateRtc()` changes it for
 links created later. For short-lived TURN credentials pass `iceServersProvider`, which is asked
-before every ICE gather (dialing, answering an offer, creating or answering an offer code):
+before every ICE gather (dialing, answering an offer, creating or answering an offer code).
+With a relay that issues TURN, use `RelaySignaler.turnProvider()`:
 
 ```ts
 const relay = new RelaySignaler({ url: 'wss://relay.example.com', wallet, originator })
@@ -218,20 +229,26 @@ const client = new DirectPayClient({
   signaler: relay,
   chain: 'main',
   rtc: { iceServers: [{ urls: 'stun:stun.example.com:3478' }] },
-  iceServersProvider: async () => {
-    // Every requestTurn() spends one of this address's credentials (6 an hour by default):
-    // reuse the last ones while they are valid.
-    const held = relay.iceServers() ?? []
-    const hasTurn = held.some(s => [s.urls].flat().some(url => /^turns?:/.test(url)))
-    return hasTurn ? held : relay.requestTurn()
-  }
+  iceServersProvider: relay.turnProvider(),
+  onIceServersProviderError: e => console.warn('gathering without the relay TURN servers', e)
 })
 ```
+
+`turnProvider()` reuses the servers of the last `requestTurn()` while one of their TURN entries
+has more than 30 s left, and asks the relay only otherwise; calls made while a request is in
+flight share it, a failed request is not remembered, and what it keeps survives reconnects
+(unlike `iceServers()`). Do not pass `() => relay.requestTurn()`: every request spends one of
+this address's TURN credentials (6 an hour by default), a payee gathers for every inbound offer
+it admits, and identities are free, so strangers could use up the budget by sending offers. A
+relay without TURN answers with STUN only, so it is asked again on each gather (a frame, no
+budget).
 
 The provider's servers are merged with `rtc.iceServers`; an entry with the same set of urls is
 replaced by the provider's. A provider that throws, rejects, returns something other than an
 array or takes more than 5 s is passed over and the gather uses `rtc.iceServers` alone, so a
-dial never fails because of it.
+dial never fails because of it. `onIceServersProviderError` is told why each time: what the
+provider threw or rejected with (`rate_limited` once the relay's budget is spent), a
+`TypeError` for a result that is not an array, or a `timeout` `WebRTPayError` after 5 s.
 
 ## Security model
 
@@ -318,6 +335,7 @@ PUBLIC_URLS=wss://relay.example.com TRUSTED_IP_HEADER=cf-connecting-ip npx webrt
 | `TURN_SECRET` | — | coturn `static-auth-secret`; requires `TURN_URLS`. |
 | `TURN_URLS` | — | Comma-separated TURN urls to issue credentials for; requires `TURN_SECRET`. |
 | `TURN_TTL` | `600` | Lifetime of issued TURN credentials, in seconds. |
+| `TURN_PER_IP_PER_HOUR` | `6` | TURN credential sets one source address may get per hour; requires `TURN_SECRET`. The relay issues at most 600 an hour in total. |
 
 - `GET /health` answers `{"status":"ok"}`. `SIGTERM` or `SIGINT` closes every socket and exits.
 - At startup it warns when there are no public urls (development only) and when `PUBLIC_URLS`
@@ -328,15 +346,17 @@ PUBLIC_URLS=wss://relay.example.com TRUSTED_IP_HEADER=cf-connecting-ip npx webrt
 - An authenticated socket may send 20 frames per 10 s; an identity may hold 5 sockets and
   receive 30 signals a minute from all senders together.
 - TURN credentials are issued only on request (`{ t: 'turn' }`), at most 6 an hour per source
-  address and 600 an hour in total, valid for `TURN_TTL`. The username is `<expiry>:<pseudonym>`
-  (`credential = base64(HMAC-SHA1(secret, username))`), so coturn needs `use-auth-secret`.
+  address (`TURN_PER_IP_PER_HOUR`) and 600 an hour in total, valid for `TURN_TTL`. The username
+  is `<expiry>:<pseudonym>` (`credential = base64(HMAC-SHA1(secret, username))`), so coturn
+  needs `use-auth-secret`.
   Identities are free, so in production also give coturn its own quotas (`--total-quota`,
   `--max-bps`, `--denied-peer-ip` for private ranges); `--user-quota` alone does not stop
   fresh keys.
 
 In code, `createRelayServer(options)` takes the same settings (`port`, `host`, `publicUrls`,
-`trustedIpHeader`, `stunUrls`, `turn: { secret, urls, ttlSeconds }`) plus `server` (attach to
-an existing HTTP server), `path`, `limits` (see `DEFAULT_RELAY_LIMITS`), `log` and, for
+`trustedIpHeader`, `stunUrls`, `turn: { secret, urls, ttlSeconds }`, and
+`limits: { turnPerIpPerHour }` for `TURN_PER_IP_PER_HOUR`) plus `server` (attach to an existing
+HTTP server), `path`, the other `limits` (see `DEFAULT_RELAY_LIMITS`), `log` and, for
 development only, `trustHostHeader`. It resolves to `{ url, port, close(), stats() }`.
 `docker/relay.Dockerfile` builds an image running `dist/server/cli.js` as a non-root user.
 
@@ -363,10 +383,15 @@ docker compose -f docker/docker-compose.yml down
   `403 Forbidden IP`. `allowed-peer-ip=172.30.78.10` is a development-only exception to the
   private-range deny list.
 - `npm run test:turn` runs the normal suite plus `test/turn.test.ts`: two relay-only peers,
-  a full payment over TURN with `RelaySignaler.requestTurn` as `iceServersProvider`, and the
-  compose relay's credentials against the compose coturn. That last test spends one of the
-  relay's 6 credentials an hour for Docker's gateway address; if a run fails with
-  `rate_limited`, run `docker compose -f docker/docker-compose.yml restart relay`.
+  a full payment over TURN with `RelaySignaler.turnProvider()` as `iceServersProvider`, and the
+  compose relay's credentials against the compose coturn. That last test spends one credential
+  of the compose relay, where every client arrives from Docker's gateway address; the compose
+  file therefore sets `TURN_PER_IP_PER_HOUR=600` (the relay's total) instead of the default 6,
+  so the suite can be run again and again.
+- coturn's 41 relay ports are the other limit: a run holds 5 allocations, which outlive it
+  until their lifetime runs out, so about 8 runs in a row fill them. The TURN tests then time
+  out and coturn logs `create_relay_ioa_sockets: no available ports`; run
+  `docker compose -f docker/docker-compose.yml restart coturn` to free them.
 - node-datachannel's polyfill hands TURN servers to libdatachannel as
   `turn:<username>:<credential>@host` urls, which cuts a REST username at its colon, and coturn
   then refuses it. `turnRtc()` in `test/helpers/rtc.ts` passes TURN servers as native
@@ -390,8 +415,8 @@ const client = new DirectPayClient({
 The root entry also needs `TextEncoder`, `TextDecoder` with `{ fatal: true }`,
 `crypto.getRandomValues` (for example from `react-native-get-random-values`) and
 `queueMicrotask`; `RelaySignaler` uses the global `WebSocket` unless given one. It uses no
-Node builtins, `Buffer` or `process` (`test/browser-safety.test.ts` enforces this). It has not
-been run on React Native.
+Node builtins, `Buffer` or `process`, and imports nothing outside `src/`
+(`test/browser-safety.test.ts` enforces this). It has not been run on React Native.
 
 ## Development
 
@@ -407,7 +432,7 @@ Node tests run real WebRTC with node-datachannel bound to `127.0.0.1`.
 
 ## Verification
 
-What the test suite exercises (`npm test`: 651 tests at 0.1.0; `npm run test:turn` adds 3 TURN
+What the test suite exercises (`npm test`: 661 tests at 0.1.0; `npm run test:turn` adds 3 TURN
 tests):
 
 - codes, compact SDP, frames: unit tests plus fast-check property suites with hostile input
@@ -423,8 +448,12 @@ tests):
 - `MessageBoxSignaler` against a fake MessageBox client;
 - the relayed path through a real coturn 4.18.0 in Docker (`npm run test:turn`);
 - the examples in `docs/protocol.md`, recomputed from the code (`test/protocol-doc.test.ts`);
-- the demo, `examples/demo-node.ts`, which pays through the built package and prints an
-  `accepted` ack.
+- guards: nothing under `src/` uses Node (`test/browser-safety.test.ts`), no public IP address
+  is published in tests or docs (`test/ip-literals.test.ts`), and the files the README links
+  to are in the package (`test/package-files.test.ts`).
+
+The demo, `examples/demo-node.ts`, is not part of `npm test`; run by hand, it pays through the
+built package and prints an `accepted` ack.
 
 Not verified:
 

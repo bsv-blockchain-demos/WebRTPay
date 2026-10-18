@@ -61,14 +61,21 @@ export interface DirectPayClientOptions {
   rtc?: RtcOptions
   /**
    * Extra STUN/TURN servers, asked for before every ICE gather: dialing, answering an
-   * offer, creating an offer code and answering one. Suits short-lived TURN credentials
-   * such as `RelaySignaler.requestTurn`'s. They are used together with `rtc.iceServers`;
-   * where both list the same urls, the provider's entry wins. A provider that throws,
-   * rejects, resolves to something other than an array or has not resolved after 5 s is
-   * passed over, as are entries that are not ICE servers: the gather goes ahead with
-   * `rtc.iceServers` alone.
+   * offer, creating an offer code and answering one. Suits short-lived TURN credentials:
+   * with a relay, pass `RelaySignaler.turnProvider()`, which reuses them. They are used
+   * together with `rtc.iceServers`; where both list the same urls, the provider's entry
+   * wins. A provider that throws, rejects, resolves to something other than an array or
+   * has not resolved after 5 s is passed over (see `onIceServersProviderError`), as are
+   * entries that are not ICE servers: the gather goes ahead with `rtc.iceServers` alone.
    */
   iceServersProvider?: () => Promise<RTCIceServer[]>
+  /**
+   * Called when `iceServersProvider` is passed over, with why: what it threw or rejected
+   * with, a `TypeError` when it resolved to something other than an array, or a `timeout`
+   * `WebRTPayError` when it had not answered after 5 s. The gather has gone ahead without
+   * its servers; anything this throws is ignored.
+   */
+  onIceServersProviderError?: (e: unknown) => void
   /**
    * The network this wallet is on, such as `'main'` or `'test'`. Offer codes carry it, and
    * answered offer codes must name it unless `expectedChain` says otherwise.
@@ -187,6 +194,7 @@ export class DirectPayClient {
   private readonly chain: string | undefined
   private rtc: RtcOptions
   private readonly iceServersProvider: (() => Promise<RTCIceServer[]>) | undefined
+  private readonly onIceServersProviderError: ((e: unknown) => void) | undefined
   private readonly limits: InboundLimits
   private readonly limiter: InboundLimiter
   private readonly connectMs: number
@@ -219,6 +227,7 @@ export class DirectPayClient {
     this.chain = o.chain
     this.rtc = { ...o.rtc }
     this.iceServersProvider = o.iceServersProvider
+    this.onIceServersProviderError = o.onIceServersProviderError
     this.limits = { ...DEFAULT_INBOUND_LIMITS, ...definedFields(o.limits) }
     this.limiter = new InboundLimiter(this.limits)
     this.connectMs = timerMs(o.timeouts?.connectMs, DEFAULTS.connectTimeoutMs, 'connectMs')
@@ -951,19 +960,34 @@ export class DirectPayClient {
     return { ...rtc, iceServers, maxMessageBytes: PRE_AUTH_MAX_MESSAGE_BYTES }
   }
 
-  /** The ICE servers `iceServersProvider` offers now; none when it is absent or fails. */
+  /**
+   * The ICE servers `iceServersProvider` offers now; none when it is absent or fails, in
+   * which case the gather goes ahead with `rtc.iceServers` alone: a dial never fails for this.
+   */
   private async providedIceServers(): Promise<RTCIceServer[]> {
     const provider = this.iceServersProvider
     if (provider === undefined) return []
+    let servers: unknown
     try {
-      const servers: unknown = await withDeadline(
+      servers = await withDeadline(
         Promise.resolve().then(provider),
         ICE_SERVERS_PROVIDER_MS,
         'The ICE servers provider did not answer in time'
       )
-      return Array.isArray(servers) ? servers.filter(isIceServer) : []
+    } catch (e) {
+      this.providerFailed(e)
+      return []
+    }
+    if (Array.isArray(servers)) return servers.filter(isIceServer)
+    this.providerFailed(new TypeError('The ICE servers provider did not resolve to an array'))
+    return []
+  }
+
+  private providerFailed(e: unknown): void {
+    try {
+      this.onIceServersProviderError?.(e)
     } catch {
-      return [] // gather with rtc.iceServers alone; a dial never fails for this
+      // a hook that throws must not stop the gather
     }
   }
 

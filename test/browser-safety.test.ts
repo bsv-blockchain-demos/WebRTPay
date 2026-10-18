@@ -2,12 +2,13 @@
  * Ruling 11: the root entry runs in browsers and React Native, so nothing under `src/` may
  * use Node: no `node:*` or other Node builtin module, no `ws` or `node-datachannel` (those
  * belong to `server/` and the tests), no `Buffer`, no `process`. Its only package import
- * is the `@bsv/sdk` peer dependency.
+ * is the `@bsv/sdk` peer dependency, and a relative import must stay inside `src/` (so
+ * nothing reaches `server/` that way).
  */
 import { describe, expect, it } from '@jest/globals'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { builtinModules } from 'node:module'
-import { join, relative } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -21,8 +22,8 @@ const NODE_PACKAGES = ['ws', 'node-datachannel']
 /** Specifiers in `import … from`, `export … from`, `import '…'`, `import('…')`, `require('…')`. */
 const SPECIFIER = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*(['"])([^'"\n]+)\1/g
 
-/** Every way `source` (TypeScript text) depends on Node, one message each. */
-function nodeDependencies(source: string): string[] {
+/** Every way `source`, the TypeScript text of `file`, depends on Node, one message each. */
+function nodeDependencies(source: string, file: string): string[] {
   const problems: string[] = []
   for (const [, , specifier] of source.matchAll(SPECIFIER)) {
     const bare = specifier.split('/')[0]
@@ -31,7 +32,12 @@ function nodeDependencies(source: string): string[] {
       problems.push(`imports the Node builtin '${specifier}'`)
     } else if (NODE_PACKAGES.includes(pkg)) {
       problems.push(`imports the Node-only package '${specifier}'`)
-    } else if (!specifier.startsWith('.') && !ALLOWED_PACKAGES.includes(pkg)) {
+    } else if (specifier.startsWith('.')) {
+      const path = relative(SRC, resolve(dirname(file), specifier))
+      if (path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path)) {
+        problems.push(`imports '${specifier}', which is outside src/`)
+      }
+    } else if (!ALLOWED_PACKAGES.includes(pkg)) {
       problems.push(`imports '${specifier}', which is not a dependency of the root entry`)
     }
   }
@@ -50,33 +56,34 @@ function typeScriptFiles(dir: string): string[] {
 
 describe('browser safety of src/ (Ruling 11)', () => {
   it('flags Node builtins, Node-only packages, Buffer, process and unknown packages', () => {
-    expect(nodeDependencies("import { readFileSync } from 'node:fs'")).toEqual([
+    const file = join(SRC, 'client', 'Sample.ts')
+    const check = (source: string): string[] => nodeDependencies(source, file)
+    expect(check("import { readFileSync } from 'node:fs'")).toEqual([
       "imports the Node builtin 'node:fs'"
     ])
-    expect(nodeDependencies("import { randomBytes } from 'crypto'")).toEqual([
+    expect(check("import { randomBytes } from 'crypto'")).toEqual([
       "imports the Node builtin 'crypto'"
     ])
-    expect(nodeDependencies("const p = await import('fs/promises')")).toEqual([
+    expect(check("const p = await import('fs/promises')")).toEqual([
       "imports the Node builtin 'fs/promises'"
     ])
-    expect(nodeDependencies("import WebSocket from 'ws'")).toEqual([
-      "imports the Node-only package 'ws'"
-    ])
-    expect(nodeDependencies("export * from 'node-datachannel/polyfill'")).toEqual([
+    expect(check("import WebSocket from 'ws'")).toEqual(["imports the Node-only package 'ws'"])
+    expect(check("export * from 'node-datachannel/polyfill'")).toEqual([
       "imports the Node-only package 'node-datachannel/polyfill'"
     ])
-    expect(nodeDependencies("const qr = require('qrcode')")).toEqual([
+    expect(check("const qr = require('qrcode')")).toEqual([
       "imports 'qrcode', which is not a dependency of the root entry"
     ])
-    expect(nodeDependencies('const b = Buffer.from(bytes)')).toEqual(['uses Buffer'])
-    expect(nodeDependencies('if (process.env.DEBUG) log()')).toEqual(['uses process'])
+    expect(check('const b = Buffer.from(bytes)')).toEqual(['uses Buffer'])
+    expect(check('if (process.env.DEBUG) log()')).toEqual(['uses process'])
     expect(
-      nodeDependencies(
+      check(
         [
           "import { PublicKey } from '@bsv/sdk'",
           "import type { WalletProtocol } from '@bsv/sdk'",
           "export * from './codec/codes.js'",
           "import { toHex } from '../util/bytes.js'",
+          "import { VERSION } from '../index.js'",
           'const view = new Uint8Array(new ArrayBuffer(8))',
           '// one step in the process. Then the next'
         ].join('\n')
@@ -84,11 +91,35 @@ describe('browser safety of src/ (Ruling 11)', () => {
     ).toEqual([])
   })
 
+  it('flags relative imports that leave src/, such as server code', () => {
+    expect(
+      nodeDependencies(
+        [
+          "import { createRelayServer } from '../../server/relay.js'",
+          "import type { RelayLimits } from '../../server/index.js'",
+          "const pkg = await import('../../package.json')",
+          "export * from '../..'"
+        ].join('\n'),
+        join(SRC, 'client', 'Sample.ts')
+      )
+    ).toEqual([
+      "imports '../../server/relay.js', which is outside src/",
+      "imports '../../server/index.js', which is outside src/",
+      "imports '../../package.json', which is outside src/",
+      "imports '../..', which is outside src/"
+    ])
+    expect(nodeDependencies("export * from '../server/index.js'", join(SRC, 'index.ts'))).toEqual([
+      "imports '../server/index.js', which is outside src/"
+    ])
+    // a file named like a parent directory is still inside
+    expect(nodeDependencies("import x from './..x.js'", join(SRC, 'index.ts'))).toEqual([])
+  })
+
   it('finds none of them in any file under src/', () => {
     const files = typeScriptFiles(SRC)
     expect(files.length).toBeGreaterThan(20)
     const problems = files.flatMap(file =>
-      nodeDependencies(readFileSync(file, 'utf8')).map(p => `${relative(ROOT, file)} ${p}`)
+      nodeDependencies(readFileSync(file, 'utf8'), file).map(p => `${relative(ROOT, file)} ${p}`)
     )
     expect(problems).toEqual([])
   })

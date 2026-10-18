@@ -933,23 +933,33 @@ describe('DirectPayClient iceServersProvider (Ruling 27)', () => {
     const payee = await makeWallet()
     const recording = recordingRtc()
     const rtcWithStun = { ...recording.rtc, iceServers: [stun] }
+    const reported: Record<string, unknown[]> = { payee: [], payer: [], odd: [], notAList: [] }
+    const limited = new WebRTPayError('rate_limited', 'Relay rate limit reached')
     const receiver = hubClient(hub, payee, {
       rtc: rtcWithStun,
       iceServersProvider: async () => {
-        throw new WebRTPayError('rate_limited', 'Relay rate limit reached')
+        throw limited
+      },
+      onIceServersProviderError: e => {
+        reported.payee.push(e)
+        throw new Error('a throwing hook changes nothing')
       }
     })
     await receiver.startReceiving(accepting(payee))
+    const noRelay = new Error('no relay configured')
     const sender = hubClient(hub, payer, {
       rtc: rtcWithStun,
       // a provider that throws before returning a promise
       iceServersProvider: () => {
-        throw new Error('no relay configured')
-      }
+        throw noRelay
+      },
+      onIceServersProviderError: e => reported.payer.push(e)
     })
     const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
     const peer = await sender.connect(payee.identityKey)
     expect(await sender.sendPayment(peer, token)).toMatchObject({ status: 'accepted', txid })
+    expect(reported.payer).toEqual([noRelay])
+    expect(reported.payee).toEqual([limited])
 
     // no list, or entries that are not ICE servers, count as nothing
     const odd = client(payee, {
@@ -958,31 +968,54 @@ describe('DirectPayClient iceServersProvider (Ruling 27)', () => {
       iceServersProvider: async () => [
         { url: 'stun:old.example' } as unknown as RTCIceServer,
         extra
-      ]
+      ],
+      onIceServersProviderError: e => reported.odd.push(e)
     })
     const notAList = client(payee, {
       rtc: rtcWithStun,
       chain: 'test',
-      iceServersProvider: async () => 'stun:x' as unknown as RTCIceServer[]
+      iceServersProvider: async () => 'stun:x' as unknown as RTCIceServer[],
+      onIceServersProviderError: e => reported.notAList.push(e)
     })
     ;(await odd.createOfferCode()).cancel()
     ;(await notAList.createOfferCode()).cancel()
     expect(recording.seen).toEqual([[stun], [stun], [stun, extra], [stun]])
+    // a list is an answer, even with entries dropped from it
+    expect(reported.odd).toEqual([])
+    expect(reported.notAList).toEqual([expect.any(TypeError)])
   })
 
   it('gives up on a provider that has not answered after 5 s', async () => {
     const payee = await makeWallet()
     const recording = recordingRtc()
+    const reported: unknown[] = []
+    let asked!: () => void
+    const providerAsked = new Promise<void>(resolve => (asked = resolve))
     const c = client(payee, {
       rtc: { ...recording.rtc, iceServers: [stun] },
       chain: 'test',
-      iceServersProvider: () => new Promise<RTCIceServer[]>(() => {})
+      iceServersProvider: () => {
+        asked()
+        return new Promise<RTCIceServer[]>(() => {})
+      },
+      onIceServersProviderError: e => reported.push(e)
     })
-    const started = Date.now()
-    const offer = await c.createOfferCode()
-    const waited = Date.now() - started
-    expect(waited).toBeGreaterThanOrEqual(4900)
-    expect(waited).toBeLessThan(9000)
+    // Only the provider's deadline runs on the fake clock: the clock is real again before the
+    // gather that follows it, which is real WebRTC.
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask', 'setImmediate'] })
+    const pending = c.createOfferCode()
+    try {
+      await providerAsked // its deadline is set by now
+      await jest.advanceTimersByTimeAsync(4999)
+      expect(reported).toEqual([])
+      expect(recording.seen).toEqual([])
+      jest.advanceTimersByTime(1)
+    } finally {
+      jest.useRealTimers()
+    }
+    const offer = await pending
+    expect(reported).toEqual([expect.objectContaining({ code: 'timeout' })])
+    expect(reported[0]).toBeInstanceOf(WebRTPayError)
     expect(recording.seen).toEqual([[stun]])
     offer.cancel()
   })

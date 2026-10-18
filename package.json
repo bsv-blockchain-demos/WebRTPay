@@ -25,6 +25,7 @@
   "files": [
     "dist",
     "docs/protocol.md",
+    "examples",
     "README.md",
     "LICENSE.txt"
   ],

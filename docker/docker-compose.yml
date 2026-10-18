@@ -39,6 +39,10 @@ services:
       STUN_URLS: stun:127.0.0.1:3478
       TURN_SECRET: webrtpay-dev-secret
       TURN_URLS: turn:127.0.0.1:3478
+      # Every client here arrives from Docker's address, so the default 6 TURN credential
+      # sets an hour per address would stop `npm run test:turn` after a few runs. 600 is
+      # also the relay's total per hour.
+      TURN_PER_IP_PER_HOUR: '600'
     ports:
       - '127.0.0.1:8787:8787'
     networks:
