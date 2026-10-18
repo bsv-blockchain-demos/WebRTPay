@@ -1,7 +1,9 @@
 # webrtpay-relay built from this package. The build context is the package root
 # (docker-compose.yml sets it; relay.Dockerfile.dockerignore limits what is sent).
 # Configured by the environment variables of server/cli.ts: PORT, HOST, PUBLIC_URLS,
-# TRUSTED_IP_HEADER, STUN_URLS, TURN_SECRET, TURN_URLS and TURN_TTL.
+# TRUSTED_IP_HEADER, STUN_URLS, TURN_PROVIDER (coturn: TURN_SECRET and TURN_URLS;
+# cloudflare: CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_API_TOKEN), TURN_TTL and the
+# limits in the README.
 
 FROM node:24-alpine AS build
 WORKDIR /src
