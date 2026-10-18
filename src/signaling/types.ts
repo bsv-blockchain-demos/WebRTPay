@@ -27,8 +27,14 @@ export interface SignalPlaintext {
   purpose: 'payment'
   /** Full SDP text (offer and answer only). */
   sdp?: string
-  /** Why the peer refused (reject only). */
+  /** Why the peer refused (reject only): `busy`, `not_receiving` or `wrong_network`. */
   reason?: string
+  /**
+   * The network the sender's wallet is on, such as `main` or `test`: 1 to 16 characters from
+   * `a-z` and `0-9`. A client given a `chain` names it in its offers and answers and refuses
+   * a peer that names another network or none; absent means unknown.
+   */
+  chain?: string
 }
 
 /**

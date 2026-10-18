@@ -144,8 +144,8 @@ import type { PaymentTokenInput } from '@bsv/webrtpay'
 // `wallet` takes the originator on every call (a WalletInterface such as a wallet-toolbox
 // Wallet); a WalletClient takes it in its constructor instead, and one argument per method.
 
-// 1. Dial and authenticate (30 s budget). Rejects peer_unreachable, rejected ('busy',
-//    'not_receiving'), rate_limited, timeout or auth_failed.
+// 1. Dial and authenticate (30 s budget). Rejects peer_unreachable, rejected (error.reason
+//    'busy', 'not_receiving' or 'wrong_network'), rate_limited, timeout or auth_failed.
 let peer = await client.connect(payeeKey)
 
 // 2. Build the payment as PeerPay does, P2PKH to the payee's BRC-29 key for a fresh
@@ -201,6 +201,22 @@ paying again. The payee acknowledges a payment it already has without internaliz
 payee's default 16 MiB message cap once base64-encoded. A session that has closed fails at
 once with `closed`. A payee configured with a smaller cap answers an oversize payment with an
 error, which `sendPayment` reports as `too_large`.
+
+**Networks.** An identity key is the same on every network, so a mainnet payer could otherwise
+reach a payee whose wallet is on testnet, broadcast, and have the payment refused. Give every
+client the wallet's network (`chain: 'main'`, `'test'`, …: 1 to 16 characters from `a-z` and
+`0-9`). Dials then name it: a payee refuses an offer from another network before gathering
+anything, and a payer refuses an answer from another network before the channel opens. Either
+way `connect` rejects with `WebRTPayError` code `rejected` and
+`error.reason === 'wrong_network'` before anything is spent, so a UI can say "the recipient's
+wallet is on a different network". A client without `chain` names no network and checks none;
+clients with one refuse it, so set it on both sides.
+
+```ts
+// when connect rejects with e: show "The recipient's wallet is on a different network"
+const onOtherNetwork = (e: unknown): boolean =>
+  e instanceof WebRTPayError && e.code === 'rejected' && e.reason === 'wrong_network'
+```
 
 ### Face to face (code exchange, no server)
 

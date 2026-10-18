@@ -17,6 +17,9 @@ export const MAX_SIGNAL_CIPHERTEXT_CHARS = 24576
 
 const KINDS: readonly SignalKind[] = ['offer', 'answer', 'reject']
 
+/** A network name a signal may carry: 1 to 16 characters from `a-z` and `0-9`. */
+const CHAIN = /^[a-z0-9]{1,16}$/
+
 /** Kept past the last moment a signal could still pass the freshness check. */
 const REPLAY_MARGIN_MS = 60000
 
@@ -85,15 +88,26 @@ export function isSignalEnvelope(x: unknown): x is SignalEnvelope {
   )
 }
 
+/** True for a network name a signal may carry: 1 to 16 characters from `a-z` and `0-9`. */
+export function isSignalChain(x: unknown): x is string {
+  return typeof x === 'string' && CHAIN.test(x)
+}
+
 /**
  * Encrypt a signal for `p.to` (BRC-2, protocol `[2, 'webrtpay signaling']`, key ID
  * `p.sid`). Only the {@link SignalPlaintext} fields are carried.
+ *
+ * @throws `TypeError` for a `chain` that is not 1 to 16 characters from `a-z` and `0-9`
+ * (nothing is encrypted).
  */
 export async function sealSignal(
   wallet: Pick<WalletLike, 'encrypt'>,
   p: SignalPlaintext,
   originator?: string
 ): Promise<SignalEnvelope> {
+  if (p.chain !== undefined && !isSignalChain(p.chain)) {
+    throw new TypeError('chain must be 1 to 16 characters from a-z and 0-9')
+  }
   const plaintext: SignalPlaintext = {
     v: 1,
     kind: p.kind,
@@ -103,7 +117,8 @@ export async function sealSignal(
     ts: p.ts,
     purpose: p.purpose,
     sdp: p.sdp,
-    reason: p.reason
+    reason: p.reason,
+    chain: p.chain
   }
   const { ciphertext } = await wallet.encrypt(
     {
@@ -191,7 +206,8 @@ function toPlaintext(x: unknown): SignalPlaintext | undefined {
     !Number.isFinite(r.ts) ||
     r.purpose !== 'payment' ||
     (r.sdp !== undefined && typeof r.sdp !== 'string') ||
-    (r.reason !== undefined && typeof r.reason !== 'string')
+    (r.reason !== undefined && typeof r.reason !== 'string') ||
+    (r.chain !== undefined && !isSignalChain(r.chain))
   ) {
     return undefined
   }
@@ -206,6 +222,7 @@ function toPlaintext(x: unknown): SignalPlaintext | undefined {
   }
   if (r.sdp !== undefined) p.sdp = r.sdp as string
   if (r.reason !== undefined) p.reason = r.reason as string
+  if (r.chain !== undefined) p.chain = r.chain as string
   return p
 }
 

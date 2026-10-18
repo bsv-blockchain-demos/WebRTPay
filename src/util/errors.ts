@@ -19,15 +19,27 @@ export type WebRTPayErrorCode =
  */
 export class WebRTPayError extends Error {
   readonly code: WebRTPayErrorCode
+  /**
+   * Why the peer refused, on `rejected` errors from `DirectPayClient.connect`: `busy`,
+   * `not_receiving` or `wrong_network` (the recipient's wallet is on another network), or
+   * whatever else the peer said, at most 200 characters. Absent on other errors.
+   */
+  declare readonly reason?: string
 
   /**
    * @param code - Machine-readable reason.
    * @param message - Human-readable detail; defaults to the code.
-   * @param options - `cause` is the underlying error, kept on `error.cause`.
+   * @param options - `cause` is the underlying error, kept on `error.cause`; `reason` is
+   * kept on `error.reason`.
    */
-  constructor(code: WebRTPayErrorCode, message?: string, options?: { cause?: unknown }) {
+  constructor(
+    code: WebRTPayErrorCode,
+    message?: string,
+    options?: { cause?: unknown; reason?: string }
+  ) {
     super(message ?? code, options && 'cause' in options ? { cause: options.cause } : undefined)
     this.name = 'WebRTPayError'
     this.code = code
+    if (options?.reason !== undefined) this.reason = options.reason
   }
 }

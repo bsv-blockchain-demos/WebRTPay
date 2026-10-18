@@ -657,12 +657,16 @@ The `sid` travels in the clear because it is also the encryption key ID.
 ### 7.2 Plaintext
 
 ```json
-{ "v": 1, "kind": "offer", "sid": "<sid>", "from": "<sender key>", "to": "<recipient key>", "ts": 1792240000000, "purpose": "payment", "sdp": "<SDP text>" }
+{ "v": 1, "kind": "offer", "sid": "<sid>", "from": "<sender key>", "to": "<recipient key>", "ts": 1792240000000, "purpose": "payment", "sdp": "<SDP text>", "chain": "main" }
 ```
 
 - `kind`: `offer` and `answer` carry `sdp` (the full SDP text, at most 16384 characters);
-  `reject` carries `reason` instead: `busy` or `not_receiving`.
+  `reject` carries `reason` instead: `busy`, `not_receiving` or `wrong_network`.
 - `ts` is the sender's clock in ms.
+- `chain` (optional): the network the sender's wallet is on, such as `main` or `test`, 1 to 16
+  characters from `a-z` and `0-9`. A client that knows its network names it in its offers and
+  answers (§7.5); absent means unknown, which is what clients without a network, and those
+  written before the field existed, send. Readers that do not know the field ignore it.
 
 ### 7.3 Encryption
 
@@ -679,7 +683,8 @@ in this order:
 1. the envelope is well formed (§7.1) and the carrier-asserted sender is an identity key;
 2. `decrypt` with `counterparty` = the carrier's sender succeeds and yields a JSON object with
    `v` 1, a known `kind`, string `sid`, `from` and `to`, a finite number `ts`, `purpose`
-   `payment`, and string `sdp` and `reason` when present;
+   `payment`, string `sdp` and `reason` when present, and `chain` when present a string of 1
+   to 16 characters from `a-z` and `0-9`;
 3. `from` equals the carrier's sender, `to` is this wallet, and `sid` equals the envelope's;
 4. `|now − ts| ≤ 120000`;
 5. `sdp` is at most 16384 characters;
@@ -695,10 +700,12 @@ and never dropped early, so no flood of signals can open a replay window.
 ```
 payer                                    payee (receiving)
   gather ICE (≤ 5 s)
-  offer {sdp} ──────── carrier ─────────▶ admit? (§7.6)
-                                            no: reject {busy | not_receiving}, or nothing
+  offer {sdp, chain} ──── carrier ──────▶ admit? (§7.6)
+                                            no: reject {busy | not_receiving |
+                                                wrong_network}, or nothing
                                             yes: gather ICE (≤ 5 s)
-  ◀──────── carrier ──────── answer {sdp}
+  ◀──────── carrier ──────── answer {sdp, chain}
+  same chain? no: rejected (wrong_network)
   apply answer; channel opens; handshake (§5); payment (§6)
 ```
 
@@ -708,6 +715,17 @@ payer                                    payee (receiving)
 - Once it has gathered, the payee must get its answer out within 30 s; the channel and
   handshake then have their own 30 s.
 - A client that is dialing but not receiving answers offers with `reject` `not_receiving`.
+
+**Network binding.** An identity key is the same on every network, so a dial names the
+network too. A client given a network (`chain`) puts it in its offers and answers. As payee it
+refuses an offer whose `chain` is absent or different with `reject` `wrong_network`, before it
+admits the offer (no session slot, no ICE gathered, within the reject budget of §7.6). As payer
+it checks the answer before applying it: an answer whose `chain` is absent or different ends
+the dial with `rejected`, reason `wrong_network`, and the channel is never opened, so nothing
+is spent on a payee whose wallet would refuse the transaction. Absent counts as different (fail
+closed). A client without a network sends no `chain` and checks none, as before the field;
+clients that have one refuse it. `DirectPayClient` reports both refusals as
+`WebRTPayError('rejected')` with `error.reason === 'wrong_network'`.
 
 ### 7.6 Intake and inbound limits (payee)
 
@@ -722,8 +740,9 @@ An offer is admitted when its sender has **no session open** and had fewer than 
 admitted in the last 60 s, and then when fewer than 3 inbound sessions are open and fewer than
 10 offers were admitted in the last 60 s. An admitted offer holds a session slot until its
 session ends or fails to connect. A refused offer counts against nothing and gathers no ICE (no
-address is disclosed): one over its sender's limits gets no reply; one refused because the
-payee is busy gets a `reject` `busy`, but at most one reject a second is sent and the rest go
+address is disclosed): one over its sender's limits gets no reply; one from another network
+(§7.5) gets a `reject` `wrong_network`, even when the payee is busy; one refused because the
+payee is busy gets a `reject` `busy`. At most one reject a second is sent, and the rest go
 unanswered.
 
 Budgets and windows run on a monotonic clock (`performance.now()`), so a wall clock set back
@@ -975,7 +994,7 @@ Every expected failure is a `WebRTPayError` with one of these `code`s:
 | `protocol` | the peer, relay or carrier broke the wire rules, or the WebRTC stack refused a configuration or SDP (the stack's error is the `cause`) |
 | `auth_failed` | the identity handshake or relay authentication failed |
 | `peer_unreachable` | no carrier could reach the peer, or no answer came |
-| `rejected` | the peer refused the connection (`busy`, `not_receiving`) |
+| `rejected` | the peer refused the connection, or answered from another network; `error.reason` says why (`busy`, `not_receiving`, `wrong_network`) |
 | `invalid_code` | a malformed, expired or wrong-network code |
 | `invalid_payment` | a payment that is malformed or does not pay this wallet, or a token `sendPayment` refuses to send |
 | `invalid_signal` | a signal that cannot be opened (§7.4) |

@@ -119,6 +119,53 @@ describe('signal envelopes', () => {
     expect('sdp' in opened).toBe(false)
   })
 
+  it('round trips the network a signal names, and leaves it out when there is none', async () => {
+    const roundTrip = async (p: SignalPlaintext): Promise<SignalPlaintext> =>
+      openSignal(bob.wallet, alice.key, await sealSignal(alice.wallet, p), {
+        me: bob.key,
+        now: NOW,
+        replay: new ReplayCache()
+      })
+    for (const chain of ['main', 'test', 'tstn', '0', 'a'.repeat(16)]) {
+      const p = offer({ chain })
+      expect(await roundTrip(p)).toEqual(p)
+    }
+    const answer: SignalPlaintext = { ...offer({ chain: 'main' }), kind: 'answer' }
+    expect(await roundTrip(answer)).toEqual(answer)
+    expect('chain' in (await roundTrip(offer()))).toBe(false)
+  })
+
+  it('rejects a network that is not 1 to 16 characters from a-z and 0-9', async () => {
+    const bad: unknown[] = [
+      '',
+      'MAIN',
+      'Main',
+      'main-net',
+      'main\n',
+      'tëst',
+      'a'.repeat(17),
+      7,
+      null
+    ]
+    for (const chain of bad) {
+      const sid = newSid()
+      const e = await craft(alice, bob.key, sid, { ...offer({ sid }), chain })
+      await expectInvalid(
+        openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay: new ReplayCache() })
+      )
+    }
+  })
+
+  it('refuses to seal a network that is not 1 to 16 characters from a-z and 0-9', async () => {
+    const encrypt = jest.fn(async (args: WalletEncryptArgs, _originator?: string) =>
+      alice.wallet.encrypt(args)
+    )
+    for (const chain of ['', 'Main', 'main-net', 'a'.repeat(17)]) {
+      await expect(sealSignal({ encrypt }, offer({ chain }))).rejects.toThrow(TypeError)
+    }
+    expect(encrypt).not.toHaveBeenCalled()
+  })
+
   it('encrypts with the signaling protocol, the sid as key ID and the recipient as counterparty', async () => {
     const encrypt = jest.fn(async (args: WalletEncryptArgs, _originator?: string) =>
       alice.wallet.encrypt(args)

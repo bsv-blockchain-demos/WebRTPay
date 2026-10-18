@@ -392,6 +392,13 @@ describe('WebRTPayError', () => {
     expect(err.cause).toBe(cause)
   })
 
+  it('carries a reason only when one is given', () => {
+    const refused = new WebRTPayError('rejected', 'other network', { reason: 'wrong_network' })
+    expect(refused.reason).toBe('wrong_network')
+    expect('cause' in refused).toBe(false)
+    expect('reason' in new WebRTPayError('rejected')).toBe(false)
+  })
+
   it('has a stack trace', () => {
     expect(new WebRTPayError('timeout', 'slow').stack).toContain('slow')
   })

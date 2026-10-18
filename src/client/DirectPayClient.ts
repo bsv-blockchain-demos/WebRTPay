@@ -19,7 +19,7 @@ import type {
 } from '../payments/wire.js'
 import type { AuthenticatedPeer } from '../session/AuthenticatedPeer.js'
 import { PRE_AUTH_MAX_MESSAGE_BYTES, authenticate } from '../session/handshake.js'
-import { ReplayCache, openSignal, sealSignal } from '../signaling/envelope.js'
+import { ReplayCache, isSignalChain, openSignal, sealSignal } from '../signaling/envelope.js'
 import type { SignalEnvelope, SignalKind, SignalPlaintext, Signaler } from '../signaling/types.js'
 import { DEFAULTS, isIdentityKey } from '../types.js'
 import type {
@@ -92,8 +92,13 @@ export interface DirectPayClientOptions {
    */
   onIceServersProviderError?: (e: unknown) => void
   /**
-   * The network this wallet is on, such as `'main'` or `'test'`. Offer codes carry it, and
-   * answered offer codes must name it unless `expectedChain` says otherwise.
+   * The network this wallet is on, such as `'main'` or `'test'`: 1 to 16 characters from
+   * `a-z` and `0-9`. Offer codes carry it, and answered offer codes must name it unless
+   * `expectedChain` says otherwise. Dials are bound to it too: offers and answers name it, an
+   * inbound offer that names another network or none is refused with a sealed `reject`
+   * (`wrong_network`, no ICE gathered), and {@link DirectPayClient.connect} refuses an answer
+   * that names another network or none before applying it. Without it, signals name no
+   * network and nothing is checked (peers that set one refuse this client).
    */
   chain?: string
   /** Inbound limits; unset fields keep {@link DEFAULT_INBOUND_LIMITS}. */
@@ -244,8 +249,14 @@ export class DirectPayClient {
   private listenOps: Promise<void> = Promise.resolve()
   private closing: Promise<void> | undefined
 
-  /** @throws `RangeError` for an invalid limit, timeout or message cap. */
+  /**
+   * @throws `RangeError` for an invalid limit, timeout or message cap; `TypeError` for a
+   * `chain` that is not 1 to 16 characters from `a-z` and `0-9`.
+   */
   constructor(o: DirectPayClientOptions) {
+    if (o.chain !== undefined && !isSignalChain(o.chain)) {
+      throw new TypeError('chain must be 1 to 16 characters from a-z and 0-9')
+    }
     this.wallet = o.wallet
     this.originator = o.originator
     this.signaler = o.signaler
@@ -288,11 +299,13 @@ export class DirectPayClient {
    *
    * Offers beyond the limits get no ICE gathering (no address disclosed). One from a sender
    * over its own limits (it has a session open, or has used its offers for the minute) gets
-   * no reply; one refused because the payee is busy gets a sealed `reject` (`busy`), but
-   * refusals are answered at most once a second and the rest go unanswered. A session must
-   * open and authenticate within `connectMs` of its answer being sent, send its first
-   * message within `firstMessageTimeoutMs` (60 s by default: the payer creates and
-   * broadcasts the transaction in that window), and ends after `maxSessionMs` regardless.
+   * no reply; with the client's `chain` set, one that names another network or none gets a
+   * sealed `reject` (`wrong_network`); one refused because the payee is busy gets a sealed
+   * `reject` (`busy`). Refusals are answered at most once a second and the rest go
+   * unanswered. A session must open and authenticate within `connectMs` of its answer being
+   * sent, send its first message within `firstMessageTimeoutMs` (60 s by default: the payer
+   * creates and broadcasts the transaction in that window), and ends after `maxSessionMs`
+   * regardless.
    *
    * @throws `WebRTPayError('unsupported')` without a signaler; `closed` after
    * {@link close}; whatever the signaler's `listen` throws (receiving is then off).
@@ -332,14 +345,20 @@ export class DirectPayClient {
    * resolves, check `peer.isOpen` before broadcasting it, and send it at once (see
    * {@link sendPayment}).
    *
+   * With the client's `chain` set, the offer names it and an answer must name the same
+   * network: one that names another or none is refused before it is applied (`rejected`,
+   * `wrong_network`), as the payee refuses an offer from another network.
+   *
    * @throws `WebRTPayError`: `unsupported` without a signaler; `peer_unreachable` when the
    * carrier cannot deliver or no answer arrives within `timeoutMs` (default `connectMs`,
    * 30 s); `rate_limited` when the carrier refuses for its limits; `rejected` when the
-   * recipient refused (the reason, at most 200 characters, is in the message: `busy`,
-   * `not_receiving`); `timeout` when the answer came but the channel and handshake did not
-   * finish in time; `auth_failed`, `closed` or `protocol` from the channel and handshake;
-   * `closed` when the client closes first. `TypeError` for a recipient that is not an
-   * identity key, `RangeError` for an invalid `timeoutMs`.
+   * recipient refused, with the reason (at most 200 characters) on `error.reason` and in the
+   * message: `busy`, `not_receiving`, or `wrong_network` when the recipient's wallet is on
+   * another network than this client's `chain` (or one of the two names none); `timeout`
+   * when the answer came but the channel and handshake did not finish in time;
+   * `auth_failed`, `closed` or `protocol` from the channel and handshake; `closed` when the
+   * client closes first. `TypeError` for a recipient that is not an identity key,
+   * `RangeError` for an invalid `timeoutMs`.
    */
   connect(recipient: PubKeyHex, o: { timeoutMs?: number } = {}): Promise<AuthenticatedPeer> {
     if (this.closing !== undefined) return Promise.reject(closedError())
@@ -383,15 +402,24 @@ export class DirectPayClient {
       link = offered.link
       this.adopt(link)
       if (failure !== undefined) throw failure
-      const envelope = await this.seal('offer', sid, me, recipient, { sdp: offered.sdp })
+      const envelope = await this.seal('offer', sid, me, recipient, {
+        sdp: offered.sdp,
+        chain: this.chain
+      })
       if (failure !== undefined) throw failure
       await signaler.send(recipient, envelope)
       const p = await reply
       if (p.kind === 'reject') {
         const reason = truncate(p.reason ?? 'no reason given', MAX_REJECT_REASON_CHARS)
-        throw new WebRTPayError('rejected', `Recipient refused the connection: ${reason}`)
+        throw new WebRTPayError('rejected', `Recipient refused the connection: ${reason}`, {
+          reason
+        })
       }
       if (p.sdp === undefined) throw new WebRTPayError('protocol', 'Answer carries no SDP')
+      // Bound to a network: an answer from another one (or none) is never applied.
+      if (this.chain !== undefined && p.chain !== this.chain) {
+        throw wrongNetwork(this.chain, p.chain)
+      }
       // Listen on the link before the channel can open, so the peer's hello is not missed.
       const session = authenticate(link, {
         wallet: this.wallet,
@@ -780,6 +808,10 @@ export class DirectPayClient {
     const refusal = this.limiter.refusal(sender)
     // A sender over its own limits gets no answer, so it cannot spend the reject budget.
     if (refusal === 'sender') return
+    // Bound to a network: an offer from another one (or none, fail closed) holds no slot.
+    if (this.chain !== undefined && p.chain !== this.chain) {
+      return this.refuse(p, me, 'wrong_network')
+    }
     if (refusal === 'busy' || !this.limiter.tryAdmit(sender)) return this.refuse(p, me, 'busy')
     let released = false
     const release = (): void => {
@@ -795,8 +827,8 @@ export class DirectPayClient {
       // The answer must go out within the connect budget; carriers like MessageBox can take
       // seconds, so open and handshake get a budget of their own once it has.
       const sent = withDeadline(
-        this.seal('answer', p.sid, me, sender, { sdp: accepted.sdp }).then(envelope =>
-          this.signaler!.send(sender, envelope)
+        this.seal('answer', p.sid, me, sender, { sdp: accepted.sdp, chain: this.chain }).then(
+          envelope => this.signaler!.send(sender, envelope)
         ),
         this.connectMs,
         'The answer could not be sent in time'
@@ -834,11 +866,12 @@ export class DirectPayClient {
     sid: string,
     from: PubKeyHex,
     to: PubKeyHex,
-    extra: { sdp?: string; reason?: string }
+    extra: { sdp?: string; reason?: string; chain?: string }
   ): Promise<SignalEnvelope> {
     const p: SignalPlaintext = { v: 1, kind, sid, from, to, ts: Date.now(), purpose: 'payment' }
     if (extra.sdp !== undefined) p.sdp = extra.sdp
     if (extra.reason !== undefined) p.reason = extra.reason
+    if (extra.chain !== undefined) p.chain = extra.chain
     return sealSignal(this.wallet, p, this.originator)
   }
 
@@ -1095,6 +1128,16 @@ function noop(): void {}
 
 function closedError(): WebRTPayError {
   return new WebRTPayError('closed', 'Client is closed')
+}
+
+/** The dialer's refusal of an answer that names another network than `ours`, or none. */
+function wrongNetwork(ours: string, theirs: string | undefined): WebRTPayError {
+  const where = theirs === undefined ? 'names no network' : `is on ${theirs}`
+  return new WebRTPayError(
+    'rejected',
+    `The recipient's wallet ${where}, this one is on ${ours}: wrong_network`,
+    { reason: 'wrong_network' }
+  )
 }
 
 /** 16 random bytes, base64url: payment ids and signaling session ids (Ruling 18). */

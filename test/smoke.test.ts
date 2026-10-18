@@ -56,6 +56,7 @@ describe('package scaffold', () => {
       'openSignal',
       'ReplayCache',
       'isSignalEnvelope',
+      'isSignalChain',
       'MAX_SIGNAL_SDP_CHARS',
       'MAX_SIGNAL_CIPHERTEXT_CHARS',
       'createMemoryHub',

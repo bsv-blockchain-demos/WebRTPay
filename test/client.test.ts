@@ -16,7 +16,7 @@ import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.j
 import { createMemoryHub } from '../src/signaling/MemorySignaler.js'
 import type { MemoryHub } from '../src/signaling/MemorySignaler.js'
 import { RelaySignaler } from '../src/signaling/RelaySignaler.js'
-import type { SignalEnvelope, Signaler } from '../src/signaling/types.js'
+import type { SignalEnvelope, SignalPlaintext, Signaler } from '../src/signaling/types.js'
 import type { IncomingPayment, IncomingPaymentRequest, PaymentToken } from '../src/types.js'
 import { randomBytes, toBase64, toBase64Url } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
@@ -457,6 +457,7 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
       await silent.heard
       const refused = await failure(sender.connect(payee.identityKey))
       expect(refused.code).toBe('rejected')
+      expect(refused.reason).toBe('not_receiving')
       expect(refused.message).toContain('not_receiving')
       expect((await ownDial).code).toBe('peer_unreachable')
       await silent.stop()
@@ -488,6 +489,7 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
       for (const s of senders.slice(0, 3)) peers.push(await s.connect(payee.identityKey))
       const busy = await failure(senders[3].connect(payee.identityKey))
       expect(busy.code).toBe('rejected')
+      expect(busy.reason).toBe('busy')
       expect(busy.message).toContain('busy')
       // refused without gathering ICE
       expect(acceptOffer).toHaveBeenCalledTimes(3)
@@ -870,6 +872,235 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
     const withSignaler = hubClient(createMemoryHub(), w)
     await expect(withSignaler.connect('not a key')).rejects.toThrow(TypeError)
     await expect(withSignaler.connect(key(), { timeoutMs: 0 })).rejects.toThrow(RangeError)
+  })
+})
+
+// ---------------------------------------------------------------- network binding
+
+/** A hub signaler for `w` that keeps every envelope it sends. */
+function recordingSignaler(
+  hub: MemoryHub,
+  w: TestWallet
+): { signaler: Signaler; sent: SignalEnvelope[] } {
+  const base = hub.signaler(w.identityKey)
+  const sent: SignalEnvelope[] = []
+  return {
+    sent,
+    signaler: {
+      send: async (to, e) => {
+        sent.push(e)
+        await base.send(to, e)
+      },
+      listen: fn => base.listen(fn)
+    }
+  }
+}
+
+/** What `to` reads in a signal `from` sent it. */
+function readSignal(from: TestWallet, to: TestWallet, e: SignalEnvelope): Promise<SignalPlaintext> {
+  return openSignal(to.wallet, from.identityKey, e, {
+    me: to.identityKey,
+    replay: new ReplayCache()
+  })
+}
+
+describe('DirectPayClient network binding (chain, MemoryHub, loopback WebRTC)', () => {
+  it('refuses a mainnet payer at a testnet payee: wrong_network, no payee link, no payer peer', async () => {
+    const acceptOffer = jest.spyOn(PeerLink, 'acceptOffer')
+    const acceptAnswer = jest.spyOn(PeerLink.prototype, 'acceptAnswer')
+    try {
+      const hub = createMemoryHub()
+      const payer = await makeWallet()
+      const payee = await makeWallet()
+      const sessions: string[] = []
+      const errors: unknown[] = []
+      await hubClient(hub, payee, { chain: 'test' }).startReceiving({
+        ...accepting(payee),
+        onSession: k => sessions.push(k),
+        onError: e => errors.push(e)
+      })
+      const sender = hubClient(hub, payer, { chain: 'main' })
+
+      const refused = await failure(sender.connect(payee.identityKey))
+      // a sealed reject: a dial left to time out would be peer_unreachable
+      expect(refused.code).toBe('rejected')
+      expect(refused.reason).toBe('wrong_network')
+      expect(refused.message).toContain('wrong_network')
+      // the payee gathered nothing and served nothing; the payer applied no answer
+      expect(acceptOffer).not.toHaveBeenCalled()
+      expect(acceptAnswer).not.toHaveBeenCalled()
+      expect(sessions).toEqual([])
+      expect(errors).toEqual([])
+      expect(payee.internalizeAction).not.toHaveBeenCalled()
+    } finally {
+      acceptOffer.mockRestore()
+      acceptAnswer.mockRestore()
+    }
+  })
+
+  it('refuses an offer that names no network at a payee that has one (fail closed)', async () => {
+    const acceptOffer = jest.spyOn(PeerLink, 'acceptOffer')
+    try {
+      const hub = createMemoryHub()
+      const payee = await makeWallet()
+      await hubClient(hub, payee, { chain: 'main' }).startReceiving(accepting(payee))
+      const legacy = hubClient(hub, await makeWallet())
+
+      const refused = await failure(legacy.connect(payee.identityKey))
+      expect(refused).toMatchObject({ code: 'rejected', reason: 'wrong_network' })
+      expect(acceptOffer).not.toHaveBeenCalled()
+    } finally {
+      acceptOffer.mockRestore()
+    }
+  })
+
+  it('refuses wrong-network offers within the reject budget, holding no slot', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    await hubClient(hub, payee, { chain: 'main', limits: { maxConcurrent: 1 } }).startReceiving(
+      accepting(payee)
+    )
+    const b = hubClient(hub, await makeWallet(), { chain: 'test' })
+    const c = hubClient(hub, await makeWallet(), { chain: 'test' })
+
+    expect(await failure(b.connect(payee.identityKey, { timeoutMs: 1000 }))).toMatchObject({
+      code: 'rejected',
+      reason: 'wrong_network'
+    })
+    // the one refusal a second is spent: the next goes unanswered
+    expect((await failure(c.connect(payee.identityKey, { timeoutMs: 600 }))).code).toBe(
+      'peer_unreachable'
+    )
+    // and neither took the only slot: a payer on the payee's network still connects
+    const peer = await hubClient(hub, await makeWallet(), { chain: 'main' }).connect(
+      payee.identityKey
+    )
+    expect(peer.peerIdentityKey).toBe(payee.identityKey)
+  })
+
+  it('refuses an answer that names no network before applying it', async () => {
+    const acceptAnswer = jest.spyOn(PeerLink.prototype, 'acceptAnswer')
+    try {
+      const hub = createMemoryHub()
+      const payee = await makeWallet()
+      const sessions: string[] = []
+      // a payee without a network answers, and its answer says nothing about one
+      await hubClient(hub, payee).startReceiving({
+        ...accepting(payee),
+        onSession: k => sessions.push(k)
+      })
+      const sender = hubClient(hub, await makeWallet(), { chain: 'main' })
+
+      const refused = await failure(sender.connect(payee.identityKey))
+      expect(refused).toMatchObject({ code: 'rejected', reason: 'wrong_network' })
+      expect(acceptAnswer).not.toHaveBeenCalled()
+      expect(sessions).toEqual([])
+    } finally {
+      acceptAnswer.mockRestore()
+    }
+  })
+
+  it('refuses an answer from another network before applying it', async () => {
+    const acceptAnswer = jest.spyOn(PeerLink.prototype, 'acceptAnswer')
+    try {
+      const hub = createMemoryHub()
+      const payer = await makeWallet()
+      const payee = await makeWallet()
+      // a payee that answers every offer with a genuine SDP, as a testnet wallet
+      const offers: SignalPlaintext[] = []
+      const payeeSignaler = hub.signaler(payee.identityKey)
+      const stop = await payeeSignaler.listen((from, e) => {
+        void (async () => {
+          const p = await openSignal(payee.wallet, from, e, {
+            me: payee.identityKey,
+            replay: new ReplayCache()
+          })
+          offers.push(p)
+          const { link, sdp } = await PeerLink.acceptOffer(p.sdp!, rtc)
+          rawLinks.push(link)
+          const answer = await sealSignal(payee.wallet, {
+            v: 1,
+            kind: 'answer',
+            sid: p.sid,
+            from: payee.identityKey,
+            to: from,
+            ts: Date.now(),
+            purpose: 'payment',
+            sdp,
+            chain: 'test'
+          })
+          await payeeSignaler.send(from, answer)
+        })().catch(() => undefined) // a failure here shows as the dial timing out
+      })
+      const sender = hubClient(hub, payer, { chain: 'main' })
+
+      const refused = await failure(sender.connect(payee.identityKey))
+      expect(refused).toMatchObject({ code: 'rejected', reason: 'wrong_network' })
+      expect(refused.message).toContain('test')
+      expect(acceptAnswer).not.toHaveBeenCalled()
+      // the offer named the payer's network
+      expect(offers.map(p => [p.kind, p.chain])).toEqual([['offer', 'main']])
+      await stop()
+    } finally {
+      acceptAnswer.mockRestore()
+    }
+  })
+
+  it('pays when both sides are on the same network, each signal naming it', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const payerSide = recordingSignaler(hub, payer)
+    const payeeSide = recordingSignaler(hub, payee)
+    await client(payee, { signaler: payeeSide.signaler, chain: 'main' }).startReceiving(
+      accepting(payee)
+    )
+    const sender = client(payer, { signaler: payerSide.signaler, chain: 'main' })
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+
+    const peer = await sender.connect(payee.identityKey)
+    expect(await sender.sendPayment(peer, token)).toMatchObject({ status: 'accepted', txid })
+    expect(payee.internalizeAction).toHaveBeenCalledTimes(1)
+
+    expect(payerSide.sent).toHaveLength(1)
+    expect(payeeSide.sent).toHaveLength(1)
+    const offer = await readSignal(payer, payee, payerSide.sent[0])
+    const answer = await readSignal(payee, payer, payeeSide.sent[0])
+    expect([offer.kind, offer.chain]).toEqual(['offer', 'main'])
+    expect([answer.kind, answer.chain]).toEqual(['answer', 'main'])
+  })
+
+  it('keeps the old behaviour when neither side names a network', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const payerSide = recordingSignaler(hub, payer)
+    const payeeSide = recordingSignaler(hub, payee)
+    await client(payee, { signaler: payeeSide.signaler }).startReceiving(accepting(payee))
+    const sender = client(payer, { signaler: payerSide.signaler })
+    const { token } = await makeToken(payer, payee.identityKey, 1000)
+
+    const peer = await sender.connect(payee.identityKey)
+    expect((await sender.sendPayment(peer, token)).status).toBe('accepted')
+
+    expect(payerSide.sent).toHaveLength(1)
+    expect(payeeSide.sent).toHaveLength(1)
+    const offer = await readSignal(payer, payee, payerSide.sent[0])
+    const answer = await readSignal(payee, payer, payeeSide.sent[0])
+    expect(offer.kind).toBe('offer')
+    expect(answer.kind).toBe('answer')
+    expect('chain' in offer).toBe(false)
+    expect('chain' in answer).toBe(false)
+  })
+
+  it('takes a network of 1 to 16 characters from a-z and 0-9', async () => {
+    const w = await makeWallet()
+    for (const chain of ['main', 'test', 'ttn', 'tstn', 'a'.repeat(16)]) {
+      expect(() => new DirectPayClient({ wallet: w.wallet, chain })).not.toThrow()
+    }
+    for (const chain of ['', 'Main', 'main-net', 'a'.repeat(17)]) {
+      expect(() => new DirectPayClient({ wallet: w.wallet, chain })).toThrow(TypeError)
+    }
   })
 })
 
