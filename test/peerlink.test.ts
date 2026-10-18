@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from '@jest/globals'
-import { FrameDecoder } from '../src/channel/frames.js'
+import { FrameDecoder, encodeMessage } from '../src/channel/frames.js'
 import { PeerLink } from '../src/channel/PeerLink.js'
 import type { PeerLinkOptions } from '../src/channel/PeerLink.js'
 import { sdpFingerprints } from '../src/codec/sdp.js'
@@ -235,6 +235,19 @@ describe('PeerLink over loopback', () => {
     expect((await bClosed)?.code).toBe('protocol')
   })
 
+  it('tells the peer its message was over the cap before closing with too_large (M14)', async () => {
+    const { a, b } = await connectPair({}, { maxMessageBytes: 65536 })
+    const reply = nextMessage(a)
+    const bClosed = closeOf(b)
+    a.send({ big: 'x'.repeat(100000) }).catch(() => undefined)
+    expect(await reply).toEqual({
+      t: 'error',
+      code: 'too_large',
+      message: 'Message exceeds 65536 bytes'
+    })
+    expect((await bClosed)?.code).toBe('too_large')
+  })
+
   it('applies setMaxMessageBytes to the messages that follow', async () => {
     const { a, b } = await connectPair({}, { maxMessageBytes: 1024 })
     b.setMaxMessageBytes(128 * 1024)
@@ -360,15 +373,34 @@ class FakeChannel extends EventTarget {
   }
 }
 
+/** An `a=fingerprint:` line of `bytes` bytes that are all `byte` (upper-case hex). */
+function fingerprintLine(byte: string, alg = 'sha-256', bytes = 32): string {
+  return `a=fingerprint:${alg} ${new Array<string>(bytes).fill(byte).join(':')}`
+}
+
+/** A minimal SDP with these lines. */
+function sdpWith(...lines: string[]): string {
+  return ['v=0', ...lines, ''].join('\r\n')
+}
+
+/** The fake connection's own fingerprint, as `sdpFingerprints` writes it. */
+const LOCAL_FINGERPRINT = `sha-256 ${'ab'.repeat(32)}`
+
 /** Just enough of RTCPeerConnection for an offerer link, with no network. */
 class FakePeerConnection extends EventTarget {
   static last: FakePeerConnection | undefined
   readonly channel = new FakeChannel()
   readonly config: RTCConfiguration
   readonly channelInit: (RTCDataChannelInit | undefined)[] = []
+  /** Descriptions given to setRemoteDescription. */
+  readonly remote: RTCSessionDescriptionInit[] = []
   connectionState: RTCPeerConnectionState = 'new'
+  signalingState: RTCSignalingState = 'stable'
   iceGatheringState: RTCIceGatheringState = 'complete'
-  localDescription = { type: 'offer', sdp: 'v=0\r\na=fingerprint:sha-256 AB:CD\r\n' }
+  localDescription: { type: string; sdp: string } | null = {
+    type: 'offer',
+    sdp: sdpWith(fingerprintLine('AB'))
+  }
 
   constructor(config: RTCConfiguration) {
     super()
@@ -382,19 +414,22 @@ class FakePeerConnection extends EventTarget {
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
-    return { type: 'offer', sdp: this.localDescription.sdp }
+    return { type: 'offer', sdp: this.localDescription?.sdp }
   }
 
   async createAnswer(): Promise<RTCSessionDescriptionInit> {
-    return { type: 'answer', sdp: this.localDescription.sdp }
+    return { type: 'answer', sdp: this.localDescription?.sdp }
   }
 
   async setLocalDescription(): Promise<void> {}
 
-  async setRemoteDescription(): Promise<void> {}
+  async setRemoteDescription(d: RTCSessionDescriptionInit): Promise<void> {
+    this.remote.push(d)
+  }
 
   close(): void {
     this.connectionState = 'closed'
+    this.signalingState = 'closed'
   }
 }
 
@@ -408,7 +443,7 @@ async function fakeOfferer(
   return { link, pc: FakePeerConnection.last! }
 }
 
-const FAKE_OFFER = 'v=0\r\na=fingerprint:sha-256 EF:01\r\n'
+const FAKE_OFFER = sdpWith(fingerprintLine('EF'))
 
 async function fakeAnswerer(): Promise<{ link: PeerLink; pc: FakePeerConnection }> {
   const { link } = await PeerLink.acceptOffer(FAKE_OFFER, {
@@ -443,7 +478,7 @@ describe('PeerLink with a fake peer connection', () => {
     expect(pc.channelInit).toEqual([{ ordered: true }])
     expect(pc.channel.binaryType).toBe('arraybuffer')
     expect(pc.channel.bufferedAmountLowThreshold).toBe(256 * 1024)
-    expect(link.localFingerprints()).toEqual(['sha-256 abcd'])
+    expect(link.localFingerprints()).toEqual([LOCAL_FINGERPRINT])
     expect(link.remoteFingerprints()).toEqual([])
     link.close()
 
@@ -581,8 +616,8 @@ describe('PeerLink with a fake peer connection', () => {
 
   it('opens an answerer whose channel is already open when it is announced', async () => {
     const { link, pc } = await fakeAnswerer()
-    expect(link.remoteFingerprints()).toEqual(['sha-256 ef01'])
-    expect(link.localFingerprints()).toEqual(['sha-256 abcd'])
+    expect(link.remoteFingerprints()).toEqual([`sha-256 ${'ef'.repeat(32)}`])
+    expect(link.localFingerprints()).toEqual([LOCAL_FINGERPRINT])
     pc.channel.readyState = 'open'
     announce(pc, pc.channel)
     await link.waitOpen(100)
@@ -625,5 +660,211 @@ describe('PeerLink with a fake peer connection', () => {
     await expect(fakeOfferer({ chunkBytes: 6 })).rejects.toThrow(RangeError)
     await expect(fakeOfferer({ maxMessageBytes: -1 })).rejects.toThrow(RangeError)
     expect(FakePeerConnection.last!.connectionState).toBe('closed')
+  })
+
+  it('answers a message over the cap with a too_large error and reads no more (M14)', async () => {
+    const deliver = (pc: FakePeerConnection, frame: Uint8Array): void => {
+      pc.channel.dispatchEvent(Object.assign(new Event('message'), { data: frame }))
+    }
+    const [first, second] = encodeMessage(0, { big: 'x'.repeat(1500) }, 1024)
+    const { link, pc } = await fakeOfferer({ maxMessageBytes: 1000 })
+    pc.channel.open()
+    const messages: unknown[] = []
+    link.onMessage(m => messages.push(m))
+    const closed = closeOf(link)
+    deliver(pc, first)
+    deliver(pc, second) // crosses the cap
+    deliver(pc, encodeMessage(1, { after: true }, 1024)[0])
+    await tick()
+    const decoder = new FrameDecoder({ maxMessageBytes: 1 << 20 })
+    expect(pc.channel.sent.map(f => decoder.push(f))).toEqual([
+      { t: 'error', code: 'too_large', message: 'Message exceeds 1000 bytes' }
+    ])
+    expect(link.isOpen).toBe(false)
+    // the peer hangs up once it has read the reply; the reason stays too_large
+    pc.channel.dispatchEvent(new Event('close'))
+    expect((await closed)?.code).toBe('too_large')
+    expect(messages).toEqual([])
+
+    // a peer that does not hang up is cut off a second later
+    const other = await fakeOfferer({ maxMessageBytes: 1000 })
+    other.pc.channel.open()
+    const started = Date.now()
+    const otherClosed = closeOf(other.link)
+    deliver(other.pc, first)
+    deliver(other.pc, second)
+    expect((await otherClosed)?.code).toBe('too_large')
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900)
+    expect(other.pc.connectionState).toBe('closed')
+  })
+
+  it('sends what it has gathered once gatherTimeoutMs passes without gathering completing (M16)', async () => {
+    class NeverGathers extends FakePeerConnection {
+      iceGatheringState: RTCIceGatheringState = 'gathering'
+    }
+    const Ctor = NeverGathers as unknown as typeof RTCPeerConnection
+    let started = Date.now()
+    const offered = await PeerLink.createOffer({ RTCPeerConnection: Ctor, gatherTimeoutMs: 150 })
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140)
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(offered.sdp).toBe(sdpWith(fingerprintLine('AB')))
+    offered.link.close()
+
+    started = Date.now()
+    const answered = await PeerLink.acceptOffer(FAKE_OFFER, {
+      RTCPeerConnection: Ctor,
+      gatherTimeoutMs: 150
+    })
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140)
+    expect(answered.sdp).toBe(sdpWith(fingerprintLine('AB')))
+    answered.link.close()
+  })
+
+  it('rejects a gatherTimeoutMs that setTimeout cannot wait for, before building anything', async () => {
+    FakePeerConnection.last = undefined
+    for (const gatherTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+      await expect(fakeOfferer({ gatherTimeoutMs })).rejects.toThrow(RangeError)
+      await expect(
+        PeerLink.acceptOffer(FAKE_OFFER, {
+          RTCPeerConnection: FakePeerConnection as unknown as typeof RTCPeerConnection,
+          gatherTimeoutMs
+        })
+      ).rejects.toThrow(RangeError)
+    }
+    expect(FakePeerConnection.last).toBeUndefined()
+  })
+
+  it('maps what the WebRTC stack throws to protocol, keeping it as the cause (M17)', async () => {
+    const boom = new DOMException('Invalid url', 'SyntaxError')
+    class ThrowsInConstructor extends FakePeerConnection {
+      constructor(config: RTCConfiguration) {
+        super(config)
+        throw boom
+      }
+    }
+    class ThrowsOnChannel extends FakePeerConnection {
+      createDataChannel(): FakeChannel {
+        throw boom
+      }
+    }
+    class ThrowsOnOffer extends FakePeerConnection {
+      async createOffer(): Promise<RTCSessionDescriptionInit> {
+        throw boom
+      }
+    }
+    class ThrowsOnAnswer extends FakePeerConnection {
+      async createAnswer(): Promise<RTCSessionDescriptionInit> {
+        throw boom
+      }
+    }
+    class ThrowsOnSetLocal extends FakePeerConnection {
+      async setLocalDescription(): Promise<void> {
+        throw boom
+      }
+    }
+    class NoLocalDescription extends FakePeerConnection {
+      localDescription = null
+    }
+    const offer = (Ctor: typeof FakePeerConnection): Promise<unknown> =>
+      PeerLink.createOffer({ RTCPeerConnection: Ctor as unknown as typeof RTCPeerConnection })
+    const answer = (Ctor: typeof FakePeerConnection): Promise<unknown> =>
+      PeerLink.acceptOffer(FAKE_OFFER, {
+        RTCPeerConnection: Ctor as unknown as typeof RTCPeerConnection
+      })
+    const steps: Array<[string, () => Promise<unknown>]> = [
+      ['constructor', () => offer(ThrowsInConstructor)],
+      ['createDataChannel', () => offer(ThrowsOnChannel)],
+      ['createOffer', () => offer(ThrowsOnOffer)],
+      ['setLocalDescription (offer)', () => offer(ThrowsOnSetLocal)],
+      ['createAnswer', () => answer(ThrowsOnAnswer)],
+      ['setLocalDescription (answer)', () => answer(ThrowsOnSetLocal)]
+    ]
+    for (const [step, run] of steps) {
+      const e = await run().then(
+        () => undefined,
+        (error: unknown) => error
+      )
+      expect([step, e instanceof WebRTPayError && e.code, (e as Error).cause]).toEqual([
+        step,
+        'protocol',
+        boom
+      ])
+    }
+    await expect(offer(NoLocalDescription)).rejects.toMatchObject({ code: 'protocol' })
+  })
+
+  it('maps a stack error to closed when the connection was closed under it', async () => {
+    class ClosedUnder extends FakePeerConnection {
+      async createOffer(): Promise<RTCSessionDescriptionInit> {
+        this.signalingState = 'closed'
+        throw new DOMException('The peer connection is closed', 'InvalidStateError')
+      }
+    }
+    await expect(
+      PeerLink.createOffer({
+        RTCPeerConnection: ClosedUnder as unknown as typeof RTCPeerConnection
+      })
+    ).rejects.toMatchObject({ code: 'closed', cause: expect.any(DOMException) })
+  })
+})
+
+describe('PeerLink fingerprint checks (audit F12)', () => {
+  const Fake = FakePeerConnection as unknown as typeof RTCPeerConnection
+  /** SDPs without exactly one sha-256 fingerprint of 32 bytes. */
+  const BAD: Array<[string, string]> = [
+    ['none', sdpWith()],
+    ['two sha-256', sdpWith(fingerprintLine('AB'), fingerprintLine('CD'))],
+    ['sha-256 and sha-1', sdpWith(fingerprintLine('AB'), fingerprintLine('CD', 'sha-1', 20))],
+    ['sha-1 only', sdpWith(fingerprintLine('CD', 'sha-1', 20))],
+    ['sha-256 too short', sdpWith(fingerprintLine('AB', 'sha-256', 2))],
+    ['sha-256 with a comma', sdpWith(fingerprintLine('AB', 'sha-256,x'))]
+  ]
+
+  it("refuses a peer's offer before the WebRTC stack sees it", async () => {
+    for (const [why, sdp] of BAD) {
+      FakePeerConnection.last = undefined
+      const e = await PeerLink.acceptOffer(sdp, { RTCPeerConnection: Fake }).then(
+        () => undefined,
+        (error: unknown) => error
+      )
+      expect([why, e instanceof WebRTPayError && e.code]).toEqual([why, 'protocol'])
+      expect((FakePeerConnection.last as FakePeerConnection | undefined)?.remote ?? []).toEqual([])
+    }
+  })
+
+  it("refuses a peer's answer before the stack sees it, leaving the link waiting for one", async () => {
+    const { link, pc } = await fakeOfferer()
+    for (const [why, sdp] of BAD) {
+      const code = await link.acceptAnswer(sdp).then(
+        () => 'accepted',
+        (e: unknown) => (e instanceof WebRTPayError ? e.code : String(e))
+      )
+      expect([why, code]).toEqual([why, 'protocol'])
+    }
+    expect(pc.remote).toEqual([])
+    expect(link.remoteFingerprints()).toEqual([])
+    await link.acceptAnswer(FAKE_OFFER)
+    expect(link.remoteFingerprints()).toEqual([`sha-256 ${'ef'.repeat(32)}`])
+    link.close()
+  })
+
+  it('refuses its own description when the stack wrote other than one sha-256 fingerprint', async () => {
+    for (const [why, sdp] of BAD) {
+      class Writes extends FakePeerConnection {
+        localDescription = { type: 'offer', sdp }
+      }
+      const Ctor = Writes as unknown as typeof RTCPeerConnection
+      for (const run of [
+        () => PeerLink.createOffer({ RTCPeerConnection: Ctor }),
+        () => PeerLink.acceptOffer(FAKE_OFFER, { RTCPeerConnection: Ctor })
+      ]) {
+        const e = await run().then(
+          () => undefined,
+          (error: unknown) => error
+        )
+        expect([why, e instanceof WebRTPayError && e.code]).toEqual([why, 'protocol'])
+        expect(FakePeerConnection.last!.connectionState).toBe('closed')
+      }
+    }
   })
 })

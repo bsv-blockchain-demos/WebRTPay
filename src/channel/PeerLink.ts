@@ -18,7 +18,10 @@ export interface RtcOptions {
    * `iceServers` and `iceTransportPolicy` here are ignored.
    */
   extraConfig?: Record<string, unknown>
-  /** Longest wait for ICE gathering before sending what was gathered; defaults to 5 s. */
+  /**
+   * Longest wait for ICE gathering before sending what was gathered: a positive number of
+   * milliseconds up to 2^31 − 1; defaults to 5 s.
+   */
   gatherTimeoutMs?: number
 }
 
@@ -34,6 +37,16 @@ export interface PeerLinkOptions extends RtcOptions {
 const MAX_BUFFERED_BYTES = 1024 * 1024
 /** Queued bytes at or below which the channel fires `bufferedamountlow`. */
 const LOW_WATER_BYTES = 256 * 1024
+/** Longest delay `setTimeout` honours. */
+const MAX_TIMER_MS = 2 ** 31 - 1
+/**
+ * How long a link that refused an oversize message stays up once its `too_large` reply is
+ * handed to the channel, unless the peer closes first: closing the connection at once can
+ * discard the reply before it is sent.
+ */
+const REFUSAL_LINGER_MS = 1000
+/** One fingerprint as `sdpFingerprints` writes it: SHA-256, 32 bytes of lower-case hex. */
+const SHA256_FINGERPRINT_ENTRY = /^sha-256 [0-9a-f]{64}$/
 
 type LinkEvents = {
   open: undefined
@@ -47,8 +60,18 @@ type LinkEvents = {
  *
  * Signaling is non-trickle: {@link createOffer} and {@link acceptOffer} return a complete
  * SDP once ICE gathering finishes or times out, so each side sends exactly one
- * description. The link closes, once, when either side calls {@link close}, the channel
- * or connection closes or fails, or the peer breaks the framing rules.
+ * description. Every SDP, local or remote, must carry exactly one DTLS fingerprint, a
+ * SHA-256 one, since the identity handshake signs the fingerprints each side sees (audit
+ * F12); anything else is refused with `protocol` before the WebRTC stack applies it. What
+ * the stack throws becomes a `WebRTPayError` with it as the `cause`: `protocol`, or `closed`
+ * when the connection was closed meanwhile.
+ *
+ * The link closes, once, when either side calls {@link close}, the channel or connection
+ * closes or fails, or the peer breaks the framing rules. A message over the cap is answered
+ * with `{ t: 'error', code: 'too_large' }` (the framing is still in step, as the cap is
+ * checked before a frame is buffered), so the peer can tell why; the link then reads
+ * nothing more and closes with `too_large` when the peer closes, or 1 s after the reply
+ * was handed to the channel.
  */
 export class PeerLink {
   private readonly pc: RTCPeerConnection
@@ -61,6 +84,9 @@ export class PeerLink {
   private remoteSdp: string | undefined
   private opened = false
   private closed = false
+  /** Why the link is refusing the peer (an oversize message): nothing more is read. */
+  private refused: WebRTPayError | undefined
+  private lingerTimer: ReturnType<typeof setTimeout> | undefined
   private closeReason: WebRTPayError | undefined
   private sendSeq = 0
   /** Tail of the send queue; never rejects, so one failed send cannot poison the next. */
@@ -90,15 +116,25 @@ export class PeerLink {
    * SDP to send to the peer. Apply the peer's answer with {@link acceptAnswer}.
    *
    * @throws `WebRTPayError('unsupported')` when no `RTCPeerConnection` is available;
-   * `RangeError` for invalid `chunkBytes` or `maxMessageBytes`.
+   * `WebRTPayError('protocol')` (the stack's error as its `cause`) when the peer connection
+   * refuses the configuration or cannot create the offer, or the offer does not have exactly
+   * one SHA-256 fingerprint; `RangeError` for invalid `chunkBytes`, `maxMessageBytes` or
+   * `gatherTimeoutMs`.
    */
   static async createOffer(o: PeerLinkOptions): Promise<{ link: PeerLink; sdp: string }> {
+    const gatherMs = gatherTimeout(o.gatherTimeoutMs)
     const pc = newPeerConnection(o)
     try {
       const link = new PeerLink(pc, 'offerer', o)
-      link.attach(pc.createDataChannel(CHANNEL_LABEL, { ordered: true }))
-      await pc.setLocalDescription(await pc.createOffer())
-      link.localSdp = await gatheredSdp(pc, o.gatherTimeoutMs ?? DEFAULTS.gatherTimeoutMs)
+      link.attach(
+        await fromStack(pc, 'create the data channel', () =>
+          pc.createDataChannel(CHANNEL_LABEL, { ordered: true })
+        )
+      )
+      await fromStack(pc, 'create an offer', async () =>
+        pc.setLocalDescription(await pc.createOffer())
+      )
+      link.localSdp = await gatheredSdp(pc, gatherMs)
       return { link, sdp: link.localSdp }
     } catch (e) {
       pc.close()
@@ -110,21 +146,27 @@ export class PeerLink {
    * Start a link as the answerer from the peer's offer SDP and return the answer SDP to
    * send back. The link takes the channel the offerer created when it arrives.
    *
-   * @throws `WebRTPayError('protocol')` when the peer connection refuses the offer;
-   * `WebRTPayError('unsupported')` when no `RTCPeerConnection` is available; `RangeError`
-   * for invalid `chunkBytes` or `maxMessageBytes`.
+   * @throws `WebRTPayError('protocol')` (the stack's error as its `cause`) for an offer
+   * without exactly one SHA-256 fingerprint, when the peer connection refuses the
+   * configuration or the offer, or cannot create an answer; `WebRTPayError('unsupported')`
+   * when no `RTCPeerConnection` is available; `RangeError` for invalid `chunkBytes`,
+   * `maxMessageBytes` or `gatherTimeoutMs`.
    */
   static async acceptOffer(
     offerSdp: string,
     o: PeerLinkOptions
   ): Promise<{ link: PeerLink; sdp: string }> {
+    const gatherMs = gatherTimeout(o.gatherTimeoutMs)
+    requireOneFingerprint(offerSdp, 'offer')
     const pc = newPeerConnection(o)
     try {
       const link = new PeerLink(pc, 'answerer', o)
       await applyRemote(pc, 'offer', offerSdp)
       link.remoteSdp = offerSdp
-      await pc.setLocalDescription(await pc.createAnswer())
-      link.localSdp = await gatheredSdp(pc, o.gatherTimeoutMs ?? DEFAULTS.gatherTimeoutMs)
+      await fromStack(pc, 'create an answer', async () =>
+        pc.setLocalDescription(await pc.createAnswer())
+      )
+      link.localSdp = await gatheredSdp(pc, gatherMs)
       return { link, sdp: link.localSdp }
     } catch (e) {
       pc.close()
@@ -136,15 +178,21 @@ export class PeerLink {
    * Apply the peer's answer SDP (offerer only, once). A refused answer leaves the link as
    * it was.
    *
-   * @throws `WebRTPayError('protocol')` on the answerer, for a second answer, or when the
-   * peer connection refuses the SDP; the close reason once the link is closed.
+   * @throws `WebRTPayError('protocol')` on the answerer, for a second answer, for an answer
+   * without exactly one SHA-256 fingerprint, or when the peer connection refuses the SDP;
+   * the close reason once the link is closed.
    */
   async acceptAnswer(answerSdp: string): Promise<void> {
     if (this.closed) throw this.closedError()
     if (this.role !== 'offerer' || this.remoteSdp !== undefined) {
       throw new WebRTPayError('protocol', 'Link is not waiting for an answer')
     }
-    await applyRemote(this.pc, 'answer', answerSdp)
+    requireOneFingerprint(answerSdp, 'answer')
+    try {
+      await applyRemote(this.pc, 'answer', answerSdp)
+    } catch (e) {
+      throw this.closed ? this.closedError() : e
+    }
     this.remoteSdp = answerSdp
   }
 
@@ -239,9 +287,9 @@ export class PeerLink {
     return this.remoteSdp === undefined ? [] : sdpFingerprints(this.remoteSdp)
   }
 
-  /** True while the data channel is open and the link has not closed. */
+  /** True while the data channel is open and the link is neither closed nor refusing the peer. */
   get isOpen(): boolean {
-    return this.opened && !this.closed
+    return this.opened && !this.closed && this.refused === undefined
   }
 
   /**
@@ -258,17 +306,20 @@ export class PeerLink {
   /**
    * Close the connection and report `reason` to {@link onClose} listeners. Pending sends
    * and waits reject with `reason`, or `closed` when there is none. Later calls do nothing.
+   * A link refusing an oversize message reports `too_large`, whatever closes it.
    */
   close(reason?: WebRTPayError): void {
     if (this.closed) return
     this.closed = true
-    this.closeReason = reason
+    clearTimeout(this.lingerTimer)
+    const why = this.refused ?? reason
+    this.closeReason = why
     try {
       this.pc.close()
     } catch {
       // already torn down; nothing left to release
     }
-    this.events.emit('close', reason)
+    this.events.emit('close', why)
     this.events.clear()
   }
 
@@ -319,7 +370,7 @@ export class PeerLink {
   }
 
   private receive(data: unknown): void {
-    if (this.closed) return
+    if (this.closed || this.refused !== undefined) return
     const frame = toBytes(data)
     if (!frame) {
       this.close(new WebRTPayError('protocol', 'Data channel message is not binary'))
@@ -329,14 +380,36 @@ export class PeerLink {
     try {
       message = this.decoder.push(frame)
     } catch (e) {
-      this.close(
+      const error =
         e instanceof WebRTPayError
           ? e
           : new WebRTPayError('protocol', 'Frame could not be processed', { cause: e })
-      )
+      if (error.code === 'too_large') this.refuseTooLarge(error)
+      else this.close(error)
       return
     }
     if (message !== undefined) this.events.emit('message', message)
+  }
+
+  /**
+   * Tell the peer its message is over the cap, then close with `error`. The decoder checks
+   * the cap before buffering a frame, so the stream is still in step and the reply is a
+   * well-formed message: a payer learns why its payment went nowhere (M14). The rest of the
+   * peer's message is ignored. Closing the connection right after handing the reply to the
+   * channel can discard it, so the link waits for the peer to close, at most 1 s.
+   */
+  private refuseTooLarge(error: WebRTPayError): void {
+    const canReply = this.isOpen
+    this.refused = error
+    const close = (): void => this.close(error)
+    if (!canReply) {
+      close()
+      return
+    }
+    const linger = (): void => {
+      if (!this.closed) this.lingerTimer = setTimeout(close, REFUSAL_LINGER_MS)
+    }
+    this.send({ t: 'error', code: 'too_large', message: error.message }).then(linger, close)
   }
 
   private async writeFrames(frames: Uint8Array[]): Promise<void> {
@@ -391,22 +464,71 @@ function newPeerConnection(o: RtcOptions): RTCPeerConnection {
     iceServers: (o.iceServers ?? []).map(server => ({ ...server }))
   }
   if (o.iceTransportPolicy !== undefined) config.iceTransportPolicy = o.iceTransportPolicy
-  return new Ctor(config)
-}
-
-async function applyRemote(
-  pc: RTCPeerConnection,
-  type: 'offer' | 'answer',
-  sdp: string
-): Promise<void> {
   try {
-    await pc.setRemoteDescription({ type, sdp })
+    return new Ctor(config)
   } catch (cause) {
-    throw new WebRTPayError('protocol', `Peer ${type} was refused`, { cause })
+    // e.g. a SyntaxError for an ICE server url the platform cannot parse
+    throw new WebRTPayError('protocol', 'Peer connection refused its configuration', { cause })
   }
 }
 
-/** Wait for ICE gathering to complete or time out, then read the full local SDP. */
+/** `gatherTimeoutMs`, or the default; a `RangeError` for a value `setTimeout` cannot wait for. */
+function gatherTimeout(ms: number | undefined): number {
+  if (ms === undefined) return DEFAULTS.gatherTimeoutMs
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0 || ms > MAX_TIMER_MS) {
+    throw new RangeError(`gatherTimeoutMs must be a positive number up to ${MAX_TIMER_MS}`)
+  }
+  return ms
+}
+
+/**
+ * Run `call` on the WebRTC stack. What it throws (a `DOMException` such as `SyntaxError` or
+ * `InvalidStateError`, or anything else) becomes a `WebRTPayError` with it as the `cause`:
+ * `closed` when the connection has been closed, `protocol` otherwise.
+ */
+async function fromStack<T>(
+  pc: RTCPeerConnection,
+  what: string,
+  call: () => T | Promise<T>
+): Promise<T> {
+  try {
+    return await call()
+  } catch (cause) {
+    if (cause instanceof WebRTPayError) throw cause
+    if (pc.signalingState === 'closed') {
+      throw new WebRTPayError('closed', `Peer connection closed before it could ${what}`, {
+        cause
+      })
+    }
+    throw new WebRTPayError('protocol', `Peer connection could not ${what}`, { cause })
+  }
+}
+
+/**
+ * Throws `protocol` unless `sdp` has exactly one `a=fingerprint:` line, a SHA-256 one of 32
+ * bytes. The identity handshake signs every fingerprint each side's SDPs carry, while a
+ * WebRTC stack may enforce only one of several (libdatachannel checks the first media-level
+ * line), so a signed list must be exactly what DTLS checks (audit F12).
+ */
+function requireOneFingerprint(sdp: string, which: 'offer' | 'answer' | 'local description'): void {
+  const fingerprints = sdpFingerprints(sdp)
+  if (fingerprints.length !== 1 || !SHA256_FINGERPRINT_ENTRY.test(fingerprints[0])) {
+    throw new WebRTPayError(
+      'protocol',
+      `The ${which} must carry exactly one sha-256 fingerprint; it has ${fingerprints.length}` +
+        (fingerprints.length === 1 ? ' of another kind' : '')
+    )
+  }
+}
+
+function applyRemote(pc: RTCPeerConnection, type: 'offer' | 'answer', sdp: string): Promise<void> {
+  return fromStack(pc, `apply the peer ${type}`, () => pc.setRemoteDescription({ type, sdp }))
+}
+
+/**
+ * Wait for ICE gathering to complete or time out, then read the full local SDP, which must
+ * carry exactly one SHA-256 fingerprint.
+ */
 async function gatheredSdp(pc: RTCPeerConnection, timeoutMs: number): Promise<string> {
   if (pc.iceGatheringState !== 'complete') {
     await new Promise<void>(resolve => {
@@ -423,7 +545,8 @@ async function gatheredSdp(pc: RTCPeerConnection, timeoutMs: number): Promise<st
     })
   }
   const sdp = pc.localDescription?.sdp
-  if (!sdp) throw new Error('Peer connection produced no local description')
+  if (!sdp) throw new WebRTPayError('protocol', 'Peer connection produced no local description')
+  requireOneFingerprint(sdp, 'local description')
   return sdp
 }
 

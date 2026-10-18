@@ -655,6 +655,25 @@ describe('authenticate over loopback', () => {
     expect(await closeOf(a)).toBe(unsent)
   })
 
+  it('caps messages at 64 KiB until the peer authenticates, whatever cap the link had (M12)', async () => {
+    const rtc = await nodeRtc()
+    // links on their own accept 32 MiB
+    const offered = await PeerLink.createOffer(rtc)
+    liveLinks.push(offered.link)
+    const answered = await PeerLink.acceptOffer(offered.sdp, rtc)
+    liveLinks.push(answered.link)
+    await offered.link.acceptAnswer(answered.sdp)
+    const A = party()
+    const B = party()
+    const outcome = rejectionCode(authenticate(offered.link, { wallet: A.wallet }))
+    const b = answered.link
+    await b.waitOpen(10000)
+    const hello = { t: 'hello', v: 1, identityKey: B.key, nonce: nonce() }
+    await b.send({ ...hello, pad: 'x'.repeat(PRE_AUTH_CAP) })
+    expect(await outcome).toBe('too_large')
+    expect((await closeOf(offered.link))?.code).toBe('too_large')
+  })
+
   it('rejects a maxMessageBytes that is not a size, leaving the link alone', async () => {
     const A = party()
     const { a } = await linkPair()

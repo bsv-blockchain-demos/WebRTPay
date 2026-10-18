@@ -9,6 +9,11 @@ import { AuthenticatedPeer, MAX_BACKLOG } from './AuthenticatedPeer.js'
 
 /** First line of every channel-binding transcript. */
 const BINDING_LABEL = 'webrtpay/1 channel-binding'
+/**
+ * Largest message accepted from the peer until its `auth` verifies (spec §4, Ruling 16):
+ * handshake messages are tiny, and an unauthenticated peer gets no more than this.
+ */
+const PRE_AUTH_MAX_MESSAGE_BYTES = 65536
 const NONCE_BYTES = 32
 /**
  * Most peer messages waiting while a handshake step awaits the wallet or the link, until
@@ -86,7 +91,7 @@ export interface AuthenticateOptions {
   timeoutMs?: number
   /**
    * Largest message accepted from the peer once it has authenticated; defaults to 32 MiB.
-   * Until then the link keeps the cap it was created with.
+   * Until then the link accepts at most 65536 bytes, whatever cap it was created with.
    */
   maxMessageBytes?: number
   /**
@@ -104,9 +109,10 @@ export interface AuthenticateOptions {
  *
  * Each side sends `hello` (identity key, fresh 32-byte nonce), then on the peer's hello an
  * `auth` signing {@link bindingTranscript} with `protocolID [2, 'webrtpay channel']`,
- * `keyID` its own nonce and `counterparty` the peer's key. Once the peer's `auth`
- * verifies, the link's cap rises to `maxMessageBytes` and this side sends `ready`. The
- * session is handed over when this side's check passed and the peer's `ready` arrived.
+ * `keyID` its own nonce and `counterparty` the peer's key. The link's message cap is set
+ * to 65536 bytes first thing; once the peer's `auth` verifies, it rises to
+ * `maxMessageBytes` and this side sends `ready`. The session is handed over when this
+ * side's check passed and the peer's `ready` arrived.
  *
  * Call it as soon as the link exists (before `waitOpen`), so the peer's hello cannot
  * arrive while nobody is listening.
@@ -117,7 +123,8 @@ export interface AuthenticateOptions {
  * than the handshake can have waiting (more than hello, auth and ready while this side is
  * still signing or verifying), or the wallet fails;
  * `WebRTPayError('timeout')` — link closed — after `timeoutMs`; the link's close reason
- * (or `closed`) when it closes first; `RangeError` for an invalid `maxMessageBytes`.
+ * (or `closed`) when it closes first, such as `too_large` for a message over 65536 bytes
+ * before the peer authenticated; `RangeError` for an invalid `maxMessageBytes`.
  */
 export function authenticate(link: PeerLink, o: AuthenticateOptions): Promise<AuthenticatedPeer> {
   const cap = o.maxMessageBytes ?? DEFAULTS.maxMessageBytes
@@ -154,6 +161,8 @@ class Handshake {
     private readonly resolve: (peer: AuthenticatedPeer) => void,
     private readonly reject: (error: unknown) => void
   ) {
+    // Before anything can arrive: only an authenticated peer gets the full message size.
+    link.setMaxMessageBytes(PRE_AUTH_MAX_MESSAGE_BYTES)
     // Listen before anything else: the link drops messages nobody is listening for.
     this.offMessage = link.onMessage(m => {
       // Messages wait here unchecked while a step is busy, so a peer that floods before it

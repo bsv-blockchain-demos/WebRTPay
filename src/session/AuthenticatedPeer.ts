@@ -116,6 +116,15 @@ export class AuthenticatedPeer {
     return this.link.onClose(fn)
   }
 
+  /**
+   * True while the session can still carry messages: the channel is open and neither side
+   * has closed it. Check it before spending when time has passed since `connect`, as a
+   * payee closes a session that sends nothing within its first-message timeout.
+   */
+  get isOpen(): boolean {
+    return this.link.isOpen && !this.failed
+  }
+
   /** Close the session and its connection; `reason` goes to {@link onClose} listeners. */
   close(reason?: WebRTPayError): void {
     this.link.close(reason)
