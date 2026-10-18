@@ -334,6 +334,8 @@ export class DirectPayClient {
     const run = async (): Promise<AuthenticatedPeer> => {
       await this.syncListening()
       const me = await this.getIdentityKey()
+      // a dial that has already failed spends no TURN credentials
+      if (failure !== undefined) throw failure
       const options = await this.linkOptions()
       if (failure !== undefined) throw failure
       const offered = await PeerLink.createOffer(options)
