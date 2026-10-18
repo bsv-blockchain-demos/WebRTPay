@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from '@jest/globals'
-import { PrivateKey, ProtoWallet, PublicKey } from '@bsv/sdk'
+import { PrivateKey } from '@bsv/sdk'
 import { PeerLink } from '../src/channel/PeerLink.js'
 import { decodeCode, encodeAnswerCode } from '../src/codec/codes.js'
 import { DirectPayClient } from '../src/client/DirectPayClient.js'
@@ -12,19 +12,17 @@ import type { AuthenticatedPeer } from '../src/session/AuthenticatedPeer.js'
 import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
 import { createMemoryHub } from '../src/signaling/MemorySignaler.js'
 import type { MemoryHub } from '../src/signaling/MemorySignaler.js'
+import { RelaySignaler } from '../src/signaling/RelaySignaler.js'
 import type { SignalEnvelope, Signaler } from '../src/signaling/types.js'
-import { PAYMENT_PROTOCOL_ID } from '../src/types.js'
-import type {
-  IncomingPayment,
-  IncomingPaymentRequest,
-  PaymentToken,
-  WalletLike
-} from '../src/types.js'
+import type { IncomingPayment, IncomingPaymentRequest, PaymentToken } from '../src/types.js'
 import { randomBytes, toBase64, toBase64Url } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
+import type { RelayServer } from '../server/index.js'
+import { relayFixtures, waitFor } from './helpers/relay.js'
 import { cleanupRtc, nodeRtc } from './helpers/rtc.js'
 import type { NodeRtcOptions } from './helpers/rtc.js'
-import { makePaymentTx } from './helpers/tx.js'
+import { makeToken, makeWallet } from './helpers/wallet.js'
+import type { TestWallet } from './helpers/wallet.js'
 
 // File scope so a filtered run (-t) still releases node-datachannel's native threads.
 afterAll(cleanupRtc)
@@ -43,24 +41,6 @@ afterEach(async () => {
   for (const link of rawLinks.splice(0)) link.close()
   await Promise.all(clients.splice(0).map(c => c.close()))
 })
-
-interface TestWallet {
-  wallet: WalletLike
-  identityKey: string
-  internalizeAction: ReturnType<typeof jest.fn<WalletLike['internalizeAction']>>
-}
-
-/** A ProtoWallet (real keys, signatures and encryption) with a jest-mocked internalizeAction. */
-async function makeWallet(): Promise<TestWallet> {
-  const internalizeAction = jest.fn<WalletLike['internalizeAction']>(async () => ({
-    accepted: true
-  }))
-  const wallet: WalletLike = Object.assign(new ProtoWallet(PrivateKey.fromRandom()), {
-    internalizeAction
-  })
-  const { publicKey } = await wallet.getPublicKey({ identityKey: true })
-  return { wallet, identityKey: publicKey, internalizeAction }
-}
 
 /** A client with loopback WebRTC and short timeouts, closed after the test. */
 function client(w: TestWallet, o: Partial<DirectPayClientOptions> = {}): DirectPayClient {
@@ -81,32 +61,6 @@ function hubClient(
   o: Partial<DirectPayClientOptions> = {}
 ): DirectPayClient {
   return client(w, { signaler: hub.signaler(w.identityKey), ...o })
-}
-
-/** A payer-built token paying `satoshis` to the payee's BRC-29 derived key at output 0. */
-async function makeToken(
-  payer: TestWallet,
-  payeeKey: string,
-  satoshis: number,
-  padBytes?: number
-): Promise<{ token: PaymentToken; txid: string }> {
-  const derivationPrefix = toBase64(randomBytes(32))
-  const derivationSuffix = toBase64(randomBytes(32))
-  const { publicKey } = await payer.wallet.getPublicKey({
-    protocolID: PAYMENT_PROTOCOL_ID,
-    keyID: `${derivationPrefix} ${derivationSuffix}`,
-    counterparty: payeeKey
-  })
-  const { beef, txid } = makePaymentTx(PublicKey.fromString(publicKey), satoshis, { padBytes })
-  return {
-    token: {
-      customInstructions: { derivationPrefix, derivationSuffix },
-      transaction: beef,
-      amount: satoshis,
-      outputIndex: 0
-    },
-    txid
-  }
 }
 
 function memorySeen(): SeenStore {
@@ -911,6 +865,161 @@ describe('DirectPayClient code exchange (no signaler)', () => {
 
     expect(constructed).toBe(1)
     offer.cancel()
+  })
+})
+
+// ---------------------------------------------------------------- ICE servers and relay
+
+/** RTC options whose peer connections record the ICE servers they are given, then use none. */
+function recordingRtc(): { rtc: NodeRtcOptions; seen: RTCIceServer[][] } {
+  const seen: RTCIceServer[][] = []
+  const Base = rtc.RTCPeerConnection
+  class Recording extends Base {
+    constructor(config?: RTCConfiguration) {
+      seen.push(config?.iceServers ?? [])
+      super({ ...config, iceServers: [] })
+    }
+  }
+  return { rtc: { ...rtc, RTCPeerConnection: Recording }, seen }
+}
+
+describe('DirectPayClient iceServersProvider (Ruling 27)', () => {
+  const stun: RTCIceServer = { urls: 'stun:stun.example:3478' }
+  const staleTurn: RTCIceServer = {
+    urls: ['turn:turn.example:3478'],
+    username: '1790000000:old',
+    credential: 'old'
+  }
+  const freshTurn: RTCIceServer = {
+    urls: ['turn:turn.example:3478'],
+    username: '1790000600:new',
+    credential: 'new'
+  }
+  const extra: RTCIceServer = { urls: ['stun:extra.example:3478'] }
+
+  it('is consulted before every gather and its servers win over rtc.iceServers with the same urls', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const recording = recordingRtc()
+    let calls = 0
+    const o: Partial<DirectPayClientOptions> = {
+      rtc: { ...recording.rtc, iceServers: [stun, staleTurn] },
+      chain: 'test',
+      iceServersProvider: async () => {
+        calls++
+        return [freshTurn, extra]
+      }
+    }
+    const receiver = hubClient(hub, payee, o)
+    await receiver.startReceiving(accepting(payee))
+    const sender = hubClient(hub, payer, o)
+
+    // the dial gathers on the payer, the answer on the payee
+    const peer = await sender.connect(payee.identityKey)
+    expect(calls).toBe(2)
+    peer.close()
+    const offer = await receiver.createOfferCode()
+    const answer = await sender.answerOfferCode(offer.code)
+    expect(calls).toBe(4)
+    expect(recording.seen).toEqual(Array(4).fill([stun, freshTurn, extra]))
+    answer.cancel()
+    offer.cancel()
+  })
+
+  it('falls back to rtc.iceServers when the provider fails, so the dial still connects', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const recording = recordingRtc()
+    const rtcWithStun = { ...recording.rtc, iceServers: [stun] }
+    const receiver = hubClient(hub, payee, {
+      rtc: rtcWithStun,
+      iceServersProvider: async () => {
+        throw new WebRTPayError('rate_limited', 'Relay rate limit reached')
+      }
+    })
+    await receiver.startReceiving(accepting(payee))
+    const sender = hubClient(hub, payer, {
+      rtc: rtcWithStun,
+      // a provider that throws before returning a promise
+      iceServersProvider: () => {
+        throw new Error('no relay configured')
+      }
+    })
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+    const peer = await sender.connect(payee.identityKey)
+    expect(await sender.sendPayment(peer, token)).toMatchObject({ status: 'accepted', txid })
+
+    // no list, or entries that are not ICE servers, count as nothing
+    const odd = client(payee, {
+      rtc: rtcWithStun,
+      chain: 'test',
+      iceServersProvider: async () => [
+        { url: 'stun:old.example' } as unknown as RTCIceServer,
+        extra
+      ]
+    })
+    const notAList = client(payee, {
+      rtc: rtcWithStun,
+      chain: 'test',
+      iceServersProvider: async () => 'stun:x' as unknown as RTCIceServer[]
+    })
+    ;(await odd.createOfferCode()).cancel()
+    ;(await notAList.createOfferCode()).cancel()
+    expect(recording.seen).toEqual([[stun], [stun], [stun, extra], [stun]])
+  })
+
+  it('gives up on a provider that has not answered after 5 s', async () => {
+    const payee = await makeWallet()
+    const recording = recordingRtc()
+    const c = client(payee, {
+      rtc: { ...recording.rtc, iceServers: [stun] },
+      chain: 'test',
+      iceServersProvider: () => new Promise<RTCIceServer[]>(() => {})
+    })
+    const started = Date.now()
+    const offer = await c.createOfferCode()
+    const waited = Date.now() - started
+    expect(waited).toBeGreaterThanOrEqual(4900)
+    expect(waited).toBeLessThan(9000)
+    expect(recording.seen).toEqual([[stun]])
+    offer.cancel()
+  })
+})
+
+describe('DirectPayClient over a relay (RelaySignaler, loopback WebRTC)', () => {
+  const fixtures = relayFixtures()
+  afterEach(fixtures.cleanup)
+
+  /** A RelaySignaler at `r` for `w`, closed after the test. */
+  function relaySignaler(r: RelayServer, w: TestWallet): RelaySignaler {
+    const s = new RelaySignaler({ url: r.url, wallet: w.wallet })
+    fixtures.defer(() => s.close())
+    return s
+  }
+
+  it('full DirectPayClient payment through RelaySignalers (Ruling 7)', async () => {
+    const r = await fixtures.relay()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const sessions: string[] = []
+    const receiver = client(payee, { signaler: relaySignaler(r, payee) })
+    await receiver.startReceiving({ ...accepting(payee), onSession: k => sessions.push(k) })
+    const sender = client(payer, { signaler: relaySignaler(r, payer) })
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+
+    const peer = await sender.connect(payee.identityKey)
+    expect(peer.peerIdentityKey).toBe(payee.identityKey)
+    const ack = await sender.sendPayment(peer, token, { note: 'over the relay' })
+
+    expect(ack).toEqual({ t: 'payment.ack', id: ack.id, status: 'accepted', txid })
+    expect(payee.internalizeAction).toHaveBeenCalledTimes(1)
+    const [args] = payee.internalizeAction.mock.calls[0]
+    expect(args.outputs[0].paymentRemittance?.senderIdentityKey).toBe(payer.identityKey)
+    expect(sessions).toEqual([payer.identityKey])
+    // the payer's signaler is held only while dialing
+    await waitFor(() => r.stats().identities === 1)
   })
 })
 

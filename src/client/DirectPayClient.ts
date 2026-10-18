@@ -60,6 +60,16 @@ export interface DirectPayClientOptions {
   /** How links build their `RTCPeerConnection` (STUN/TURN servers, implementation). */
   rtc?: RtcOptions
   /**
+   * Extra STUN/TURN servers, asked for before every ICE gather: dialing, answering an
+   * offer, creating an offer code and answering one. Suits short-lived TURN credentials
+   * such as `RelaySignaler.requestTurn`'s. They are used together with `rtc.iceServers`;
+   * where both list the same urls, the provider's entry wins. A provider that throws,
+   * rejects, resolves to something other than an array or has not resolved after 5 s is
+   * passed over, as are entries that are not ICE servers: the gather goes ahead with
+   * `rtc.iceServers` alone.
+   */
+  iceServersProvider?: () => Promise<RTCIceServer[]>
+  /**
    * The network this wallet is on, such as `'main'` or `'test'`. Offer codes carry it, and
    * answered offer codes must name it unless `expectedChain` says otherwise.
    */
@@ -135,6 +145,8 @@ const MAX_REJECT_REASON_CHARS = 200
 const MAX_ACK_REASON_CHARS = 500
 /** Most messages from one inbound peer waiting to be handled before the session is closed. */
 const MAX_PENDING_MESSAGES = 8
+/** Longest wait for `iceServersProvider` before gathering without its servers. */
+const ICE_SERVERS_PROVIDER_MS = 5000
 /** Ack reason when the handler failed in a way the payer should not see the details of. */
 const NOT_PROCESSED = 'The payee could not process the payment'
 const MAX_TIMER_MS = 2 ** 31 - 1
@@ -174,6 +186,7 @@ export class DirectPayClient {
   private readonly signaler: Signaler | undefined
   private readonly chain: string | undefined
   private rtc: RtcOptions
+  private readonly iceServersProvider: (() => Promise<RTCIceServer[]>) | undefined
   private readonly limits: InboundLimits
   private readonly limiter: InboundLimiter
   private readonly connectMs: number
@@ -205,6 +218,7 @@ export class DirectPayClient {
     this.signaler = o.signaler
     this.chain = o.chain
     this.rtc = { ...o.rtc }
+    this.iceServersProvider = o.iceServersProvider
     this.limits = { ...DEFAULT_INBOUND_LIMITS, ...definedFields(o.limits) }
     this.limiter = new InboundLimiter(this.limits)
     this.connectMs = timerMs(o.timeouts?.connectMs, DEFAULTS.connectTimeoutMs, 'connectMs')
@@ -320,8 +334,9 @@ export class DirectPayClient {
     const run = async (): Promise<AuthenticatedPeer> => {
       await this.syncListening()
       const me = await this.getIdentityKey()
+      const options = await this.linkOptions()
       if (failure !== undefined) throw failure
-      const offered = await PeerLink.createOffer(this.linkOptions())
+      const offered = await PeerLink.createOffer(options)
       link = offered.link
       this.adopt(link)
       if (failure !== undefined) throw failure
@@ -457,7 +472,7 @@ export class DirectPayClient {
         : Date.now() + timerMs(o.expiresInMs, 0, 'expiresInMs')
     const me = await this.getIdentityKey()
     const sid = randomBytes(SID_BYTES)
-    const { link, sdp } = await PeerLink.createOffer(this.linkOptions())
+    const { link, sdp } = await PeerLink.createOffer(await this.linkOptions())
     this.adopt(link)
     let code: string
     try {
@@ -541,7 +556,7 @@ export class DirectPayClient {
     if (offer.kind !== 'offer') {
       throw new WebRTPayError('invalid_code', 'This is an answer code, not an offer code')
     }
-    const { link, sdp } = await PeerLink.acceptOffer(offer.sdp, this.linkOptions())
+    const { link, sdp } = await PeerLink.acceptOffer(offer.sdp, await this.linkOptions())
     this.adopt(link)
     const connected = authenticate(link, {
       wallet: this.wallet,
@@ -689,7 +704,7 @@ export class DirectPayClient {
     }
     let link: PeerLink | undefined
     try {
-      const accepted = await PeerLink.acceptOffer(p.sdp, this.linkOptions())
+      const accepted = await PeerLink.acceptOffer(p.sdp, await this.linkOptions())
       link = accepted.link
       this.adopt(link)
       // The answer must go out within the connect budget; carriers like MessageBox can take
@@ -925,8 +940,29 @@ export class DirectPayClient {
 
   // ------------------------------------------------------------ helpers
 
-  private linkOptions(): PeerLinkOptions {
-    return { ...this.rtc, maxMessageBytes: PRE_AUTH_MAX_MESSAGE_BYTES }
+  /** Options for a new link: the RTC options with the provider's ICE servers merged in. */
+  private async linkOptions(): Promise<PeerLinkOptions> {
+    const provided = await this.providedIceServers()
+    const rtc = this.rtc
+    const iceServers =
+      provided.length === 0 ? rtc.iceServers : mergeIceServers(rtc.iceServers ?? [], provided)
+    return { ...rtc, iceServers, maxMessageBytes: PRE_AUTH_MAX_MESSAGE_BYTES }
+  }
+
+  /** The ICE servers `iceServersProvider` offers now; none when it is absent or fails. */
+  private async providedIceServers(): Promise<RTCIceServer[]> {
+    const provider = this.iceServersProvider
+    if (provider === undefined) return []
+    try {
+      const servers: unknown = await withDeadline(
+        Promise.resolve().then(provider),
+        ICE_SERVERS_PROVIDER_MS,
+        'The ICE servers provider did not answer in time'
+      )
+      return Array.isArray(servers) ? servers.filter(isIceServer) : []
+    } catch {
+      return [] // gather with rtc.iceServers alone; a dial never fails for this
+    }
   }
 
   /** Track a new link so {@link close} reaches it; a link made after close is closed. */
@@ -967,6 +1003,35 @@ function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T>
     timer = setTimeout(() => reject(new WebRTPayError('timeout', message)), ms)
   })
   return Promise.race([p, late]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * `base` then `extra`, one entry per set of urls: an entry replaces an earlier one with
+ * the same urls (in any order), so `extra` wins over `base`.
+ */
+function mergeIceServers(base: RTCIceServer[], extra: RTCIceServer[]): RTCIceServer[] {
+  const byUrls = new Map<string, RTCIceServer>()
+  for (const server of [...base, ...extra]) {
+    const urls = typeof server.urls === 'string' ? [server.urls] : [...server.urls]
+    const key = JSON.stringify(urls.sort())
+    byUrls.delete(key)
+    byUrls.set(key, server)
+  }
+  return [...byUrls.values()]
+}
+
+/** True for an `RTCIceServer`: string urls (one or more), and string credentials if any. */
+function isIceServer(x: unknown): x is RTCIceServer {
+  if (typeof x !== 'object' || x === null) return false
+  const { urls, username, credential } = x as Record<string, unknown>
+  const urlsOk =
+    typeof urls === 'string' ||
+    (Array.isArray(urls) && urls.length > 0 && urls.every(u => typeof u === 'string'))
+  return (
+    urlsOk &&
+    (username === undefined || typeof username === 'string') &&
+    (credential === undefined || typeof credential === 'string')
+  )
 }
 
 function truncate(s: string, max: number): string {
