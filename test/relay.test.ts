@@ -642,12 +642,36 @@ describe('relay', () => {
       await expect(signaler(url, alice).connect()).rejects.toMatchObject({
         code: 'peer_unreachable'
       })
-      await expect(signaler(url, alice).listen(() => {})).rejects.toMatchObject({
-        code: 'peer_unreachable'
-      })
       await expect(signaler(url, alice).send(bob.key, env())).rejects.toMatchObject({
         code: 'peer_unreachable'
       })
+      await expect(signaler(url, alice).requestTurn()).rejects.toMatchObject({
+        code: 'peer_unreachable'
+      })
+    })
+
+    it('keeps a listener subscribed while the relay is unreachable and connects once it is up', async () => {
+      const port = await freePort()
+      const states: string[] = []
+      const box = inbox()
+      const b = signaler(`ws://127.0.0.1:${port}`, bob, {
+        random: () => 0.1,
+        onStateChange: state => states.push(state)
+      })
+      // resolves although nothing listens on the port yet
+      const stop = await b.listen(box.fn)
+      expect(states).toEqual(['connecting', 'offline'])
+
+      const r = await relay({ port })
+      await waitFor(() => states.at(-1) === 'online')
+      expect(r.stats().identities).toBe(1)
+      const e = env()
+      await signaler(r, alice).send(bob.key, e)
+      expect(await box.next()).toEqual([alice.key, e])
+
+      await stop()
+      expect(states.at(-1)).toBe('offline')
+      await waitFor(() => r.stats().identities === 0)
     })
 
     it('reports empty ice servers when the relay has none configured', async () => {
@@ -707,8 +731,13 @@ describe('relay', () => {
  */
 class FakeSocket {
   static instances: FakeSocket[] = []
-  /** up: full protocol; down: fails to connect; silent: never challenges; mute: never replies to signals. */
-  static mode: 'up' | 'down' | 'silent' | 'mute' = 'up'
+  /**
+   * up: full protocol; down: fails to connect; silent: never challenges; mute: never replies
+   * to signals; confused: answers signals with `ice`, the reply to a `turn`.
+   */
+  static mode: 'up' | 'down' | 'silent' | 'mute' | 'confused' = 'up'
+  /** The servers a `turn` request is answered with. */
+  static turnServers: RTCIceServer[] = []
 
   readyState = 0
   readonly frames: Array<Record<string, unknown>> = []
@@ -747,6 +776,10 @@ class FakeSocket {
       if (frame.t === 'auth') {
         this.message({ t: 'ready', identityKey: frame.identityKey })
         this.message({ t: 'ice', iceServers: [] })
+      } else if (frame.t === 'turn') {
+        this.message({ t: 'ice', iceServers: FakeSocket.turnServers })
+      } else if (frame.t === 'signal' && FakeSocket.mode === 'confused') {
+        this.message({ t: 'ice', iceServers: [] })
       } else if (frame.t === 'signal' && FakeSocket.mode !== 'mute') {
         this.message({ t: 'sent', ref: (frame.envelope as SignalEnvelope).sid })
       }
@@ -764,7 +797,8 @@ class FakeSocket {
     this.finish(1006)
   }
 
-  private message(frame: unknown): void {
+  /** Deliver `frame` as if the relay had sent it. */
+  message(frame: unknown): void {
     if (this.readyState === 1) this.fire('message', { data: JSON.stringify(frame) })
   }
 
@@ -790,6 +824,7 @@ describe('RelaySignaler connection lifecycle', () => {
   beforeEach(() => {
     FakeSocket.instances = []
     FakeSocket.mode = 'up'
+    FakeSocket.turnServers = []
     jest.useFakeTimers()
   })
 
@@ -898,6 +933,110 @@ describe('RelaySignaler connection lifecycle', () => {
     await dropAfter(30000, 500) // stable again
 
     await stop()
+    await s.close()
+  })
+
+  it('resolves listen while the relay is down and keeps reconnecting with the jittered backoff', async () => {
+    FakeSocket.mode = 'down'
+    const states: string[] = []
+    const s = fake({ random: () => 0.5, onStateChange: state => states.push(state) })
+    const stop = await s.listen(() => {})
+    expect(FakeSocket.instances).toHaveLength(1)
+    expect(states).toEqual(['connecting', 'offline'])
+
+    // caps 2, 4 and 8 s after the first, second and third failure; drawn at half of each
+    for (const [i, cap] of [2000, 4000, 8000].entries()) {
+      if (i === 2) FakeSocket.mode = 'up'
+      await jest.advanceTimersByTimeAsync(cap / 2 - 1)
+      expect(FakeSocket.instances).toHaveLength(i + 1)
+      await jest.advanceTimersByTimeAsync(1)
+      expect(FakeSocket.instances).toHaveLength(i + 2)
+    }
+    await waitForFake(() => states.at(-1) === 'online')
+    expect(states).toEqual([
+      'connecting',
+      'offline',
+      'connecting',
+      'offline',
+      'connecting',
+      'offline',
+      'connecting',
+      'online'
+    ])
+
+    await stop()
+    await s.close()
+    expect(states.at(-1)).toBe('offline')
+  })
+
+  it('reports connecting, online and offline through onStateChange', async () => {
+    const states: string[] = []
+    const s = fake({
+      random: () => 0,
+      onStateChange: state => {
+        states.push(state)
+        throw new Error('a throwing callback changes nothing')
+      }
+    })
+    const stop = await s.listen(() => {})
+    expect(states).toEqual(['connecting', 'online'])
+    last().drop()
+    expect(states).toEqual(['connecting', 'online', 'offline'])
+    await waitForFake(() => states.length === 5)
+    expect(states.slice(3)).toEqual(['connecting', 'online'])
+
+    await stop() // the last listener: the connection is closed
+    expect(states).toHaveLength(6)
+    expect(states.at(-1)).toBe('offline')
+    await s.send(alice.key, env()) // a send opens a connection of its own and closes it again
+    expect(states.slice(6)).toEqual(['connecting', 'online', 'offline'])
+    await s.close()
+    expect(states).toHaveLength(9)
+  })
+
+  it('ends the connection with protocol when a reply does not match the request it answers', async () => {
+    const s = fake()
+    await s.connect()
+    FakeSocket.mode = 'confused'
+    await expect(s.send(alice.key, env())).rejects.toMatchObject({ code: 'protocol' })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(3)
+
+    // a reply that arrives with no request outstanding ends the connection too
+    FakeSocket.mode = 'up'
+    await s.send(alice.key, env())
+    expect(FakeSocket.instances).toHaveLength(2)
+    last().message({ t: 'sent' })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(3)
+    await s.send(alice.key, env())
+    expect(FakeSocket.instances).toHaveLength(3)
+    last().message({ t: 'error', code: 'rate_limited' })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(last().readyState).toBe(3)
+    await s.close()
+  })
+
+  it('drops TURN servers from iceServers() once their REST credentials have expired', async () => {
+    jest.setSystemTime(1_790_000_000_000)
+    const stun = { urls: ['stun:relay.test:3478'] }
+    const turn = (expiry: number): RTCIceServer => ({
+      urls: ['turn:relay.test:3478'],
+      username: `${expiry}:pseudonym`,
+      credential: 'c'
+    })
+    const unparsed = { urls: 'turns:relay.test:5349', username: 'static', credential: 'c' }
+    FakeSocket.turnServers = [stun, turn(1_790_000_060), unparsed]
+    const s = fake()
+    await s.connect()
+    expect(await s.requestTurn()).toEqual(FakeSocket.turnServers)
+    expect(s.iceServers()).toEqual(FakeSocket.turnServers)
+
+    await jest.advanceTimersByTimeAsync(59_999)
+    expect(s.iceServers()).toEqual(FakeSocket.turnServers)
+    // coturn refuses the credentials from their expiry second on
+    await jest.advanceTimersByTimeAsync(1)
+    expect(s.iceServers()).toEqual([stun, unparsed])
     await s.close()
   })
 

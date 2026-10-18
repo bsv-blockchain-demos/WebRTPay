@@ -11,12 +11,15 @@ import type { SignalEnvelope, Signaler } from './types.js'
 /** Domain separation for the relay authentication message. */
 export const RELAY_AUTH_PREFIX = 'webrtpay-relay/1|'
 
-/**
- * Why the relay refused a frame or a socket. `forbidden` refuses a `turn` request
- * from a socket that has not delivered a signal recently.
- */
+/** Why the relay refused a frame or a socket. */
 export type RelayErrorCode =
-  'offline' | 'rate_limited' | 'too_large' | 'bad_request' | 'auth_failed' | 'forbidden'
+  'offline' | 'rate_limited' | 'too_large' | 'bad_request' | 'auth_failed'
+
+/**
+ * Where the relay connection stands: being opened and authenticated, `online`
+ * (authenticated), or `offline` (none, or waiting to reconnect).
+ */
+export type RelayConnectionState = 'connecting' | 'online' | 'offline'
 
 /** An ICE server as the relay hands it out. */
 export interface RelayIceServer {
@@ -73,6 +76,8 @@ export interface RelaySignalerOptions {
   WebSocket?: typeof WebSocket
   /** Called with the ICE servers the relay hands out on every (re)connection and `requestTurn`. */
   onIceServers?: (servers: RTCIceServer[]) => void
+  /** Called whenever the connection state changes; see {@link RelayConnectionState}. */
+  onStateChange?: (state: RelayConnectionState) => void
   /** Source of reconnect jitter, uniform in [0, 1); defaults to `Math.random`. */
   random?: () => number
 }
@@ -91,17 +96,15 @@ const STABLE_MS = 30000
 const MAX_NONCE_CHARS = 256
 const CLOSED = 3
 const RELAY_URL_RE = /^wss?:\/\/[^/?#\s]+/i
+/** A coturn REST username, `<unix expiry seconds>:<user>`. */
+const TURN_REST_USERNAME_RE = /^(\d{1,15}):/
 
 const RELAY_ERRORS: Record<RelayErrorCode, [WebRTPayErrorCode, string]> = {
   offline: ['peer_unreachable', 'Peer is not connected to the relay'],
   rate_limited: ['rate_limited', 'Relay rate limit reached'],
   too_large: ['too_large', 'Signal envelope is too large for the relay'],
   bad_request: ['protocol', 'Relay rejected the frame as malformed'],
-  auth_failed: ['auth_failed', 'Relay authentication failed'],
-  forbidden: [
-    'rejected',
-    'Relay issues TURN credentials only to a connection that recently delivered a signal'
-  ]
+  auth_failed: ['auth_failed', 'Relay authentication failed']
 }
 
 /**
@@ -112,15 +115,17 @@ const RELAY_ERRORS: Record<RelayErrorCode, [WebRTPayErrorCode, string]> = {
  * subscription exists, while a `send` is in flight, or after an explicit
  * `connect()`. Otherwise it is closed, so the relay reports this identity as
  * offline and a peer's `send` fails fast with `peer_unreachable`. While
- * listening, a dropped connection is reopened after a random delay below a cap
- * (full jitter, so clients that lost the relay together do not return together).
- * The cap is 1 s after a connection that stayed authenticated for 30 s, and
- * doubles per attempt that failed or dropped sooner, up to 30 s.
+ * listening, a connection that could not be opened or dropped is reopened after a
+ * random delay below a cap (full jitter, so clients that lost the relay together
+ * do not return together). The cap is 1 s after a connection that stayed
+ * authenticated for 30 s, and doubles per attempt that failed or dropped sooner,
+ * up to 30 s. `onStateChange` follows it.
  *
  * Failures reject `WebRTPayError`: `peer_unreachable` (relay unreachable, the
  * connection dropped, or the peer is offline), `auth_failed`, `rate_limited`
- * (also for too many sockets for this identity), `too_large`, `protocol`,
- * `rejected` (TURN refused, see `requestTurn`) and, after `close()`, `closed`.
+ * (also for too many sockets for this identity), `too_large`, `protocol` (also
+ * for a reply that does not match its request, which ends the connection) and,
+ * after `close()`, `closed`.
  */
 export class RelaySignaler implements Signaler {
   private readonly url: string
@@ -128,6 +133,7 @@ export class RelaySignaler implements Signaler {
   private readonly originator: string | undefined
   private readonly WS: typeof WebSocket
   private readonly onIceServers: ((servers: RTCIceServer[]) => void) | undefined
+  private readonly onStateChange: ((state: RelayConnectionState) => void) | undefined
   private readonly random: () => number
   private readonly subs = new Set<SignalSubscription>()
   private conn: RelayConnection | undefined
@@ -138,6 +144,7 @@ export class RelaySignaler implements Signaler {
   private failures = 0
   private timer: ReturnType<typeof setTimeout> | undefined
   private closing: Promise<void> | undefined
+  private state: RelayConnectionState = 'offline'
 
   constructor(o: RelaySignalerOptions) {
     if (typeof o.url !== 'string' || !RELAY_URL_RE.test(o.url)) {
@@ -152,6 +159,7 @@ export class RelaySignaler implements Signaler {
     this.originator = o.originator
     this.WS = WS
     this.onIceServers = o.onIceServers
+    this.onStateChange = o.onStateChange
     this.random = o.random ?? Math.random
   }
 
@@ -168,6 +176,7 @@ export class RelaySignaler implements Signaler {
       this.subs.clear()
       const conn = this.conn
       this.conn = undefined
+      this.setState('offline')
       this.closing = conn?.close(closedError()) ?? Promise.resolve()
     }
     return this.closing
@@ -175,10 +184,14 @@ export class RelaySignaler implements Signaler {
 
   /**
    * The ICE servers the relay handed out most recently, on connecting (STUN only) or
-   * on `requestTurn`; undefined before the first connection.
+   * on `requestTurn`, without TURN servers whose credentials have expired (the expiry
+   * is the Unix seconds before the `:` of a coturn REST username); undefined before
+   * the first connection.
    */
   iceServers(): RTCIceServer[] | undefined {
-    return this.ice === undefined ? undefined : copyIceServers(this.ice)
+    if (this.ice === undefined) return undefined
+    const now = Date.now()
+    return copyIceServers(this.ice.filter(s => !turnExpired(s, now)))
   }
 
   /** Forward `e` to every socket of `to`; resolves once the relay confirms. */
@@ -196,11 +209,11 @@ export class RelaySignaler implements Signaler {
   /**
    * Ask the relay for TURN credentials. Resolves with its full ICE server list
    * (STUN, then TURN), which `iceServers()` returns from then on; a relay without
-   * TURN answers with its STUN servers only. The relay issues credentials only on
-   * a connection that delivered a signal (a `send` resolved) in the last 5 minutes,
-   * so call it while listening, after sending an offer; otherwise it rejects
-   * `rejected`. It rejects `rate_limited` when the relay's hourly budget for this
-   * address, or in total, is spent.
+   * TURN answers with its STUN servers only. It rejects `rate_limited` when the
+   * relay's hourly budget for this address, or in total, is spent. Suits
+   * `DirectPayClient`'s `iceServersProvider`; as every call spends one of this
+   * address's credentials (6 an hour by default), a provider may return
+   * `iceServers()` instead while that still holds a TURN server.
    */
   async requestTurn(): Promise<RTCIceServer[]> {
     this.inFlight++
@@ -213,18 +226,25 @@ export class RelaySignaler implements Signaler {
     }
   }
 
-  /** Subscribe; resolves once the connection is authenticated and rejects if it cannot be. */
+  /**
+   * Subscribe. Resolves once the connection is authenticated or, when the relay
+   * cannot be reached or refuses it, once that attempt has failed: the subscription
+   * stays, and the connection is retried in the background until it opens or the
+   * last subscription ends (see `onStateChange`). While a retry is already waiting,
+   * it resolves at once. Rejects only `closed`, after `close()`.
+   */
   async listen(fn: (from: PubKeyHex, e: SignalEnvelope) => void): Promise<() => Promise<void>> {
     if (this.closing !== undefined) throw closedError()
     const sub: SignalSubscription = { fn }
     this.subs.add(sub)
-    try {
-      await this.open()
-    } catch (err) {
-      this.subs.delete(sub)
-      void this.release()
-      throw err
+    if (this.timer === undefined) {
+      try {
+        await this.open()
+      } catch {
+        // retried in the background while subscribed
+      }
     }
+    if (this.closing !== undefined) throw closedError()
     return async () => {
       if (this.subs.delete(sub)) await this.release()
     }
@@ -248,9 +268,13 @@ export class RelaySignaler implements Signaler {
         this.ice = servers
         this.onIceServers?.(copyIceServers(servers))
       },
+      onOpen: () => {
+        if (this.conn === conn) this.setState('online')
+      },
       onEnd: openedAt => this.ended(conn, openedAt)
     })
     this.conn = conn
+    this.setState('connecting')
     conn.open()
     return conn
   }
@@ -263,6 +287,7 @@ export class RelaySignaler implements Signaler {
   private ended(conn: RelayConnection, openedAt: number | undefined): void {
     if (this.conn !== conn) return
     this.conn = undefined
+    this.setState('offline')
     if (openedAt !== undefined && Date.now() - openedAt >= STABLE_MS) this.failures = 0
     else this.failures++
     if (this.closing !== undefined || this.subs.size === 0) return
@@ -283,12 +308,23 @@ export class RelaySignaler implements Signaler {
     const conn = this.conn
     this.conn = undefined
     if (conn === undefined) return Promise.resolve()
+    this.setState('offline')
     return conn.close(new WebRTPayError('closed', 'Relay connection is no longer needed'))
   }
 
   private clearTimer(): void {
     if (this.timer !== undefined) clearTimeout(this.timer)
     this.timer = undefined
+  }
+
+  private setState(state: RelayConnectionState): void {
+    if (this.state === state) return
+    this.state = state
+    try {
+      this.onStateChange?.(state)
+    } catch {
+      // a faulty callback must not break signaling
+    }
   }
 }
 
@@ -299,6 +335,8 @@ interface ConnectionHooks {
   originator: string | undefined
   onSignal(from: PubKeyHex, e: SignalEnvelope): void
   onIce(servers: RTCIceServer[]): void
+  /** Called once when the handshake has completed. */
+  onOpen(): void
   /**
    * Called once when the connection ends, with the time (Unix milliseconds) its
    * handshake completed, or undefined when it never did.
@@ -306,7 +344,11 @@ interface ConnectionHooks {
   onEnd(openedAt: number | undefined): void
 }
 
-/** A frame awaiting its reply; the relay answers frames in order. */
+/**
+ * A frame awaiting its reply. The relay answers frames in order, so a reply of the
+ * wrong kind for the head of the queue, or one with nothing queued, ends the
+ * connection rather than being matched to a later frame.
+ */
 interface Pending {
   /** The reply that completes it; `error` rejects either kind. */
   expects: 'sent' | 'ice'
@@ -443,23 +485,26 @@ class RelayConnection {
         return
       case 'ice': {
         if (this.stage !== 'ice' && this.stage !== 'open') return
+        // after the handshake an `ice` only ever answers a `turn` request
+        if (this.stage === 'open' && !this.replyMatches('ice')) return
         const servers = iceServersOf(f.iceServers)
-        const turn = this.stage === 'open' && this.pending[0]?.expects === 'ice'
         if (servers === undefined) {
-          // fails the handshake or the turn request it answers; an unasked one is ignored
+          // fails the handshake or the turn request it answers
           const err = new WebRTPayError('protocol', 'Relay sent bad ICE servers')
           if (this.stage === 'ice') this.end(err)
-          else if (turn) this.pending.shift()?.reject(err)
+          else this.pending.shift()?.reject(err)
           return
         }
         this.h.onIce(servers)
-        if (turn) this.pending.shift()?.resolve(servers)
-        if (this.stage === 'ice') {
-          this.stage = 'open'
-          this.openedAt = Date.now()
-          clearTimeout(this.handshakeTimer)
-          this.settle()
+        if (this.stage === 'open') {
+          this.pending.shift()?.resolve(servers)
+          return
         }
+        this.stage = 'open'
+        this.openedAt = Date.now()
+        clearTimeout(this.handshakeTimer)
+        this.h.onOpen()
+        this.settle()
         return
       }
       case 'signal':
@@ -468,17 +513,29 @@ class RelayConnection {
         }
         return
       case 'sent':
-        if (this.stage === 'open' && this.pending[0]?.expects === 'sent') {
+        if (this.stage === 'open' && this.replyMatches('sent')) {
           this.pending.shift()?.resolve(undefined)
         }
         return
       case 'error': {
         const err = relayError(f.code)
-        if (this.stage === 'open') this.pending.shift()?.reject(err)
-        else this.end(err)
+        if (this.stage !== 'open') this.end(err)
+        else if (this.replyMatches('error')) this.pending.shift()?.reject(err)
         return
       }
     }
+  }
+
+  /**
+   * Whether a reply of `kind` answers the oldest frame still waiting (an `error`
+   * answers either kind). Otherwise the relay and this client disagree on which frame
+   * a reply belongs to, so the connection ends with `protocol`.
+   */
+  private replyMatches(kind: 'sent' | 'ice' | 'error'): boolean {
+    const head = this.pending[0]
+    if (head !== undefined && (kind === 'error' || head.expects === kind)) return true
+    this.end(new WebRTPayError('protocol', `Relay sent a '${kind}' reply out of order`))
+    return false
   }
 
   private answer(nonce: unknown): void {
@@ -569,6 +626,14 @@ function iceServersOf(x: unknown): RTCIceServer[] | undefined {
     out.push(server)
   }
   return out
+}
+
+/** True for a TURN server whose coturn REST username says its credentials have expired. */
+function turnExpired(server: RTCIceServer, now: number): boolean {
+  const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
+  if (!urls.some(u => /^turns?:/i.test(u))) return false
+  const expiry = TURN_REST_USERNAME_RE.exec(server.username ?? '')
+  return expiry !== null && now >= Number(expiry[1]) * 1000
 }
 
 function copyIceServers(servers: RTCIceServer[]): RTCIceServer[] {
