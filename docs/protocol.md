@@ -387,7 +387,7 @@ exactly the cap is accepted.
 
 | When | Cap |
 | --- | --- |
-| A link in the identity handshake (`authenticate` sets it first), until the peer authenticates | 65536 bytes |
+| A link in the identity handshake (`DirectPayClient` creates its links with it, `authenticate` sets it first), until the peer authenticates | 65536 bytes |
 | After the peer's `auth` verifies, on the payee (inbound sessions and offer codes) | 16 MiB (`limits.maxMessageBytes`) |
 | After the peer's `auth` verifies, on the payer (`connect`, `answerOfferCode`) | 32 MiB (`maxMessageBytes`) |
 | A `PeerLink` used on its own | 32 MiB unless set |
@@ -840,15 +840,17 @@ Each client frame gets exactly one reply, in the order the frames were sent.
   24576-character ciphertext), so any signal §7 allows, a 16384-character SDP included, fits;
   only a sid or ciphertext of multi-byte characters can exceed it.
 - The relay forwards `{ t: 'signal', from, envelope: { v: 1, sid, ciphertext } }` (other fields
-  dropped) to every socket of `to`, within two budgets: the sender's own share of `to`, 6 signals
-  a minute from one sender identity (checked first), and `to`'s total, 120 a minute from all
-  senders together. A spent share gets `rate_limited` with `ref`. It replies `sent` when at
-  least one socket took it, otherwise `offline` (`to` is not connected, no socket took it, or
-  its total is spent). Budgets are spent only for a signal delivered.
-- The shares stop one identity from making a recipient unreachable. Identities are free,
-  though: one address may hold 20 sockets, each a fresh identity with its own share, and 20 × 6
-  a minute is the whole total of 120. Spending it that way takes 20 sockets from one address
-  held for as long as it lasts.
+  dropped) to every socket of `to`, within two budgets: the sender address's share of `to`, 6
+  signals a minute from one source address group (an IPv4 address or an IPv6 /64, whatever
+  identities connect from it; checked first), and `to`'s total, 120 a minute from all senders
+  together. A spent share gets `rate_limited` with `ref`. It replies `sent` when at least one
+  socket took it, otherwise `offline` (`to` is not connected, no socket took it, or its total
+  is spent). Budgets are spent only for a signal delivered.
+- The shares stop one address from making a recipient unreachable. They are per address, not
+  per identity, because identities are free and addresses are not: fresh identities from one
+  address share one share, so at the defaults spending the whole total takes 20 addresses. The
+  cost is that users behind one carrier-grade NAT address share 6 signals a minute toward one
+  recipient; `SIGNALS_PER_PAIR_PER_MINUTE` raises it.
 
 `turn`:
 

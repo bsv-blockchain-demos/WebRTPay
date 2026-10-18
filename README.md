@@ -63,7 +63,8 @@ import {
   DirectPayClient,
   MessageBoxSignaler,
   WebRTPayError,
-  acceptDirectPayment
+  acceptDirectPayment,
+  verifyDirectPayment
 } from '@bsv/webrtpay'
 
 const originator = 'wallet.example.com'
@@ -76,22 +77,34 @@ const client = new DirectPayClient({
 })
 
 // Yours: `seen`, a durable SeenStore (has/add), is what makes a re-delivered payment harmless;
-// `retryStore` is a durable store with a cap for payments to internalize later; `isTransient`
-// says whether a wallet failure will pass (wallet locked, storage, IPC or network down).
+// `retryStore` is a durable store of payments to internalize later, with `size` and `keep`;
+// `isTransient` says whether a wallet failure will pass (wallet locked, storage, IPC or
+// network down).
+const MAX_KEPT = 50
+
 await client.startReceiving({
   async onPayment(p) {
+    // 1. Check that output p.token.outputIndex pays this wallet's BRC-29 key for p.sender.
     try {
-      // Checks that output p.token.outputIndex pays this wallet's BRC-29 key for p.sender,
-      // then internalizes it once.
-      await acceptDirectPayment(wallet, p, { originator, seen })
-      return 'accepted'
+      await verifyDirectPayment(wallet, p, { originator })
     } catch (e) {
       // malformed, or it does not pay this wallet: nothing was stored
       if (e instanceof WebRTPayError && e.code === 'invalid_payment') {
         return { status: 'rejected', reason: e.message }
       }
-      // it verified, but the wallet cannot take it right now: keep it, never refuse it
-      if (isTransient(e)) {
+      throw e // not checked yet (wallet failure): acked 'rejected', the payer keeps its token
+    }
+    // 2. It verified, so it is never refused. Internalize it once.
+    try {
+      await acceptDirectPayment(wallet, p, {
+        originator,
+        seen,
+        onSeenError: e => console.warn('payment taken but not recorded as seen', e)
+      })
+      return 'accepted'
+    } catch (e) {
+      // the wallet cannot take it right now: keep it (up to the cap) and retry locally
+      if (isTransient(e) && retryStore.size < MAX_KEPT) {
         await retryStore.keep(p)
         return 'received'
       }
@@ -104,14 +117,15 @@ await client.startReceiving({
 
 `p.sender` is the identity key the payer proved in the handshake. By the time a payment arrives
 the payer has usually broadcast it, so a payment that verifies is never refused: when only
-internalizing fails for a passing reason, keep it, retry locally and return `'received'`. Keep
-only such failures, in a store with a cap: a wallet's argument or proof errors (a BEEF it cannot
-verify fails with `WERR_INVALID_PARAMETER`, say) do not pass, and keeping those would let anyone
-fill the store. A handler that throws makes the ack `rejected`. `acceptDirectPayment` reports a
-payment the wallet took as `accepted` even when `seen.add` fails afterwards (`onSeenError`
-hears about it). Receiving answers offers automatically within the inbound limits (3 sessions,
-1 per sender, 10 offers a minute, 3 per sender); see
-[Security and privacy](#security-and-privacy) before turning it on for users.
+internalizing fails for a passing reason, keep it, retry locally and return `'received'`. Call
+`verifyDirectPayment` first and keep only failures after it: a failure before it says nothing
+about the payment, and keeping those would let anyone fill the store. Keep them in a store with
+a cap, and only for failures that pass: a wallet's argument or proof errors (a BEEF it cannot
+verify fails with `WERR_INVALID_PARAMETER`, say) do not. A handler that throws makes the ack
+`rejected`. `acceptDirectPayment` reports a payment the wallet took as `accepted` even when
+`seen.add` fails afterwards (`onSeenError` hears about it). Receiving answers offers
+automatically within the inbound limits (3 sessions, 1 per sender, 10 offers a minute, 3 per
+sender); see [Security and privacy](#security-and-privacy) before turning it on for users.
 
 ### Pay (payer)
 
@@ -119,8 +133,8 @@ Connect first, then create the transaction: if the payee cannot be reached, noth
 payee that answered the dial waits 60 s (its `firstMessageTimeoutMs`) for the payment before it
 hangs up, and creating and broadcasting the transaction, permission prompts included, has to
 fit in that window. So have the user confirm before `connect`, sign the transaction without
-broadcasting it (`noSend`), check that the session is still open, then broadcast and send at
-once.
+broadcasting it (`noSend`), check that the session is still open (dial again if it is not),
+then broadcast and send at once.
 
 ```ts
 import { P2PKH, PublicKey } from '@bsv/sdk'
@@ -132,7 +146,7 @@ import type { PaymentTokenInput } from '@bsv/webrtpay'
 
 // 1. Dial and authenticate (30 s budget). Rejects peer_unreachable, rejected ('busy',
 //    'not_receiving'), rate_limited, timeout or auth_failed.
-const peer = await client.connect(payeeKey)
+let peer = await client.connect(payeeKey)
 
 // 2. Build the payment as PeerPay does, P2PKH to the payee's BRC-29 key for a fresh
 //    derivation, and sign it without broadcasting it.
@@ -164,9 +178,9 @@ const token: PaymentTokenInput = {
 validatePaymentToken(token) // what the payee checks short of its own key: invalid_payment
 
 // 3. Broadcast only while the payee is still there, then deliver and wait for its ack (45 s).
-if (!peer.isOpen) {
-  // the payee hung up: connect again before broadcasting, or abort the action
-}
+//    If it hung up meanwhile, dial again first: nothing has been broadcast, so the same token
+//    still serves, and a dial that fails throws before anything goes out.
+if (!peer.isOpen) peer = await client.connect(payeeKey)
 await wallet.createAction(
   { description: 'Direct payment', options: { sendWith: [txid!] } },
   originator
@@ -216,7 +230,8 @@ if (await confirmWithUser(preview.identityKey, preview.amount)) {
   const answer = await client.answerOfferCode(text) // ICE and the connect timer start here
   showQr(answer.answerCode)
   const peer = await answer.connected // the payee proved preview.identityKey
-  // prepare, check peer.isOpen, broadcast and send as in Pay; on giving up, answer.cancel()
+  // prepare as in Pay; if peer.isOpen is false, broadcast nothing and start over with new
+  // codes (a code exchange cannot be redialed); on giving up, answer.cancel()
   const ack = await client.sendPayment(peer, token)
 }
 ```
@@ -470,7 +485,7 @@ can send any value and choose its own per-source limits.
 | `CONNECTIONS_PER_48_PER_MINUTE` | `120` | New connections all the IPv6 sources of one /48 may open a minute. |
 | `MAX_SOCKETS` | `10000` | Sockets the relay holds. |
 | `MAX_UNAUTHENTICATED_SOCKETS` | `1000` | Sockets not yet authenticated the relay holds. |
-| `SIGNALS_PER_PAIR_PER_MINUTE` | `6` | Signals one sender identity may send one recipient a minute. |
+| `SIGNALS_PER_PAIR_PER_MINUTE` | `6` | Signals all the identities behind one source address (an IPv4 address or an IPv6 /64) may send one recipient a minute, together. |
 | `SIGNALS_PER_RECIPIENT_PER_MINUTE` | `120` | Signals one recipient may receive a minute from all senders. |
 | `MAX_OVER_RATE_FRAMES` | `20` | Frames over the socket rate answered in a row before the socket is closed. |
 
@@ -488,10 +503,12 @@ can send any value and choose its own per-source limits.
   answered `rate_limited` (pings get no pong) until 20 have come in a row; the next closes the
   socket with 1008, so a client that floods, reading the replies or not, is cut off.
 - An identity may hold 5 sockets and receive 120 signals a minute from all senders together,
-  6 a minute from any one sender identity. A sender over its share gets `rate_limited`; when
-  the total is spent the sender gets `offline`, as if the recipient were not connected. Fresh
-  identities are free, so 20 sockets from one address, each a new identity, can still spend a
-  recipient's whole total; the shares stop one identity from doing it.
+  6 a minute from any one source address (its /64 for IPv6), however many identities connect
+  from it. A sender over its address's share gets `rate_limited`; when the total is spent the
+  sender gets `offline`, as if the recipient were not connected. Identities are free and
+  addresses are not, so the share is per address: fresh identities from one address share it.
+  Every user behind one carrier-grade NAT address therefore shares 6 signals a minute toward
+  one recipient; raise `SIGNALS_PER_PAIR_PER_MINUTE` when many of your users do.
 - An envelope may be up to 24672 bytes, the largest a signal can produce (a 16384-character
   SDP fits).
 - TURN credentials are issued only on request (`{ t: 'turn' }`), at most 6 an hour per source

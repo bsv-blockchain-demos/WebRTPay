@@ -62,9 +62,11 @@ export interface RelayLimits {
   /** New connections all the IPv6 sources of one /48 may open per minute, together. */
   connectionsPer48PerMinute: number
   /**
-   * Signals forwarded from one sender identity to one recipient per minute (a token bucket);
-   * the rest are answered `rate_limited`. It keeps one identity from spending a recipient's
-   * whole budget.
+   * Signals forwarded from one source address group (an IPv4 address or an IPv6 /64, as
+   * for `maxSocketsPerIp`) to one recipient per minute, whatever identities they come from
+   * (a token bucket); the rest are answered `rate_limited`. Identities cost nothing and
+   * addresses do, so the share is per address: it keeps one address from spending a
+   * recipient's whole budget, however many identities it brings.
    */
   signalsPerPairPerMinute: number
   /**
@@ -203,6 +205,8 @@ interface Client {
   authUrls: string[]
   /** The sources this socket counts against: its address group, and an IPv6 address's /48. */
   sources: Source[]
+  /** Its address group (`addressGroup`): the key of its share of a recipient's budget. */
+  group: string
   /** Frames this socket may still send. */
   rate: TokenBucket
   /** Frames over the rate sent in a row. */
@@ -218,8 +222,12 @@ interface Identity {
   sockets: Set<Client>
   /** Signals it may still receive from everyone together. */
   budget: TokenBucket
-  /** Signals it may still receive from each sender identity; full buckets are swept out. */
-  pairs: Map<PubKeyHex, TokenBucket>
+  /**
+   * Signals it may still receive from each source address group (`Client.group`); full
+   * buckets are swept out. Keyed by the group's string, not its `Source`, which is swept
+   * out and made again while the group has no socket.
+   */
+  pairs: Map<string, TokenBucket>
 }
 
 /** A source (an IPv4 address, an IPv6 /64 or /48): its sockets and budgets. */
@@ -303,7 +311,8 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       if (owned) refuse(socket, '404 Not Found')
       return
     }
-    const sources = sourcesOf(sourceAddress(req))
+    const address = sourceAddress(req)
+    const sources = sourcesOf(address)
     if (sources.some(s => s.sockets >= s.maxSockets || !s.connections.ready())) {
       refuse(socket, '429 Too Many Requests')
       return
@@ -318,7 +327,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     for (const s of sources) s.connections.take()
     // ws completes the upgrade synchronously, so no other upgrade runs between these
     // checks and accept() counting the socket.
-    wss.handleUpgrade(req, socket, head, ws => accept(ws, req, sources))
+    wss.handleUpgrade(req, socket, head, ws => accept(ws, req, sources, addressGroup(address)))
   }
 
   /** The address `req` counts under: `trustedIpHeader`'s, else the socket's peer address. */
@@ -382,7 +391,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     return source
   }
 
-  function accept(ws: WsSocket, req: IncomingMessage, from: Source[]): void {
+  function accept(ws: WsSocket, req: IncomingMessage, from: Source[], group: string): void {
     const client: Client = {
       ws,
       stage: 'auth',
@@ -390,6 +399,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       nonce: randomBytes(32).toString('base64url'),
       authUrls: publicUrls.length > 0 ? publicUrls : requestUrls(req),
       sources: from,
+      group,
       rate: new TokenBucket(limits.rateMessages, limits.rateWindowMs),
       overRate: 0,
       ping: undefined,
@@ -557,13 +567,15 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     const frame = JSON.stringify({ t: 'signal', from: sender, envelope: forward })
     const recipient = identities.get(f.to)
     if (recipient !== undefined) {
-      // Each sender has its own share of the recipient's budget, checked first, so one
-      // identity cannot spend everyone's. The total still bounds what fresh identities,
-      // which cost nothing, can send together. Tokens go only for a signal delivered.
-      let pair = recipient.pairs.get(sender)
+      // Each source address group has its own share of the recipient's budget, checked
+      // first, so one address cannot spend everyone's. It is the address and not the
+      // identity that is counted: identities cost nothing (Ruling 34). The total still
+      // bounds what many addresses can send together. Tokens go only for a signal
+      // delivered.
+      let pair = recipient.pairs.get(client.group)
       if (pair === undefined) {
         pair = new TokenBucket(limits.signalsPerPairPerMinute, MINUTE_MS)
-        recipient.pairs.set(sender, pair)
+        recipient.pairs.set(client.group, pair)
       }
       if (!pair.ready()) {
         sendError(client, 'rate_limited', ref)
@@ -689,7 +701,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     sweep()
   }
 
-  /** Forget sources that hold no socket and sender shares, whose budgets are full again. */
+  /** Forget sources that hold no socket and address shares, whose budgets are full again. */
   function sweep(): void {
     const now = Date.now()
     for (const [key, source] of sources) {
@@ -697,7 +709,7 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
       if (source.sockets === 0 && turnFull && source.connections.full(now)) sources.delete(key)
     }
     for (const identity of identities.values()) {
-      for (const [sender, pair] of identity.pairs) if (pair.full(now)) identity.pairs.delete(sender)
+      for (const [group, pair] of identity.pairs) if (pair.full(now)) identity.pairs.delete(group)
     }
   }
 

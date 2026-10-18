@@ -392,6 +392,31 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
     expect(await sender.getIdentityKey()).toBe(payer.identityKey)
   })
 
+  it('creates every link at the 64 KiB pre-auth cap, and the payment still goes through', async () => {
+    const createOffer = jest.spyOn(PeerLink, 'createOffer')
+    const acceptOffer = jest.spyOn(PeerLink, 'acceptOffer')
+    try {
+      const hub = createMemoryHub()
+      const payer = await makeWallet()
+      const payee = await makeWallet()
+      await hubClient(hub, payee).startReceiving(accepting(payee))
+      const sender = hubClient(hub, payer)
+      const { token } = await makeToken(payer, payee.identityKey, 1000)
+
+      const peer = await sender.connect(payee.identityKey)
+      // before authenticate() runs, a link accepts no more than a handshake needs
+      expect(createOffer).toHaveBeenCalledTimes(1)
+      expect(createOffer.mock.calls[0][0]).toMatchObject({ maxMessageBytes: 65536 })
+      expect(acceptOffer).toHaveBeenCalledTimes(1)
+      expect(acceptOffer.mock.calls[0][1]).toMatchObject({ maxMessageBytes: 65536 })
+      // authentication raises the cap again
+      expect((await sender.sendPayment(peer, token)).status).toBe('accepted')
+    } finally {
+      createOffer.mockRestore()
+      acceptOffer.mockRestore()
+    }
+  })
+
   it('connect to offline recipient rejects with peer_unreachable within budget', async () => {
     const hub = createMemoryHub()
     const payer = await makeWallet()

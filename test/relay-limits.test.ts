@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from '@jest/globals'
+import { afterEach, beforeAll, describe, expect, it, jest } from '@jest/globals'
 import { DEFAULT_RELAY_LIMITS } from '../server/index.js'
 import type { RelayServer } from '../server/index.js'
 import { addressGroup, ipv6Block48 } from '../server/ip.js'
@@ -19,10 +19,17 @@ describe('relay limits', () => {
   let bob: Party
   let carol: Party
   let dave: Party
+  let erin: Party
   const { relay, signaler, rawAt, defer, cleanup } = relayFixtures()
 
   beforeAll(async () => {
-    ;[alice, bob, carol, dave] = await Promise.all([party(), party(), party(), party()])
+    ;[alice, bob, carol, dave, erin] = await Promise.all([
+      party(),
+      party(),
+      party(),
+      party(),
+      party()
+    ])
   })
 
   afterEach(cleanup)
@@ -62,6 +69,20 @@ describe('relay limits', () => {
     return got
   }
 
+  /** The headers that make a relay with `trustedIpHeader: 'x-client-ip'` see `ip`. */
+  function fromIp(ip: string): Record<string, string> {
+    return { 'x-client-ip': ip }
+  }
+
+  /** Send `to` a signal over `c` and return the relay's reply to it. */
+  async function deliver(c: Raw, to: Party): Promise<Record<string, unknown>> {
+    const e = env()
+    c.send({ t: 'signal', to: to.key, envelope: e })
+    const reply = await c.next()
+    expect(reply.ref).toBe(e.sid)
+    return reply
+  }
+
   describe('frames over the rate (R3)', () => {
     it('answers each frame over the rate until maxOverRateFrames in a row, then closes with 1008', async () => {
       const r = await relay({ limits: { rateMessages: 5, maxOverRateFrames: 3 } })
@@ -78,26 +99,38 @@ describe('relay limits', () => {
     })
 
     it('counts only frames over the rate in a row', async () => {
-      // one frame a second, 3 at most; the auth frame took one
-      const r = await relay({
-        limits: { rateMessages: 3, rateWindowMs: 3000, maxOverRateFrames: 2 }
-      })
-      const a = await authed(r, alice)
-      const got = record(a)
-      const codes = async (n: number): Promise<unknown[]> => {
-        await waitFor(() => got.length >= n)
-        return got.splice(0, n).map(f => f.code)
+      // The relay's clock is the test's, so only what the test advances refills a bucket and
+      // no real delay can matter. One frame a second, 3 at most; the auth frame took one.
+      let now = Date.now()
+      const clock = jest.spyOn(Date, 'now').mockImplementation(() => now)
+      try {
+        const r = await relay({
+          limits: { rateMessages: 3, rateWindowMs: 3000, maxOverRateFrames: 2 }
+        })
+        const a = await authed(r, alice)
+        const got = record(a)
+        const codes = async (n: number): Promise<unknown[]> => {
+          await waitFor(() => got.length >= n)
+          return got.splice(0, n).map(f => f.code)
+        }
+        for (let i = 0; i < 4; i++) a.send({})
+        expect(await codes(4)).toEqual([
+          'bad_request',
+          'bad_request',
+          'rate_limited',
+          'rate_limited'
+        ])
+        now += 1100
+        a.send({}) // within the rate again: the count starts over
+        a.send({})
+        a.send({})
+        expect(await codes(3)).toEqual(['bad_request', 'rate_limited', 'rate_limited'])
+        expect(a.ws.readyState).toBe(a.ws.OPEN)
+        a.send({})
+        expect(await a.closed).toBe(1008)
+      } finally {
+        clock.mockRestore()
       }
-      for (let i = 0; i < 4; i++) a.send({})
-      expect(await codes(4)).toEqual(['bad_request', 'bad_request', 'rate_limited', 'rate_limited'])
-      await new Promise(resolve => setTimeout(resolve, 1100))
-      a.send({}) // within the rate again: the count starts over
-      a.send({})
-      a.send({})
-      expect(await codes(3)).toEqual(['bad_request', 'rate_limited', 'rate_limited'])
-      expect(a.ws.readyState).toBe(a.ws.OPEN)
-      a.send({})
-      expect(await a.closed).toBe(1008)
     })
 
     it('charges pings to the rate: pongs within it, closes a socket that keeps pinging', async () => {
@@ -309,34 +342,26 @@ describe('relay limits', () => {
       await accepted(r, { 'x-client-ip': '203.0.113.3' })
     })
 
-    it('limits signals per sender to a recipient, and to a recipient in total (R4)', async () => {
+    it('limits signals per sender address to a recipient, and to a recipient in total (R4)', async () => {
       const r = await relay({
+        trustedIpHeader: 'x-client-ip',
         limits: { signalsPerPairPerMinute: 2, signalsPerRecipientPerMinute: 3 }
       })
       const bobBox = inbox()
       await signaler(r, bob).listen(bobBox.fn)
       const carolBox = inbox()
       await signaler(r, carol).listen(carolBox.fn)
-      const a = await authed(r, alice)
-      const deliver = async (c: Raw, to: Party): Promise<Record<string, unknown>> => {
-        const e = env()
-        c.send({ t: 'signal', to: to.key, envelope: e })
-        const reply = await c.next()
-        expect(reply.ref).toBe(e.sid)
-        return reply
-      }
-
+      const a = await authed(r, alice, fromIp('203.0.113.1'))
       expect((await deliver(a, bob)).t).toBe('sent')
       expect((await deliver(a, bob)).t).toBe('sent')
-      // alice has spent her share of bob's budget, and only hers
+      // alice's address has spent its share of bob's budget, and only its own
       expect(await deliver(a, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
-      const c = signaler(r, carol)
-      await c.send(bob.key, env())
+      // carol's signaler connects from the loopback address, which has a share of its own
+      await signaler(r, carol).send(bob.key, env())
       // bob's total of 3 is spent: anyone else is told he is not reachable
-      await expect(signaler(r, dave).send(bob.key, env())).rejects.toMatchObject({
-        code: 'peer_unreachable'
-      })
-      // alice's share of carol's budget is her own
+      const d = await authed(r, dave, fromIp('203.0.113.2'))
+      expect(await deliver(d, bob)).toMatchObject({ t: 'error', code: 'offline' })
+      // alice's address has its own share of carol's budget
       expect((await deliver(a, carol)).t).toBe('sent')
       await waitFor(() => carolBox.got.length === 1)
       expect(bobBox.got).toHaveLength(3)
@@ -344,11 +369,11 @@ describe('relay limits', () => {
       expect(DEFAULT_RELAY_LIMITS.signalsPerRecipientPerMinute).toBe(120)
     })
 
-    it('lets one identity at the default rate no longer lock other senders out (R4)', async () => {
-      const r = await relay()
+    it('lets one address at the default rate no longer lock other senders out (R4)', async () => {
+      const r = await relay({ trustedIpHeader: 'x-client-ip' })
       const bobBox = inbox()
       await signaler(r, bob).listen(bobBox.fn)
-      const mallory = await authed(r, alice)
+      const mallory = await authed(r, alice, fromIp('203.0.113.1'))
       // one junk signal every frame mallory may send: her share is gone after 6
       const replies: unknown[] = []
       for (let i = 0; i < 15; i++) {
@@ -358,6 +383,66 @@ describe('relay limits', () => {
       expect(replies.filter(t => t === 'sent')).toHaveLength(6)
       for (const p of [carol, dave]) await signaler(r, p).send(bob.key, env())
       expect(bobBox.got).toHaveLength(8)
+    })
+
+    it('shares one pair budget among the identities of one address group (Ruling 34)', async () => {
+      const r = await relay({
+        trustedIpHeader: 'x-client-ip',
+        limits: { signalsPerPairPerMinute: 2 }
+      })
+      const bobBox = inbox()
+      await signaler(r, bob).listen(bobBox.fn)
+      const erinBox = inbox()
+      await signaler(r, erin).listen(erinBox.fn)
+      // alice and carol are two identities behind one IPv4 address; dave is elsewhere
+      const a = await authed(r, alice, fromIp('203.0.113.1'))
+      const c = await authed(r, carol, fromIp('203.0.113.1'))
+      const d = await authed(r, dave, fromIp('203.0.113.2'))
+      expect((await deliver(a, bob)).t).toBe('sent')
+      expect((await deliver(c, bob)).t).toBe('sent')
+      // the fresh identity does not bring a share of its own
+      expect(await deliver(c, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
+      expect(await deliver(a, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
+      // another address has its own share of bob, and this address one of every recipient
+      expect((await deliver(d, bob)).t).toBe('sent')
+      expect((await deliver(c, erin)).t).toBe('sent')
+      expect(bobBox.got).toHaveLength(3)
+      await waitFor(() => erinBox.got.length === 1)
+    })
+
+    it('groups IPv6 sources by /64, not by /48, for the pair budget (Ruling 34)', async () => {
+      const r = await relay({
+        trustedIpHeader: 'x-client-ip',
+        limits: { signalsPerPairPerMinute: 1 }
+      })
+      await signaler(r, bob).listen(inbox().fn)
+      const a = await authed(r, alice, fromIp('2001:db8:aa:1::1'))
+      const c = await authed(r, carol, fromIp('2001:db8:aa:1:ffff::9'))
+      const d = await authed(r, dave, fromIp('2001:db8:aa:2::1'))
+      expect((await deliver(a, bob)).t).toBe('sent')
+      // same /64 as alice: her share
+      expect(await deliver(c, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
+      // another /64 of the same /48: a share of its own
+      expect((await deliver(d, bob)).t).toBe('sent')
+    })
+
+    it('keeps an address group share when its sockets close and its source is swept (Ruling 34)', async () => {
+      const r = await relay({
+        trustedIpHeader: 'x-client-ip',
+        // sources are swept as soon as they hold no socket and a connection token is back
+        limits: { signalsPerPairPerMinute: 2, pingIntervalMs: 200, connectionsPerIpPerMinute: 6000 }
+      })
+      await signaler(r, bob).listen(inbox().fn)
+      const a = await authed(r, alice, fromIp('203.0.113.1'))
+      expect((await deliver(a, bob)).t).toBe('sent')
+      expect((await deliver(a, bob)).t).toBe('sent')
+      a.ws.close()
+      await a.closed
+      await waitFor(() => r.stats().sockets === 1)
+      await new Promise(resolve => setTimeout(resolve, 600))
+      // a new identity from the same address finds the share still spent
+      const c = await authed(r, carol, fromIp('203.0.113.1'))
+      expect(await deliver(c, bob)).toMatchObject({ t: 'error', code: 'rate_limited' })
     })
 
     it('also counts IPv6 sources by /48, at 4 times the /64 limits by default (R5)', async () => {

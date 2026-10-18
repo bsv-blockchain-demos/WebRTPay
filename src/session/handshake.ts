@@ -12,8 +12,11 @@ const BINDING_LABEL = 'webrtpay/1 channel-binding'
 /**
  * Largest message accepted from the peer until its `auth` verifies (spec §4, Ruling 16):
  * handshake messages are tiny, and an unauthenticated peer gets no more than this.
+ * `authenticate` applies it first thing, and `DirectPayClient` creates its links with it, so
+ * there is no moment when a link of the client accepts more. The one definition; the package
+ * entry does not export it.
  */
-const PRE_AUTH_MAX_MESSAGE_BYTES = 65536
+export const PRE_AUTH_MAX_MESSAGE_BYTES = 65536
 const NONCE_BYTES = 32
 /**
  * Most peer messages waiting while a handshake step awaits the wallet or the link, until

@@ -18,7 +18,7 @@ import type {
   WireMessage
 } from '../payments/wire.js'
 import type { AuthenticatedPeer } from '../session/AuthenticatedPeer.js'
-import { authenticate } from '../session/handshake.js'
+import { PRE_AUTH_MAX_MESSAGE_BYTES, authenticate } from '../session/handshake.js'
 import { ReplayCache, openSignal, sealSignal } from '../signaling/envelope.js'
 import type { SignalEnvelope, SignalKind, SignalPlaintext, Signaler } from '../signaling/types.js'
 import { DEFAULTS, isIdentityKey } from '../types.js'
@@ -461,9 +461,10 @@ export class DirectPayClient {
    *
    * Before anything is sent, the token is checked with `validatePaymentToken` and against
    * `MAX_DIRECT_TRANSACTION_BYTES`, and the session must still be open; these failures leave
-   * the session as it was. A payee that dialed in closes the session when no message comes
-   * within its first-message timeout (60 s by default) of `connect` resolving, so prepare
-   * the payment promptly, check `peer.isOpen` before broadcasting, and send right after.
+   * the session as it was. A payee that answered the dial closes the session when no message
+   * comes within its first-message timeout (60 s by default) of `connect` resolving, so
+   * prepare the payment promptly, check `peer.isOpen` before broadcasting, and send right
+   * after.
    *
    * Keep the token until the ack is `accepted` or `received`. When this throws after the
    * transaction was broadcast, or the ack is `rejected` with a `txid`, the payee may hold an
@@ -1025,16 +1026,18 @@ export class DirectPayClient {
   // ------------------------------------------------------------ helpers
 
   /**
-   * Options for a new link: the RTC options with the provider's ICE servers merged in.
-   * `authenticate`, which every path runs before the peer can connect, caps messages at
-   * 64 KiB until the peer has authenticated.
+   * Options for a new link: the RTC options with the provider's ICE servers merged in, and
+   * messages capped at 64 KiB until the peer has authenticated. `authenticate`, which every
+   * path runs before the peer can connect, applies the same cap first thing and raises it
+   * when the peer's `auth` verifies; creating the link with it too leaves no moment between
+   * the two when a link accepts more.
    */
   private async linkOptions(): Promise<PeerLinkOptions> {
     const provided = await this.providedIceServers()
     const rtc = this.rtc
     const iceServers =
       provided.length === 0 ? rtc.iceServers : mergeIceServers(rtc.iceServers ?? [], provided)
-    return { ...rtc, iceServers }
+    return { ...rtc, iceServers, maxMessageBytes: PRE_AUTH_MAX_MESSAGE_BYTES }
   }
 
   /**

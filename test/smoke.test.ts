@@ -78,6 +78,7 @@ describe('package scaffold', () => {
       'dispatchSignal',
       // implementation limits and helpers
       'MAX_BACKLOG',
+      'PRE_AUTH_MAX_MESSAGE_BYTES',
       'TokenBucket',
       'KeyedBuckets'
     ]) {

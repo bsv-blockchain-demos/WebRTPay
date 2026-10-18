@@ -8,7 +8,9 @@ export * from './codec/sdp.js'
 export * from './codec/codes.js'
 export * from './channel/frames.js'
 export * from './channel/PeerLink.js'
-export * from './session/handshake.js'
+// By name: the pre-auth message cap is an implementation detail, not API.
+export { authenticate, bindingTranscript } from './session/handshake.js'
+export type { AuthenticateOptions, BindingTranscriptInput } from './session/handshake.js'
 // By name: the module's backlog limit is an implementation detail, not API.
 export { AuthenticatedPeer } from './session/AuthenticatedPeer.js'
 export * from './payments/wire.js'
