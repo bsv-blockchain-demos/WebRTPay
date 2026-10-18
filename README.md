@@ -1,5 +1,7 @@
 # @bsv/webrtpay
 
+> **Maintained in ts-stack.** The package now lives in [bsv-blockchain/ts-stack](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/messaging/webrtpay) (`packages/messaging/webrtpay`) and is published from there. This repository keeps the prototype history; open issues and pull requests against ts-stack. The earlier demo app is preserved at the tag `archive/main-pre-v2`.
+
 Direct wallet-to-wallet BSV payments over WebRTC data channels, authenticated with BRC-100
 identity keys.
 
