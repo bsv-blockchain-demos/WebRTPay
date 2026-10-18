@@ -884,10 +884,10 @@ Each client frame gets exactly one reply, in the order the frames were sent.
   otherwise), for IPv6 its /48's (24 an hour), and the relay's (600 an hour): `ice` with the
   STUN servers followed by the provider's servers (§8.7), and `expiresAt`; past any budget,
   `rate_limited`. The budgets are spent before the provider is asked.
-- A provider that fails (Cloudflare answers other than 200 or 201, not within 5 s, or with no
-  TURN server) gets `{ "t": "error", "code": "unavailable" }`, without `ref`: a `turn` frame
-  carries no envelope. The socket stays open; the relay logs what failed, never the API token
-  or the credentials.
+- A provider that fails (Cloudflare answers other than 200 or 201, not within 5 s, with more
+  than 64 KiB, or with no TURN server) gets `{ "t": "error", "code": "unavailable" }`, without
+  `ref`: a `turn` frame carries no envelope. The socket stays open; the relay logs what
+  failed, never the API token or the credentials.
 - The answer can take up to 5 s. Signals the socket sends meanwhile are forwarded at once, but
   their replies wait behind the `turn` reply, so replies stay in frame order.
 
@@ -953,14 +953,16 @@ Content-Type: application/json
 {"ttl":<min(ttl, 172800)>}
 ```
 
-It accepts `200` or `201` within 5 s, body included. `iceServers` in the answer may be a list
-(today a STUN entry and a TURN entry; until 2025 one entry mixing both) or a single object.
-Every url on port 53 (blocked by browsers) and of a scheme other than `stun:`, `stuns:`,
-`turn:` or `turns:` is dropped; the STUN urls become one `{ urls }` entry, and each entry's
-TURN urls become `{ urls, username, credential }` when it has both. An answer without a TURN
-entry counts as a failure. The usernames are 96 hex characters with no expiry inside, and the
-answer carries no lifetime, so `expiresAt` = the time the relay sent the request + ttl × 1000.
-The identity key is never sent to Cloudflare.
+It accepts `200` or `201` within 5 s, body included, and reads at most 64 KiB of the body (a
+larger `content-length`, or more bytes than that, counts as a failure). `iceServers` in the
+answer may be a list (today a STUN entry and a TURN entry; until 2025 one entry mixing both)
+or a single object. Every url on port 53 (blocked by browsers) and of a scheme other than
+`stun:`, `stuns:`, `turn:` or `turns:` is dropped; the STUN urls become one `{ urls }` entry,
+and each entry's TURN urls become `{ urls, username, credential }` when it has both. At most
+8 TURN urls are kept in all, the first listed. An answer without a TURN entry counts as a
+failure. The usernames are 96 hex characters with no expiry inside, and the answer carries
+no lifetime, so `expiresAt` = the time the relay sent the request + ttl × 1000. The identity
+key is never sent to Cloudflare.
 
 ### 8.8 Client behaviour (`RelaySignaler`)
 
@@ -1022,6 +1024,7 @@ The identity key is never sent to Cloudflare.
 | Relay: queued bytes per socket / ping interval | 1 MiB / 30 s |
 | Relay: TURN credentials per source / per /48 / in total / lifetime | 6 / 24 / 600 an hour / 600 s |
 | Relay: Cloudflare credentials request / longest lifetime | 5 s / 172800 s (48 h) |
+| Relay: Cloudflare answer read / TURN urls forwarded | 64 KiB / 8 |
 | `RelaySignaler`: TURN servers count as expired | 30 s before their expiry |
 | `iceServersProvider` wait before gathering without it | 5 s |
 

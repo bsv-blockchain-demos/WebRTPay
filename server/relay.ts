@@ -445,7 +445,9 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     const allowed = client.rate.take()
     switch (client.stage) {
       case 'auth':
-        void authenticate(client, data, isBinary)
+        // Nothing awaits this, and an unhandled rejection ends a Node process. A failure no
+        // check above expects leaves the socket in no known state, so it is cut off.
+        authenticate(client, data, isBinary).catch(() => client.ws.terminate())
         return
       case 'verifying':
         refuseAuth(client)
@@ -630,17 +632,25 @@ export async function createRelayServer(o: RelayServerOptions = {}): Promise<Rel
     for (const b of buckets) b.take(now)
     const answer = replyLater(client)
     // set when the socket authenticated, before any frame reaches here
-    void turn.issue(client.identityKey as PubKeyHex).then(
-      ({ iceServers, expiresAt }) => {
-        answer({ t: 'ice', iceServers: [...stunServers(), ...iceServers], expiresAt })
-      },
-      (err: unknown) => {
-        // issuers reject with messages that hold no secret (see TurnIssuer)
-        const why = err instanceof Error ? err.message : 'unknown error'
-        log(`webrtpay relay: could not get TURN credentials from ${turn.kind}: ${why}`)
-        answer({ t: 'error', code: 'unavailable' })
-      }
-    )
+    turn
+      .issue(client.identityKey as PubKeyHex)
+      .then(
+        ({ iceServers, expiresAt }) => {
+          answer({ t: 'ice', iceServers: [...stunServers(), ...iceServers], expiresAt })
+        },
+        (err: unknown) => {
+          // The reply comes first: it fills the place the socket's later replies wait
+          // behind, so a log hook that throws cannot leave them waiting for ever.
+          answer({ t: 'error', code: 'unavailable' })
+          // issuers reject with messages that hold no secret (see TurnIssuer)
+          const why = err instanceof Error ? err.message : 'unknown error'
+          log(`webrtpay relay: could not get TURN credentials from ${turn.kind}: ${why}`)
+        }
+      )
+      // Nothing awaits this chain, and an unhandled rejection ends a Node process: whatever
+      // `answer` or the log hook throws stops here, on purpose. The reply has gone first, and
+      // a log hook that threw is no use for reporting this.
+      .catch(() => {})
   }
 
   function stunServers(): RelayIceServer[] {

@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, jest } from '@jest/globals'
+import { WebSocket } from 'ws'
 import type { RelayServer } from '../server/index.js'
 import { turnCredentials, turnIssuer } from '../server/turn.js'
 import type { CloudflareTurnProvider, TurnProvider } from '../server/turn.js'
@@ -82,6 +83,11 @@ function mockFetch(respond: (init: RequestInit) => Response | Promise<Response>)
 
 function cloudflare(fetch: Fetch, o: Partial<CloudflareTurnProvider> = {}): CloudflareTurnProvider {
   return { kind: 'cloudflare', keyId: KEY_ID, apiToken: API_TOKEN, fetch, ...o }
+}
+
+/** Throws `e`, whatever it is, for a mock that fails. */
+function throwing(e: unknown): never {
+  throw e
 }
 
 /** A promise with its resolve function. */
@@ -297,6 +303,191 @@ describe('turnIssuer: Cloudflare', () => {
     }
   })
 
+  it('adds a short allow-listed diagnostic to a failed request, never what the error says', async () => {
+    const withCause = (message: string, code: unknown): Error =>
+      Object.assign(new TypeError(message), {
+        cause: Object.assign(new Error(`connect failed ${GENERATE_URL}`), { code })
+      })
+    const named = (name: unknown): Error => Object.assign(new Error(`x ${API_TOKEN}`), { name })
+    const leaky = `fetch failed ${GENERATE_URL} Bearer ${API_TOKEN}`
+    const cases: Array<[string, () => never, string]> = [
+      ['a system error code', () => throwing(withCause(leaky, 'ECONNREFUSED')), 'ECONNREFUSED'],
+      [
+        'an undici code',
+        () => throwing(withCause(leaky, 'UND_ERR_CONNECT_TIMEOUT')),
+        'UND_ERR_CONNECT_TIMEOUT'
+      ],
+      ['the name, with no cause', () => throwing(new TypeError(leaky)), 'TypeError'],
+      ['the name of an abort', () => throwing(named('AbortError')), 'AbortError'],
+      [
+        'the name when the code is not allow-listed',
+        () => throwing(withCause(leaky, `connect ${GENERATE_URL}`)),
+        'TypeError'
+      ],
+      [
+        'the name when the code is lowercase',
+        () => throwing(withCause(leaky, 'econnrefused')),
+        'TypeError'
+      ],
+      ['the name when the code is a number', () => throwing(withCause(leaky, 503)), 'TypeError'],
+      [
+        'the name when the code is over 40 characters',
+        () => throwing(withCause(leaky, 'E'.repeat(41))),
+        'TypeError'
+      ],
+      ['nothing for a bare Error', () => throwing(new Error(leaky)), ''],
+      ['nothing for a name that is the token', () => throwing(named(API_TOKEN)), ''],
+      ['nothing for a name that is not letters', () => throwing(named('Fetch-Error')), ''],
+      [
+        'a name of 40 letters and Error',
+        () => throwing(named('A'.repeat(40) + 'Error')),
+        'A'.repeat(40) + 'Error'
+      ],
+      [
+        'nothing for a name of 41 letters and Error',
+        () => throwing(named('A'.repeat(41) + 'Error')),
+        ''
+      ],
+      ['nothing for a thrown string', () => throwing(leaky), ''],
+      ['nothing for a thrown null', () => throwing(null), ''],
+      [
+        'nothing for an error whose properties throw',
+        () =>
+          throwing(
+            Object.defineProperty(new Error(leaky), 'cause', {
+              get() {
+                throw new Error(leaky)
+              }
+            })
+          ),
+        ''
+      ]
+    ]
+    for (const [label, fail, diagnostic] of cases) {
+      const { fetch } = mockFetch(fail)
+      const failure = await turnIssuer(cloudflare(fetch))
+        .issue('02ab')
+        .then(
+          () => undefined,
+          (e: unknown) => e
+        )
+      const expected = `Cloudflare TURN: request failed${diagnostic === '' ? '' : ` (${diagnostic})`}`
+      expect([label, (failure as Error | undefined)?.message]).toEqual([label, expected])
+      expect(failure).toBeInstanceOf(Error)
+      for (const secret of [API_TOKEN, KEY_ID, GENERATE_URL]) {
+        expect((failure as Error).message).not.toContain(secret)
+      }
+    }
+  })
+
+  it('reads an answer of 64 KiB but not one byte more', async () => {
+    const padded = (bytes: number): string => {
+      const text = JSON.stringify(CURRENT)
+      return text + ' '.repeat(bytes - Buffer.byteLength(text))
+    }
+    const at = mockFetch(() => new Response(padded(65536), { status: 201 }))
+    expect((await turnIssuer(cloudflare(at.fetch)).issue('02ab')).iceServers).toEqual(ISSUED)
+    const over = mockFetch(() => new Response(padded(65537), { status: 201 }))
+    await expect(turnIssuer(cloudflare(over.fetch)).issue('02ab')).rejects.toThrow(
+      'Cloudflare TURN: the answer is too large'
+    )
+  })
+
+  it('refuses an answer whose content-length is over 64 KiB without reading it', async () => {
+    let read = false
+    let cancelled = false
+    // a high water mark of 0: nothing is pulled until something reads
+    const body = new ReadableStream(
+      {
+        pull(c) {
+          read = true
+          c.enqueue(new TextEncoder().encode(JSON.stringify(CURRENT)))
+          c.close()
+        },
+        cancel() {
+          cancelled = true
+        }
+      },
+      { highWaterMark: 0 }
+    )
+    const { fetch } = mockFetch(
+      () => new Response(body, { status: 201, headers: { 'content-length': '65537' } })
+    )
+    await expect(turnIssuer(cloudflare(fetch)).issue('02ab')).rejects.toThrow('too large')
+    expect(cancelled).toBe(true)
+    expect(read).toBe(false)
+    // a content-length that says nothing usable leaves the streamed limit to decide
+    const odd = mockFetch(
+      () =>
+        new Response(JSON.stringify(CURRENT), {
+          status: 201,
+          headers: { 'content-length': 'many' }
+        })
+    )
+    expect((await turnIssuer(cloudflare(odd.fetch)).issue('02ab')).iceServers).toEqual(ISSUED)
+  })
+
+  it('stops reading a body without a length once it passes 64 KiB, and releases it', async () => {
+    let pulls = 0
+    let cancelled = false
+    const endless = new ReadableStream({
+      async pull(c) {
+        pulls++
+        // a network body arrives in turns of the event loop, which the deadline's timer needs
+        await new Promise(res => setTimeout(res, 1))
+        c.enqueue(new Uint8Array(8192).fill(0x20))
+        // long enough to show the limit works, and it ends, so a missing limit cannot hang
+        if (pulls === 100) c.close()
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+    const { fetch } = mockFetch(() => new Response(endless, { status: 201 }))
+    // real timers: it must give up on size, long before the 5 s deadline
+    const started = Date.now()
+    await expect(turnIssuer(cloudflare(fetch)).issue('02ab')).rejects.toThrow('too large')
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(cancelled).toBe(true)
+    // 8 chunks make 64 KiB; the 9th is over. The stream may have been pulled one ahead.
+    expect(pulls).toBeLessThanOrEqual(10)
+  })
+
+  it('forwards at most 8 TURN urls, the first ones Cloudflare lists', async () => {
+    const urls = (n: number, port = 3478): string[] =>
+      Array.from({ length: n }, (_, i) => `turn:turn.cloudflare.com:${port + i}?transport=udp`)
+    const one = mockFetch(() =>
+      json({
+        iceServers: [
+          { urls: [CF_STUN] },
+          { urls: urls(12), username: USERNAME, credential: CREDENTIAL }
+        ]
+      })
+    )
+    expect((await turnIssuer(cloudflare(one.fetch)).issue('02ab')).iceServers).toEqual([
+      { urls: [CF_STUN] },
+      { urls: urls(8), username: USERNAME, credential: CREDENTIAL }
+    ])
+    // the limit counts every entry together; an entry with no room left is dropped
+    const many = mockFetch(() =>
+      json({
+        iceServers: [
+          { urls: urls(6), username: USERNAME, credential: CREDENTIAL },
+          { urls: urls(6, 4000), username: 'ef'.repeat(48), credential: 'ab'.repeat(48) },
+          { urls: urls(2, 5000), username: 'cd'.repeat(48), credential: 'ef'.repeat(48) }
+        ]
+      })
+    )
+    const issued = (await turnIssuer(cloudflare(many.fetch)).issue('02ab')).iceServers
+    expect(issued).toEqual([
+      { urls: urls(6), username: USERNAME, credential: CREDENTIAL },
+      { urls: urls(2, 4000), username: 'ef'.repeat(48), credential: 'ab'.repeat(48) }
+    ])
+    // the six Cloudflare lists today are not touched
+    const today = mockFetch(() => json(CURRENT))
+    expect((await turnIssuer(cloudflare(today.fetch)).issue('02ab')).iceServers).toEqual(ISSUED)
+  })
+
   it('refuses a provider it cannot issue for when it is made, naming no secret', () => {
     const { fetch } = mockFetch(() => json(CURRENT))
     const bad: Array<Partial<CloudflareTurnProvider>> = [
@@ -413,7 +604,7 @@ describe('relay with a Cloudflare TURN provider', () => {
     const failures = logs.filter(line => line.includes('could not get TURN credentials'))
     expect(failures).toHaveLength(3)
     expect(failures[0]).toContain('HTTP 503')
-    expect(failures[1]).toContain('request failed')
+    expect(failures[1]).toContain('request failed (TypeError)')
     expect(failures[2]).toContain('no TURN server')
     for (const secret of [API_TOKEN, KEY_ID, USERNAME, CREDENTIAL]) {
       expect(JSON.stringify(logs)).not.toContain(secret)
@@ -515,5 +706,107 @@ describe('relay with a Cloudflare TURN provider', () => {
     } finally {
       await s.close()
     }
+  })
+
+  /**
+   * Let Node report a promise nobody handled, which it does a turn after the rejection. Jest
+   * then fails the run (`Test suite failed to run`, exit code 1), so a test that ends with
+   * `settle()` cannot pass over an unhandled rejection the relay left behind.
+   */
+  const settle = (): Promise<void> => new Promise(res => setTimeout(res, 50))
+
+  it('answers unavailable and leaves nothing unhandled when the log hook throws', async () => {
+    const answers: Array<() => Response> = [
+      () => new Response('down', { status: 503 }),
+      () => json(CURRENT)
+    ]
+    const { fetch } = mockFetch(() => answers.shift()!())
+    const { r } = await cfRelay(
+      fetch,
+      {},
+      {
+        log: line => {
+          if (line.includes('could not get TURN credentials')) {
+            throw new Error(`the log sink is down ${API_TOKEN}`)
+          }
+        }
+      }
+    )
+    const a = await authed(r, alice)
+    a.send({ t: 'turn' })
+    // the reply slot is filled whatever the log hook does, so the client is not left waiting
+    await waitFor(() => a.seen.length >= 4)
+    expect(await a.next()).toEqual({ t: 'error', code: 'unavailable' })
+    // and the replies behind it still flow
+    expect((await requestTurn(a)).t).toBe('ice')
+    await settle()
+    expect(r.stats()).toEqual({ sockets: 1, identities: 1 })
+  })
+
+  it('closes a socket whose authentication fails unexpectedly, leaving nothing unhandled', async () => {
+    const { fetch } = mockFetch(() => json(CURRENT))
+    const { r } = await cfRelay(fetch)
+    // the relay's reply to a good signature is what breaks: ws cannot write the `ready` frame
+    const send = WebSocket.prototype.send
+    const spy = jest.spyOn(WebSocket.prototype, 'send').mockImplementation(function (
+      this: WebSocket,
+      ...args: unknown[]
+    ) {
+      if (typeof args[0] === 'string' && args[0].includes('"t":"ready"')) {
+        throw new Error('write failed')
+      }
+      return (send as (...a: unknown[]) => void).apply(this, args)
+    })
+    try {
+      const c = rawAt(r.url)
+      await authenticate(c, alice, r.url)
+      // the relay cuts the socket off: it is gone from its books and closed at the client
+      await waitFor(() => r.stats().sockets === 0)
+      await c.closed
+      await settle()
+    } finally {
+      spy.mockRestore()
+    }
+    // it carries on serving
+    expect(r.stats()).toEqual({ sockets: 0, identities: 0 })
+    const b = await authed(r, bob)
+    expect((await requestTurn(b)).t).toBe('ice')
+  })
+
+  it('answers unavailable once its 5 s are up when Cloudflare never answers, and keeps the socket', async () => {
+    const answers: Array<() => Promise<Response>> = [
+      () => new Promise<Response>(() => {}),
+      async () => json(CURRENT)
+    ]
+    const { fetch } = mockFetch(() => answers.shift()!())
+    const { r, logs } = await cfRelay(fetch)
+    const a = await authed(r, alice)
+    // The real clock and event loop stay as they are for everything but the timers: the
+    // sockets still deliver, and `pause` waits on the real clock.
+    const realSetTimeout = setTimeout
+    const pause = (ms: number): Promise<void> => new Promise(res => realSetTimeout(res, ms))
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+    try {
+      a.send({ t: 'turn' })
+      while (fetch.mock.calls.length === 0) await pause(5)
+      await jest.advanceTimersByTimeAsync(4999)
+      await pause(100)
+      // challenge, ready and ice only: the deadline has not passed
+      expect(a.seen).toHaveLength(3)
+      await jest.advanceTimersByTimeAsync(1)
+      while (a.seen.length < 4) await pause(5)
+    } finally {
+      jest.useRealTimers()
+    }
+    expect(a.seen[3]).toEqual({ t: 'error', code: 'unavailable' })
+    expect(logs.filter(line => line.includes('could not get TURN credentials'))).toEqual([
+      'webrtpay relay: could not get TURN credentials from cloudflare: ' +
+        'Cloudflare TURN: no answer within 5 s'
+    ])
+    // the socket stays open and is served again
+    expect(a.ws.readyState).toBe(WebSocket.OPEN)
+    expect(r.stats()).toEqual({ sockets: 1, identities: 1 })
+    expect((await a.next()).t).toBe('error')
+    expect((await requestTurn(a)).t).toBe('ice')
   })
 })

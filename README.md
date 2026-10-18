@@ -501,7 +501,7 @@ can send any value and choose its own per-source limits.
 | `PUBLIC_URLS` | — | Comma-separated `wss://` urls clients dial; clients sign the one they use. **Required in production**: the relay refuses to start without it unless `HOST` is a loopback address, because otherwise clients sign a url built from the `Host` header, which the client chooses. Set it whenever a proxy fronts the relay, even on loopback. |
 | `TRUSTED_IP_HEADER` | — | Header the outermost proxy sets to the client's single address, for the per-source limits: `cf-connecting-ip` behind Cloudflare. Without it every client behind a proxy shares the proxy's limits. `x-forwarded-for` is right only behind exactly one proxy that overwrites it. Set it only when every connection reaches the relay through that proxy (firewall it, or keep the listener private, e.g. a ClusterIP Service behind the tunnel); a client that can reach the relay directly can send any value and choose its own per-source limits. |
 | `STUN_URLS` | — | Comma-separated STUN urls handed to every authenticated socket. |
-| `TURN_PROVIDER` | `coturn` | Where TURN credentials come from: `coturn` (REST credentials the relay mints; the default when `TURN_SECRET` is set) or `cloudflare` (Cloudflare Realtime TURN). Without it and without `TURN_SECRET` the relay issues no TURN. |
+| `TURN_PROVIDER` | — (coturn when TURN_SECRET is set) | Where TURN credentials come from: `coturn` (REST credentials the relay mints; what runs when `TURN_SECRET` is set and this is not) or `cloudflare` (Cloudflare Realtime TURN). Without it and without `TURN_SECRET` the relay issues no TURN. Enable `cloudflare` only once every client is on a package version that reads `ice.expiresAt` (see [TURN options](#turn-options)). |
 | `TURN_SECRET` | — | coturn `static-auth-secret`; requires `TURN_URLS`. Refused with `TURN_PROVIDER=cloudflare`. |
 | `TURN_URLS` | — | Comma-separated TURN urls to issue credentials for; requires `TURN_SECRET`. Refused with `TURN_PROVIDER=cloudflare`, which chooses its own. |
 | `CLOUDFLARE_TURN_KEY_ID` | — | The Cloudflare TURN key's id; requires `TURN_PROVIDER=cloudflare` and `CLOUDFLARE_TURN_API_TOKEN`. |
@@ -521,8 +521,10 @@ can send any value and choose its own per-source limits.
 | `MAX_OVER_RATE_FRAMES` | `20` | Frames over the socket rate answered in a row before the socket is closed. |
 
 - `GET /health` answers `{"status":"ok"}`. `SIGTERM` or `SIGINT` closes every socket and exits.
-- At startup it names the TURN provider and the credential lifetime, and warns when there are
-  no public urls (development only) and when `PUBLIC_URLS` is set without `TRUSTED_IP_HEADER`.
+- At startup it logs `TURN credentials from <provider>, valid <ttl> s`, naming the provider by
+  its `kind` in code: `coturn-rest` for `TURN_PROVIDER=coturn`, or `cloudflare`. It warns when
+  there are no public urls (development only) and when `PUBLIC_URLS` is set without
+  `TRUSTED_IP_HEADER`.
   It refuses to start with a half-configured or mixed TURN provider (`TURN_URLS` without
   `TURN_SECRET`, `TURN_PROVIDER=cloudflare` without both Cloudflare variables or with
   `TURN_SECRET`, Cloudflare variables without `TURN_PROVIDER=cloudflare`) rather than run
@@ -550,10 +552,10 @@ can send any value and choose its own per-source limits.
   address (`TURN_PER_IP_PER_HOUR`) and 600 an hour in total, valid for `TURN_TTL`, whichever
   the provider. The budget is spent before the provider is asked, so a request Cloudflare fails
   costs one too. The answer lists the relay's `STUN_URLS`, then the provider's servers, with
-  `expiresAt`. A provider that fails (Cloudflare answers an error, or nothing within 5 s) gets
-  the client `{ t: 'error', code: 'unavailable' }` and one log line naming what failed, never
-  the token or credentials. Other frames from that socket are still forwarded at once, and
-  their replies follow the TURN reply in order.
+  `expiresAt`. A provider that fails (Cloudflare answers an error, nothing within 5 s, or more
+  than 64 KiB) gets the client `{ t: 'error', code: 'unavailable' }` and one log line naming
+  what failed, never the token or credentials. Other frames from that socket are still
+  forwarded at once, and their replies follow the TURN reply in order.
 - coturn REST: the username is `<expiry>:<pseudonym>` (`credential = base64(HMAC-SHA1(secret,
   username))`), so coturn needs `use-auth-secret`. Identities are free, so in production also
   give coturn its own quotas (`--total-quota`, `--max-bps`, `--denied-peer-ip` for private
@@ -575,6 +577,10 @@ for one of two providers.
 
 **Cloudflare Realtime TURN (`TURN_PROVIDER=cloudflare`; the default for production).**
 
+- Rollout: enable `TURN_PROVIDER=cloudflare` only after every client is on a package version
+  that reads `ice.expiresAt` (this version on). Older clients work out when TURN credentials
+  expire from the `<expiry>:<pseudonym>` username of coturn REST credentials, and treat
+  Cloudflare's opaque usernames as never expiring.
 - Setup: create a TURN key in the Cloudflare dashboard, or with
   `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/calls/turn_keys` and an API
   token with Calls Write permission. The key has an id (`uid`) and an API token (`key`); give
@@ -585,8 +591,11 @@ for one of two providers.
   with `{ "ttl": TURN_TTL }`. It passes on Cloudflare's STUN url and its TURN urls (UDP 3478
   and 443, TCP 3478 and 80, TLS 5349 and 443, anycast to the nearest Cloudflare location),
   picked by scheme rather than by position because the answer's shape has changed before, and
-  drops any url on port 53, which browsers block. Cloudflare's answer does not say when the
-  credentials expire, so the relay sends `expiresAt` (request time + ttl).
+  drops any url on port 53, which browsers block. It reads at most 64 KiB of the answer and
+  forwards at most 8 TURN urls (the first listed; Cloudflare lists 6). Cloudflare's answer
+  does not say when the credentials expire, so the relay sends `expiresAt` (request time +
+  ttl). The log line for a failed request says what failed in a few words (`HTTP 503`,
+  `no answer within 5 s`, `request failed (ECONNREFUSED)`), never the url or the token.
 - Cost: TURN is billed at $0.05 per GB sent from Cloudflare to TURN clients, after the first
   1,000 GB a month, which are free and shared with Cloudflare's Realtime SFU; STUN is free. A
   direct payment is about 100 KB, so even with every session relayed, 1,000 sessions a day
@@ -693,7 +702,7 @@ Node tests run real WebRTC with node-datachannel bound to `127.0.0.1`.
 
 ## Verification
 
-What the test suite exercises (`npm test`: 745 tests at 0.1.0; `npm run test:turn` adds 3 TURN
+What the test suite exercises (`npm test`: 753 tests at 0.1.0; `npm run test:turn` adds 3 TURN
 tests):
 
 - codes, compact SDP, frames: unit tests plus fast-check property suites with hostile input
