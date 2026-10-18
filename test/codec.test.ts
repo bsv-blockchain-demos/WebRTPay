@@ -526,10 +526,30 @@ describe('decodeCode rejects', () => {
     expectWebRTPayError(() => decodeCode(body), 'invalid_code')
   })
 
-  it('input longer than 4000 characters', () => {
-    const text = CODE_PREFIX + 'A'.repeat(3991)
-    expect(text.length).toBe(4001)
-    expectWebRTPayError(() => decodeCode(text), 'invalid_code')
+  it('input longer than 4000 characters, even a valid code; exactly 4000 decodes (M11)', () => {
+    // A valid answer code padded with an unknown TLV (skipped by decoders) to `length`.
+    const padded = (length: number): string => {
+      const code = encodeAnswerCode({ sid: new Uint8Array(16).fill(7), sdp: offerSdp })
+      const body = fromBase64Url(code.slice(CODE_PREFIX.length))
+      // base64url without padding: n bytes take ceil(4n / 3) characters
+      const bodyBytes = Math.floor(((length - CODE_PREFIX.length) * 3) / 4)
+      const fill = bodyBytes - body.length - 3 // tag and a two-byte varint length
+      expect(fill).toBeGreaterThan(127)
+      const tlv = concatBytes(
+        Uint8Array.of(0x7f, 0x80 | (fill & 0x7f), fill >> 7),
+        new Uint8Array(fill)
+      )
+      const text = CODE_PREFIX + toBase64Url(concatBytes(body, tlv))
+      expect(text).toHaveLength(length)
+      return text
+    }
+    const exact = decodeCode(padded(4000))
+    expect(exact.kind).toBe('answer')
+    expect(exact.sdp).toBe(offerSdp)
+    for (const text of [padded(4001), CODE_PREFIX + 'A'.repeat(3991)]) {
+      expect(() => decodeCode(text)).toThrow(/longer than 4000 characters/)
+      expectWebRTPayError(() => decodeCode(text), 'invalid_code')
+    }
   })
 
   it('a non-string', () => {
