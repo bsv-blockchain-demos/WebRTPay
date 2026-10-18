@@ -6,7 +6,10 @@
     "moduleResolution": "NodeNext",
     "lib": ["ES2022", "DOM"],
     "isolatedModules": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "paths": {
+      "@bsv/webrtpay": ["./src/index.ts"]
+    }
   },
-  "include": ["src", "server", "test"]
+  "include": ["src", "server", "test", "examples"]
 }
