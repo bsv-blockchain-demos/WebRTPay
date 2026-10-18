@@ -20,12 +20,21 @@ export const FRAME_HEADER_BYTES = 6
 /**
  * Deepest nesting of objects and arrays a received message may have: the number of
  * containers open at once, so `{"a":1}` is 1 and `{"a":[{}]}` is 3. Wire messages are
- * shallow (the spec's deepest is about 5; a payment's transaction is a flat array). The
+ * shallow (the spec's deepest is about 5; a payment's transaction is one string). The
  * decoder rejects anything deeper as a `protocol` error before parsing it, because
  * `JSON.parse` spends memory in proportion to depth, not just byte count: a 16 MiB run of
  * `[` and `]` costs over 1 GiB and a second of blocked event loop.
  */
 export const MAX_JSON_DEPTH = 32
+
+/**
+ * Most structural tokens a received message may have: every `{`, `[`, `,` and `:` outside
+ * strings. `JSON.parse` builds at most about one value per token, so this bounds what a
+ * message can make the parser allocate to roughly the size of its strings. Width costs
+ * memory like depth does: a 16 MiB array of empty objects builds 5.6 million objects (over
+ * 300 MiB). Wire messages have a few dozen tokens; a payment's transaction is one string.
+ */
+export const MAX_JSON_TOKENS = 4096
 
 const FRAME_VERSION = 1
 const FLAG_FINAL = 0x01
@@ -84,14 +93,15 @@ function protocolError(message: string, cause?: unknown): WebRTPayError {
 
 /**
  * Bound what `JSON.parse` may be asked to build, without allocating anything: require a
- * top-level object and no more than {@link MAX_JSON_DEPTH} containers open at once.
+ * top-level object, no more than {@link MAX_JSON_DEPTH} containers open at once and no more
+ * than {@link MAX_JSON_TOKENS} structural tokens (`{`, `[`, `,`, `:`).
  *
- * It tracks string and escape state, so brackets inside strings do not count, and it works
- * on the raw bytes: every structural character is ASCII, and UTF-8 never uses a byte below
- * 0x80 inside a multi-byte sequence. It validates nothing else; `JSON.parse` still decides
- * whether the text is JSON. On valid JSON the count is exact, and on invalid JSON it agrees
- * with the parser up to the point where the parser gives up, so whatever the parser builds
- * is within the bound.
+ * It tracks string and escape state, so structural characters inside strings do not count,
+ * and it works on the raw bytes: every structural character is ASCII, and UTF-8 never uses a
+ * byte below 0x80 inside a multi-byte sequence. It validates nothing else; `JSON.parse`
+ * still decides whether the text is JSON. On valid JSON the counts are exact, and on invalid
+ * JSON they agree with the parser up to the point where the parser gives up, so whatever the
+ * parser builds is within the bounds.
  */
 function assertBoundedObject(bytes: Uint8Array): void {
   const end = bytes.length
@@ -105,6 +115,7 @@ function assertBoundedObject(bytes: Uint8Array): void {
   if (i === end || bytes[i] !== 0x7b) throw protocolError('Message is not a JSON object')
 
   let depth = 0
+  let tokens = 0
   let inString = false
   for (; i < end; i++) {
     const b = bytes[i]
@@ -116,7 +127,10 @@ function assertBoundedObject(bytes: Uint8Array): void {
       }
     } else if (b === 0x22) {
       inString = true
+    } else if (b === 0x2c || b === 0x3a) {
+      if (++tokens > MAX_JSON_TOKENS) throw tooManyTokens()
     } else if (b === 0x7b || b === 0x5b) {
+      if (++tokens > MAX_JSON_TOKENS) throw tooManyTokens()
       if (++depth > MAX_JSON_DEPTH) {
         throw protocolError(`Message nests deeper than ${MAX_JSON_DEPTH} levels`)
       }
@@ -126,6 +140,10 @@ function assertBoundedObject(bytes: Uint8Array): void {
       if (--depth < 0) throw protocolError('Message has unbalanced brackets')
     }
   }
+}
+
+function tooManyTokens(): WebRTPayError {
+  return protocolError(`Message has more than ${MAX_JSON_TOKENS} structural tokens`)
 }
 
 function checkCap(maxMessageBytes: number): number {
@@ -195,8 +213,9 @@ export class FrameDecoder {
    * @throws `WebRTPayError('protocol')` for a frame shorter than the header, an unknown
    * version or reserved flag bit, a sequence number other than the expected one (first
    * message 0, then +1; every chunk of a message repeats its number), text that is not
-   * UTF-8 JSON, a top level that is not an object, or objects and arrays nested more than
-   * {@link MAX_JSON_DEPTH} deep (rejected before parsing). `WebRTPayError('too_large')` when
+   * UTF-8 JSON, a top level that is not an object, objects and arrays nested more than
+   * {@link MAX_JSON_DEPTH} deep or more than {@link MAX_JSON_TOKENS} structural tokens (both
+   * rejected before parsing). `WebRTPayError('too_large')` when
    * the reassembled message would pass the cap, checked before the frame is buffered.
    */
   push(frame: Uint8Array): unknown | undefined {

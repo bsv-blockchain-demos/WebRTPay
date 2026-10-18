@@ -8,41 +8,70 @@ import type { SignalEnvelope, SignalKind, SignalPlaintext } from './types.js'
 export const MAX_SIGNAL_SDP_CHARS = 16384
 /** Longest `sid` accepted in an envelope, in characters (a 16-byte base64url sid is 22). */
 export const MAX_SIGNAL_SID_CHARS = 64
+/**
+ * Longest `ciphertext` accepted in an envelope, in base64 characters (18 KiB of bytes):
+ * room for a {@link MAX_SIGNAL_SDP_CHARS} SDP with ordinary line lengths, the JSON around it
+ * and the BRC-2 overhead. Checked before anything is decrypted.
+ */
+export const MAX_SIGNAL_CIPHERTEXT_CHARS = 24576
 
 const KINDS: readonly SignalKind[] = ['offer', 'answer', 'reject']
 
+/** Kept past the last moment a signal could still pass the freshness check. */
+const REPLAY_MARGIN_MS = 60000
+
 /**
- * Remembers session IDs so each signal is opened once. Entries expire after
- * `ttlMs` (comfortably longer than the ±120 s freshness window) and the oldest is
- * dropped beyond `max`.
+ * Remembers session IDs so each signal is opened once. A sid is kept until a signal
+ * carrying it could no longer pass the ±120 s freshness check, plus a minute: until
+ * `max(seen, ts) + 120 s + 60 s`. Beyond `max` entries only expired ones are dropped, never
+ * one that is still needed, so a flood of valid signals cannot flush a sid and open the
+ * door to a replay; the cache may then hold more than `max` until entries expire (callers
+ * bound how fast signals arrive).
  */
 export class ReplayCache {
-  /** sid → time it was first seen; insertion order is oldest first. */
-  private readonly seen = new Map<string, number>()
+  /** sid → when it can be forgotten; insertion order. */
+  private readonly expiries = new Map<string, number>()
+  /** Size at which the next full sweep for expired entries runs. */
+  private sweepAt: number
 
-  constructor(
-    private readonly ttlMs = 600000,
-    private readonly max = 10000
-  ) {}
+  constructor(private readonly max = 10000) {
+    this.sweepAt = max
+  }
 
-  /** Record `sid`; true when it has not been seen within the ttl. */
-  check(sid: string, now = Date.now()): boolean {
-    for (const [key, at] of this.seen) {
-      if (now - at < this.ttlMs) break
-      this.seen.delete(key)
+  /** Number of sids remembered. */
+  get size(): number {
+    return this.expiries.size
+  }
+
+  /**
+   * Record `sid`, seen at `now`, from a signal stamped `ts` (defaults to `now`); true when
+   * it was not already remembered.
+   */
+  check(sid: string, now = Date.now(), ts = now): boolean {
+    // Cheap upkeep: entries at the front that have expired (insertion is roughly in expiry
+    // order, so this keeps the cache small in normal use).
+    for (const [key, expiry] of this.expiries) {
+      if (now < expiry) break
+      this.expiries.delete(key)
     }
-    const at = this.seen.get(sid)
-    if (at !== undefined && now - at < this.ttlMs) return false
-    this.seen.delete(sid)
-    this.seen.set(sid, now)
-    while (this.seen.size > this.max) {
-      this.seen.delete(this.seen.keys().next().value as string)
+    const expiry = this.expiries.get(sid)
+    if (expiry !== undefined && now < expiry) return false
+    this.expiries.delete(sid)
+    this.expiries.set(sid, Math.max(now, ts) + DEFAULTS.signalMaxSkewMs + REPLAY_MARGIN_MS)
+    if (this.expiries.size > this.sweepAt) {
+      for (const [key, at] of this.expiries) if (now >= at) this.expiries.delete(key)
+      // Sweep again only once the cache has grown by half, so a cache full of entries that
+      // are all still needed is not rescanned on every check.
+      this.sweepAt = Math.max(this.max, Math.ceil(this.expiries.size * 1.5))
     }
     return true
   }
 }
 
-/** True for a well-formed envelope: `v` 1, a non-empty bounded `sid`, a string `ciphertext`. */
+/**
+ * True for a well-formed envelope: `v` 1, a non-empty bounded `sid`, a string `ciphertext`
+ * of at most {@link MAX_SIGNAL_CIPHERTEXT_CHARS} characters.
+ */
 export function isSignalEnvelope(x: unknown): x is SignalEnvelope {
   if (typeof x !== 'object' || x === null) return false
   const e = x as Record<string, unknown>
@@ -51,7 +80,8 @@ export function isSignalEnvelope(x: unknown): x is SignalEnvelope {
     typeof e.sid === 'string' &&
     e.sid.length > 0 &&
     e.sid.length <= MAX_SIGNAL_SID_CHARS &&
-    typeof e.ciphertext === 'string'
+    typeof e.ciphertext === 'string' &&
+    e.ciphertext.length <= MAX_SIGNAL_CIPHERTEXT_CHARS
   )
 }
 
@@ -89,16 +119,29 @@ export async function sealSignal(
 
 /**
  * Decrypt and check a signal received from `from` (the identity the carrier
- * asserts). The plaintext must name the same sender, be addressed to `me`, carry
- * the envelope's sid, be within ±120 s of `now`, have an sdp of at most 16384
- * characters and a sid not seen before. The sid is recorded only when every
- * other check passes. Any failure rejects with `WebRTPayError('invalid_signal')`.
+ * asserts). The envelope must be well formed (ciphertext of at most
+ * {@link MAX_SIGNAL_CIPHERTEXT_CHARS} characters, checked before decrypting); the
+ * plaintext must name the same sender, be addressed to `me`, carry the envelope's sid, be
+ * within ±120 s of `now`, have an sdp of at most 16384 characters, pass `wanted` when it
+ * is given, and carry a sid not seen before. The sid is recorded only when every other
+ * check passes. Any failure rejects with `WebRTPayError('invalid_signal')`.
+ *
+ * @param o.wanted - Called last, before the sid is recorded: false rejects the signal and
+ * leaves its sid unrecorded, so a signal the caller has no use for (an answer to a dial it
+ * is not making, forged with a sid seen in the clear) cannot burn a sid the genuine signal
+ * still needs.
  */
 export async function openSignal(
   wallet: Pick<WalletLike, 'decrypt'>,
   from: PubKeyHex,
   e: SignalEnvelope,
-  o: { me: PubKeyHex; now?: number; replay: ReplayCache; originator?: string }
+  o: {
+    me: PubKeyHex
+    now?: number
+    replay: ReplayCache
+    originator?: string
+    wanted?: (p: SignalPlaintext) => boolean
+  }
 ): Promise<SignalPlaintext> {
   if (!isSignalEnvelope(e)) throw invalid('Malformed signal envelope')
   if (!isIdentityKey(from)) throw invalid('Signal sender is not an identity key')
@@ -129,7 +172,8 @@ export async function openSignal(
   if (p.sdp !== undefined && p.sdp.length > MAX_SIGNAL_SDP_CHARS) {
     throw invalid('Signal sdp is too long')
   }
-  if (!o.replay.check(p.sid, now)) throw invalid('Signal was replayed')
+  if (o.wanted !== undefined && !o.wanted(p)) throw invalid('Signal is not wanted')
+  if (!o.replay.check(p.sid, now, p.ts)) throw invalid('Signal was replayed')
   return p
 }
 

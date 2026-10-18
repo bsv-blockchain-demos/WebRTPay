@@ -3,13 +3,14 @@ import {
   FRAME_HEADER_BYTES,
   FrameDecoder,
   MAX_JSON_DEPTH,
+  MAX_JSON_TOKENS,
   encodeMessage
 } from '../src/channel/frames.js'
 import { DEFAULTS } from '../src/types.js'
 import { concatBytes, utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
 import type { WebRTPayErrorCode } from '../src/util/errors.js'
-import { nestingDepth, rawFrame, rawFramesOf } from './helpers/frames.js'
+import { nestingDepth, rawFrame, rawFramesOf, structuralTokens } from './helpers/frames.js'
 
 function codeOf(fn: () => unknown): WebRTPayErrorCode | undefined {
   try {
@@ -452,7 +453,7 @@ describe('FrameDecoder nesting limit', () => {
 
   it('counts only open containers, not their total', () => {
     const wide =
-      '{"a":[' + Array.from({ length: 500 }, () => arrays(MAX_JSON_DEPTH - 2)).join(',') + ']}'
+      '{"a":[' + Array.from({ length: 100 }, () => arrays(MAX_JSON_DEPTH - 2)).join(',') + ']}'
     expect(nestingDepth(JSON.parse(wide))).toBe(MAX_JSON_DEPTH)
     expect(decoder().push(rawFrame(0, true, wide))).toEqual(JSON.parse(wide))
   })
@@ -521,5 +522,99 @@ describe('FrameDecoder nesting limit', () => {
   it('still reports too_large first for an oversized bomb', () => {
     const text = '{"a":' + arrays(5000) + '}'
     expect(codeOf(() => decoder(1000).push(rawFrame(0, true, text)))).toBe('too_large')
+  })
+})
+
+describe('FrameDecoder token limit', () => {
+  /** `{"a":[0,0,…]}` with exactly `tokens` structural tokens: `{`, `:`, `[` and the commas. */
+  function wideArray(tokens: number): string {
+    return `{"a":[${Array.from({ length: tokens - 2 }, () => '0').join(',')}]}`
+  }
+
+  /** `{"k0":0,"k1":0,…}` with `members` members: 2 tokens each (`{` plus `:`s and `,`s). */
+  function wideObject(members: number): string {
+    return `{${Array.from({ length: members }, (_, i) => `"k${i}":0`).join(',')}}`
+  }
+
+  function parseCalls(fn: () => void): number {
+    const spy = jest.spyOn(JSON, 'parse')
+    try {
+      fn()
+      return spy.mock.calls.length
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('measures tokens the way the limit is documented', () => {
+    expect(structuralTokens(JSON.parse('{"a":1}'))).toBe(2)
+    expect(structuralTokens(JSON.parse('{"a":[1,2,{}],"b":"x,:[{"}'))).toBe(8)
+    expect(structuralTokens(JSON.parse(wideArray(MAX_JSON_TOKENS)))).toBe(MAX_JSON_TOKENS)
+    expect(structuralTokens(JSON.parse(wideObject(MAX_JSON_TOKENS / 2)))).toBe(MAX_JSON_TOKENS)
+  })
+
+  it('decodes exactly MAX_JSON_TOKENS tokens and rejects one more before parsing', () => {
+    expect(MAX_JSON_TOKENS).toBe(4096)
+    for (const [ok, over] of [
+      [wideArray(MAX_JSON_TOKENS), wideArray(MAX_JSON_TOKENS + 1)],
+      [wideObject(MAX_JSON_TOKENS / 2), `${wideObject(MAX_JSON_TOKENS / 2).slice(0, -1)},"z":0}`]
+    ]) {
+      expect(decoder().push(rawFrame(0, true, ok))).toEqual(JSON.parse(ok))
+      // Split into tiny frames, so reassembly feeds the check too.
+      expect(feed(decoder(), rawFramesOf(ok, 0, FRAME_HEADER_BYTES + 7))).toEqual([JSON.parse(ok)])
+      const calls = parseCalls(() => {
+        expect(codeOf(() => decoder().push(rawFrame(0, true, over)))).toBe('protocol')
+        expect(codeOf(() => feed(decoder(), rawFramesOf(over, 0, FRAME_HEADER_BYTES + 7)))).toBe(
+          'protocol'
+        )
+      })
+      expect(calls).toBe(0)
+    }
+  })
+
+  it('rejects a 16 MiB array of empty objects quickly and without parsing it', () => {
+    // The audit's amplification bomb: valid JSON, depth 3, about 5.6 million objects.
+    const head = '{"t":"x","a":['
+    const count = Math.floor((DEFAULTS.inboundMaxMessageBytes - head.length - 2) / 3)
+    const text = head + Array.from({ length: count }, () => '{}').join(',') + ']}'
+    expect(text.length).toBeLessThanOrEqual(DEFAULTS.inboundMaxMessageBytes)
+    const frames = rawFramesOf(text)
+
+    const d = decoder(DEFAULTS.inboundMaxMessageBytes)
+    let error: unknown
+    const started = performance.now()
+    const calls = parseCalls(() => {
+      try {
+        feed(d, frames)
+      } catch (e) {
+        error = e
+      }
+    })
+
+    expect((error as WebRTPayError).code).toBe('protocol')
+    expect(calls).toBe(0)
+    expect(performance.now() - started).toBeLessThan(1000)
+  })
+
+  it('does not count commas, colons or brackets inside strings', () => {
+    const noisy = ',:[{'.repeat(5000)
+    const text = JSON.stringify({ s: noisy, t: `\\"${noisy}`, a: [noisy] })
+    expect(decoder().push(rawFrame(0, true, text))).toEqual(JSON.parse(text))
+  })
+
+  it('leaves room for a large payment: its transaction is a single string', () => {
+    const payment = {
+      t: 'payment',
+      id: 'abc',
+      token: {
+        customInstructions: { derivationPrefix: 'cA==', derivationSuffix: 'cw==' },
+        transaction: 'A'.repeat(2 * 1024 * 1024),
+        amount: 1000,
+        outputIndex: 0
+      },
+      note: 'lunch'
+    }
+    expect(structuralTokens(payment)).toBeLessThan(32)
+    expect(feed(decoder(4 * 1024 * 1024), encodeMessage(0, payment))).toEqual([payment])
   })
 })

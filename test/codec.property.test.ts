@@ -189,7 +189,7 @@ const offerFields = fc.record(
   { requiredKeys: ['sid', 'identityKey', 'sdp'] }
 )
 
-const answerFields = fc.record({ sid, identityKey, sdp: codeSdp })
+const answerFields = fc.record({ sid, sdp: codeSdp })
 
 /** LEB128, as the code body uses for TLV lengths and numbers. */
 function varint(n: number): Uint8Array {
@@ -219,7 +219,8 @@ function decodesOrRejects(text: string): void {
   expect(['offer', 'answer']).toContain(decoded.kind)
   expect(decoded.sid).toBeInstanceOf(Uint8Array)
   expect(decoded.sid.length).toBe(16)
-  expect(isIdentityKey(decoded.identityKey)).toBe(true)
+  if (decoded.kind === 'offer') expect(isIdentityKey(decoded.identityKey)).toBe(true)
+  else expect(Object.keys(decoded).sort()).toEqual(['kind', 'sdp', 'sid'])
   expect(typeof decoded.sdp).toBe('string')
 }
 
@@ -227,9 +228,11 @@ const validCodeBody = fc
   .oneof(offerFields.map(encodeOfferCode), answerFields.map(encodeAnswerCode))
   .map(code => fromBase64Url(code.slice(CODE_PREFIX.length)))
 
-const validHeader = fc
-  .tuple(fc.constantFrom(1, 2), sid, identityKey)
-  .map(([kind, s, key]) => concatBytes(Uint8Array.of(1, kind), s, fromHex(key)))
+// An offer header carries the payee's key; an answer header ends after the sid.
+const validHeader = fc.oneof(
+  fc.tuple(sid, identityKey).map(([s, key]) => concatBytes(Uint8Array.of(1, 1), s, fromHex(key))),
+  sid.map(s => concatBytes(Uint8Array.of(1, 2), s))
+)
 
 const hostileTlv = fc
   .record({

@@ -4,12 +4,15 @@ import { decodeCode, encodeAnswerCode, encodeOfferCode } from '../src/codec/code
 import type { AnswerCode, OfferCode } from '../src/codec/codes.js'
 import { decodeSdp, encodeSdp, sdpFingerprints } from '../src/codec/sdp.js'
 import { CODE_PREFIX } from '../src/types.js'
-import { concatBytes, fromBase64Url, toBase64Url, utf8Encode } from '../src/util/bytes.js'
+import { concatBytes, fromBase64Url, fromHex, toBase64Url, utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
 import type { WebRTPayErrorCode } from '../src/util/errors.js'
 import { cleanupRtc, nodeRtc } from './helpers/rtc.js'
 
-/** A real Chromium 152 data-channel offer: two mDNS hosts, srflx IPv4 and srflx IPv6. */
+/**
+ * A Chromium 152 data-channel offer: two mDNS hosts, srflx IPv4 and srflx IPv6. The public
+ * addresses are documentation ranges (RFC 5737, RFC 3849), never a real capture's.
+ */
 const CHROMIUM_OFFER = [
   'v=0',
   'o=- 1545341433245991043 2 IN IP4 127.0.0.1',
@@ -232,9 +235,9 @@ describe('encodeSdp / decodeSdp: compact form', () => {
         'a=candidate:1 1 udp 1 2001:0DB8:0000:0000:0000:0000:0000:0001 5000 typ relay raddr 0.0.0.0 rport 0',
         'a=candidate:2 1 udp 1 5782404B-578F-45CC-93B2-B088C7B105AF.local 5001 typ host',
         'a=candidate:3 1 udp 1 10.0.0.1 5002 typ prflx raddr 0.0.0.0 rport 0',
-        'a=candidate:4 1 udp 1 1:0:0:2:0:0:3:4 5003 typ host',
-        'a=candidate:5 1 udp 1 1:0:0:2:0:0:0:4 5004 typ host',
-        'a=candidate:6 1 udp 1 1:0:2:3:4:5:6:7 5005 typ host'
+        'a=candidate:4 1 udp 1 2001:db8:0:0:1:0:0:4 5003 typ host',
+        'a=candidate:5 1 udp 1 2001:db8:0:0:1:0:0:0 5004 typ host',
+        'a=candidate:6 1 udp 1 2001:db8:0:3:4:5:6:7 5005 typ host'
       ].join('\r\n')
     )
     expect(candidates(decodeSdp(encodeSdp(sdp)))).toEqual([
@@ -246,10 +249,11 @@ describe('encodeSdp / decodeSdp: compact form', () => {
         type: 'host'
       },
       { transport: 'udp', address: '10.0.0.1', port: 5002, type: 'prflx' },
-      // Equal runs: the first is compressed. A single zero group is never compressed.
-      { transport: 'udp', address: '1::2:0:0:3:4', port: 5003, type: 'host' },
-      { transport: 'udp', address: '1:0:0:2::4', port: 5004, type: 'host' },
-      { transport: 'udp', address: '1:0:2:3:4:5:6:7', port: 5005, type: 'host' }
+      // Equal runs: the first is compressed; a longer later run wins; a single zero group is
+      // never compressed.
+      { transport: 'udp', address: '2001:db8::1:0:0:4', port: 5003, type: 'host' },
+      { transport: 'udp', address: '2001:db8:0:0:1::', port: 5004, type: 'host' },
+      { transport: 'udp', address: '2001:db8:0:3:4:5:6:7', port: 5005, type: 'host' }
     ])
   })
 
@@ -401,9 +405,26 @@ describe('offer and answer codes', () => {
 
   it('round trips an answer, including a raw-fallback SDP', () => {
     const raw = 'v=0\r\na=custom\r\n'
-    const code = encodeAnswerCode({ sid: SID, identityKey: IDENTITY_KEY, sdp: raw })
-    const expected: AnswerCode = { kind: 'answer', sid: SID, identityKey: IDENTITY_KEY, sdp: raw }
+    const code = encodeAnswerCode({ sid: SID, sdp: raw })
+    const expected: AnswerCode = { kind: 'answer', sid: SID, sdp: raw }
     expect(decodeCode(code)).toStrictEqual(expected)
+  })
+
+  it('writes no identity key into an answer: [1][2][sid][TLVs]', () => {
+    // The payee learns the payer's key from the handshake; a bystander reading the answer
+    // QR does not.
+    const code = encodeAnswerCode({ sid: SID, sdp: offerSdp })
+    const body = fromBase64Url(code.slice(CODE_PREFIX.length))
+    const sdpBytes = encodeSdp(offerSdp)
+    expect(body.subarray(0, 2)).toEqual(Uint8Array.of(1, 2))
+    expect(body.subarray(2, 18)).toEqual(SID)
+    expect(body.subarray(18, 21)).toEqual(
+      Uint8Array.of(0x10, (sdpBytes.length & 0x7f) | 0x80, sdpBytes.length >> 7)
+    )
+    expect(body.subarray(21)).toEqual(sdpBytes)
+    // An offer still names the payee.
+    const offer = encodeOfferCode({ sid: SID, identityKey: IDENTITY_KEY, sdp: offerSdp })
+    expect(fromBase64Url(offer.slice(CODE_PREFIX.length)).length).toBe(body.length + 33)
   })
 
   it('stores expiresAt with second precision, rounded down', () => {
@@ -417,7 +438,7 @@ describe('offer and answer codes', () => {
   })
 
   it('accepts surrounding whitespace from scanners and paste', () => {
-    const code = encodeAnswerCode({ sid: SID, identityKey: IDENTITY_KEY, sdp: offerSdp })
+    const code = encodeAnswerCode({ sid: SID, sdp: offerSdp })
     expect(decodeCode(`  ${code}\n`).kind).toBe('answer')
   })
 
@@ -538,9 +559,16 @@ describe('decodeCode rejects', () => {
         code(header, Uint8Array.of(0x02, 8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10), sdpTlv)
     ],
     ['malformed UTF-8 in chain', () => code(header, Uint8Array.of(0x01, 1, 0xff), sdpTlv)],
+    ['a truncated answer header', () => code(Uint8Array.of(1, 2), SID.subarray(0, 15))],
     [
       'an answer carrying offer-only fields',
-      () => code(Uint8Array.of(1, 2), header.subarray(2), Uint8Array.of(0x02, 1, 5), sdpTlv)
+      () => code(Uint8Array.of(1, 2), SID, Uint8Array.of(0x02, 1, 5), sdpTlv)
+    ],
+    // The old answer layout, with the payer's 33-byte key after the sid: its first byte (2 or
+    // 3) reads as an offer-only tag.
+    [
+      'an answer in the old layout with an identity key',
+      () => code(Uint8Array.of(1, 2), SID, fromHex(IDENTITY_KEY), sdpTlv)
     ],
     ['an sdp tag with malformed compact bytes', () => code(header, Uint8Array.of(0x10, 2, 1, 0))]
   ]
@@ -566,13 +594,13 @@ describe('encodeOfferCode / encodeAnswerCode validate their input', () => {
     expect(() => encodeOfferCode(fields)).toThrow(RangeError)
   })
 
-  it('throws RangeError for an invalid answer identity key', () => {
-    expect(() => encodeAnswerCode({ ...base, identityKey: 'nope' })).toThrow(RangeError)
+  it('throws RangeError for an answer sid that is not 16 bytes', () => {
+    expect(() => encodeAnswerCode({ sid: new Uint8Array(17), sdp })).toThrow(RangeError)
   })
 
   it('throws too_large instead of emitting a code longer than 4000 characters', () => {
     const big = `v=0\r\n${'a=x-padding:0123456789\r\n'.repeat(130)}`
-    expectWebRTPayError(() => encodeAnswerCode({ ...base, sdp: big }), 'too_large')
+    expectWebRTPayError(() => encodeAnswerCode({ sid: SID, sdp: big }), 'too_large')
   })
 })
 

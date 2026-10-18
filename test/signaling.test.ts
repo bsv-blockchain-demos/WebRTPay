@@ -4,7 +4,13 @@ import type { WalletEncryptArgs } from '@bsv/sdk'
 import { SIGNALING_PROTOCOL_ID, SIGNALS_MESSAGEBOX } from '../src/types.js'
 import { fromBase64, randomBytes, toBase64, toBase64Url, utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
-import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
+import {
+  MAX_SIGNAL_CIPHERTEXT_CHARS,
+  ReplayCache,
+  isSignalEnvelope,
+  openSignal,
+  sealSignal
+} from '../src/signaling/envelope.js'
 import { createMemoryHub } from '../src/signaling/MemorySignaler.js'
 import { MessageBoxSignaler } from '../src/signaling/MessageBoxSignaler.js'
 import type { MessageBoxLike } from '../src/signaling/MessageBoxSignaler.js'
@@ -258,6 +264,78 @@ describe('signal envelopes', () => {
     ).resolves.toMatchObject({ sid: e.sid })
   })
 
+  it('remembers a sid until a signal with its timestamp could no longer be fresh', async () => {
+    // ts is 120 s ahead of the receiver's clock (the most the skew allows), so the signal
+    // stays fresh until NOW + 240 s; a cache that ignored ts would forget the sid at
+    // NOW + 180 s and take the replay.
+    const replay = new ReplayCache()
+    const e = await sealSignal(alice.wallet, offer({ ts: NOW + 120_000 }))
+    await openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay })
+    await expectInvalid(
+      openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW + 239_000, replay })
+    )
+  })
+
+  it('checks wanted last, and an unwanted signal leaves its sid unrecorded', async () => {
+    const replay = new ReplayCache()
+    const e = await sealSignal(alice.wallet, offer())
+    const seen: SignalPlaintext[] = []
+    const unwanted = (p: SignalPlaintext): boolean => {
+      seen.push(p)
+      return false
+    }
+    await expectInvalid(
+      openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay, wanted: unwanted })
+    )
+    expect(seen).toEqual([expect.objectContaining({ sid: e.sid, from: alice.key })])
+    // not consulted for a signal that fails another check
+    await expectInvalid(
+      openSignal(bob.wallet, alice.key, e, {
+        me: bob.key,
+        now: NOW + 121_000,
+        replay,
+        wanted: unwanted
+      })
+    )
+    expect(seen).toHaveLength(1)
+    await expect(
+      openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay, wanted: () => true })
+    ).resolves.toMatchObject({ sid: e.sid })
+    await expectInvalid(openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay }))
+  })
+
+  it('rejects ciphertext longer than 24576 characters before decrypting it', async () => {
+    expect(MAX_SIGNAL_CIPHERTEXT_CHARS).toBe(24576)
+    const decrypt = jest.spyOn(bob.wallet, 'decrypt')
+    try {
+      const atCap = { v: 1, sid: newSid(), ciphertext: 'A'.repeat(MAX_SIGNAL_CIPHERTEXT_CHARS) }
+      const over = { ...atCap, ciphertext: `${atCap.ciphertext}A` }
+      expect(isSignalEnvelope(atCap)).toBe(true)
+      expect(isSignalEnvelope(over)).toBe(false)
+      await expectInvalid(
+        openSignal(bob.wallet, alice.key, over as SignalEnvelope, {
+          me: bob.key,
+          now: NOW,
+          replay: new ReplayCache()
+        })
+      )
+      expect(decrypt).not.toHaveBeenCalled()
+    } finally {
+      decrypt.mockRestore()
+    }
+  })
+
+  it('fits a signal carrying the longest SDP allowed under the ciphertext cap', async () => {
+    // 16384 characters in 72-character lines, as a large real SDP might be.
+    const line = `a=candidate:1 1 udp 2113937151 ${'x'.repeat(36)}.local 5000 typ host\r\n`
+    const sdp = line.repeat(Math.ceil(16384 / line.length)).slice(0, 16384)
+    const e = await sealSignal(alice.wallet, offer({ sdp }))
+    expect(e.ciphertext.length).toBeLessThanOrEqual(MAX_SIGNAL_CIPHERTEXT_CHARS)
+    await expect(
+      openSignal(bob.wallet, alice.key, e, { me: bob.key, now: NOW, replay: new ReplayCache() })
+    ).resolves.toMatchObject({ sdp })
+  })
+
   it('rejects an envelope sid that differs from the plaintext sid', async () => {
     const sid = newSid()
     const e = await craft(alice, bob.key, sid, offer({ sid: newSid() }))
@@ -353,6 +431,9 @@ describe('signal envelopes', () => {
 })
 
 describe('ReplayCache', () => {
+  /** signalMaxSkewMs (120 s) plus the 60 s margin. */
+  const KEEP = 180_000
+
   it('reports only the first sighting of a sid', () => {
     const c = new ReplayCache()
     expect(c.check('a', 0)).toBe(true)
@@ -360,29 +441,67 @@ describe('ReplayCache', () => {
     expect(c.check('b', 1)).toBe(true)
   })
 
-  it('forgets a sid after the ttl', () => {
-    const c = new ReplayCache(1000)
-    expect(c.check('a', 0)).toBe(true)
-    expect(c.check('a', 999)).toBe(false)
-    expect(c.check('a', 1000)).toBe(true)
-    expect(c.check('a', 1500)).toBe(false)
+  it('remembers a sid until max(seen, ts) + 120 s + 60 s', () => {
+    const c = new ReplayCache()
+    // ts in the past: counted from when it was seen
+    expect(c.check('past', 1000, 1000 - 120_000)).toBe(true)
+    expect(c.check('past', 1000 + KEEP - 1)).toBe(false)
+    expect(c.check('past', 1000 + KEEP)).toBe(true)
+    // ts in the future: counted from ts, which can stay fresh until ts + 120 s
+    expect(c.check('future', 1000, 1000 + 120_000)).toBe(true)
+    expect(c.check('future', 1000 + 120_000 + KEEP - 1)).toBe(false)
+    expect(c.check('future', 1000 + 120_000 + KEEP)).toBe(true)
   })
 
-  it('evicts the oldest sid beyond max', () => {
-    const c = new ReplayCache(60_000, 2)
-    expect(c.check('a', 0)).toBe(true)
-    expect(c.check('b', 0)).toBe(true)
-    expect(c.check('c', 0)).toBe(true)
-    expect(c.check('c', 1)).toBe(false)
-    expect(c.check('b', 1)).toBe(false)
-    expect(c.check('a', 1)).toBe(true)
+  it('never evicts a sid that could still pass the freshness check, even beyond max', () => {
+    // A flood of valid junk from throwaway identities must not flush a captured sid.
+    const c = new ReplayCache(100)
+    expect(c.check('captured', 0)).toBe(true)
+    for (let i = 0; i < 1000; i++) expect(c.check(`junk-${i}`, i)).toBe(true)
+    expect(c.size).toBe(1001)
+    expect(c.check('captured', 1000)).toBe(false)
   })
 
-  it('defaults to a ten minute ttl and the current time', () => {
+  it('evicts only expired sids once beyond max', () => {
+    const c = new ReplayCache(2)
+    c.check('old', 0)
+    c.check('newer', 100_000)
+    expect(c.size).toBe(2)
+    // 'old' expired at 180 s; 'newer' is kept until 280 s
+    c.check('latest', 190_000)
+    expect(c.size).toBe(2)
+    expect(c.check('newer', 190_000)).toBe(false)
+    expect(c.check('old', 190_000)).toBe(true)
+  })
+
+  it('sweeps out expired sids kept behind a longer-lived one once the cache has grown', () => {
+    const c = new ReplayCache(2)
+    c.check('long', 0, 120_000) // kept until 300 s, at the front
+    c.check('b', 0)
+    c.check('c', 0)
+    expect(c.size).toBe(3)
+    // b and c expired at 180 s but sit behind 'long'; the sweep runs when the cache has
+    // grown by half since the last one
+    c.check('d', 200_000)
+    c.check('e', 200_000)
+    expect(c.size).toBe(5)
+    c.check('f', 200_000)
+    expect(c.size).toBe(4)
+    expect(c.check('long', 200_000)).toBe(false)
+  })
+
+  it('stays small when nothing is over max: expired sids at the front are dropped', () => {
+    const c = new ReplayCache()
+    for (let i = 0; i < 100; i++) c.check(`s${i}`, i * 10_000)
+    // at 990 s only the sids seen in the last 180 s are left
+    expect(c.size).toBe(18)
+  })
+
+  it('defaults to the current time', () => {
     const c = new ReplayCache()
     expect(c.check('a')).toBe(true)
     expect(c.check('a')).toBe(false)
-    expect(c.check('a', Date.now() + 600_000)).toBe(true)
+    expect(c.check('a', Date.now() + KEEP + 1000)).toBe(true)
   })
 })
 
@@ -492,9 +611,11 @@ class FakeMessageBox {
   }
 }
 
+type ListArgs = Parameters<MessageBoxLike['listMessages']>[0]
+
 class FakeClient implements MessageBoxLike {
   sent: Array<{ args: unknown; overrideHost: string | undefined }> = []
-  lists: Array<{ messageBox: string; host?: string; at: number }> = []
+  lists: Array<ListArgs & { at: number }> = []
   listFailures = 0
   ackFailures = 0
   sendFailure: Error | undefined
@@ -515,12 +636,10 @@ class FakeClient implements MessageBoxLike {
     return { status: 'success' }
   }
 
-  async listMessages(a: {
-    messageBox: string
-    host?: string
-  }): Promise<
-    Array<{ messageId: string; sender: string; body: string | Record<string, unknown> }>
-  > {
+  /** Like a server or client that ignores `limit`: every stored message is listed. */
+  async listMessages(
+    a: ListArgs
+  ): Promise<Array<{ messageId: string; sender: string; body: string | Record<string, unknown> }>> {
     this.lists.push({ ...a, at: Date.now() })
     if (this.listGate) await this.listGate
     if (this.listFailures > 0) {
@@ -608,7 +727,108 @@ describe('MessageBoxSignaler', () => {
     try {
       await jest.advanceTimersByTimeAsync(7500)
       expect(b.lists.map(l => l.at - t0)).toEqual([0, 2500, 5000, 7500])
-      expect(b.lists[0]).toEqual({ messageBox: 'webrtpay_signals', at: t0 })
+      // one bounded page per poll, and never payments
+      expect(b.lists[0]).toEqual({
+        messageBox: 'webrtpay_signals',
+        limit: 100,
+        pageSize: 100,
+        maxPages: 1,
+        acceptPayments: false,
+        at: t0
+      })
+    } finally {
+      await stop()
+    }
+  })
+
+  /** Deposit `n` distinct envelopes from ALICE to BOB; returns their sids in order. */
+  function depositMany(server: FakeMessageBox, n: number): string[] {
+    return Array.from({ length: n }, (_, i) => {
+      const sid = `sid-${i}`
+      server.deposit(BOB, ALICE, JSON.stringify({ ...ENV, sid }))
+      return sid
+    })
+  }
+
+  it('handles at most 100 new messages per poll and leaves the rest for later polls', async () => {
+    const server = new FakeMessageBox()
+    const sids = depositMany(server, 250)
+    const b = server.client(BOB)
+    const { got, fn } = collect()
+    const stop = await new MessageBoxSignaler(b).listen(fn)
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      expect(got.map(([, e]) => e.sid)).toEqual(sids.slice(0, 100))
+      // the rest is neither read nor acknowledged yet
+      expect(server.acks.flatMap(a => a.messageIds)).toHaveLength(100)
+      expect(server.messages).toHaveLength(150)
+      await jest.advanceTimersByTimeAsync(2500)
+      expect(got).toHaveLength(200)
+      await jest.advanceTimersByTimeAsync(2500)
+      expect(got.map(([, e]) => e.sid)).toEqual(sids)
+      expect(server.messages).toEqual([])
+    } finally {
+      await stop()
+    }
+  })
+
+  it('acks in batches of at most 100; a failed batch is retried without backing off', async () => {
+    const server = new FakeMessageBox()
+    depositMany(server, 150)
+    const b = server.client(BOB)
+    // the only batch of the first poll and the first batch of the second fail
+    b.ackFailures = 2
+    const { got, fn } = collect()
+    const stop = await new MessageBoxSignaler(b).listen(fn)
+    const ids = (from: number, to: number): string[] =>
+      Array.from({ length: to - from + 1 }, (_, i) => `m${from + i}`)
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      expect(got).toHaveLength(100)
+      expect(server.acks).toEqual([])
+      await jest.advanceTimersByTimeAsync(2500)
+      expect(got).toHaveLength(150)
+      expect(server.acks).toEqual([{ identity: BOB, messageIds: ids(101, 150) }])
+      await jest.advanceTimersByTimeAsync(2500)
+      expect(server.acks).toEqual([
+        { identity: BOB, messageIds: ids(101, 150) },
+        { identity: BOB, messageIds: ids(1, 100) }
+      ])
+      expect(server.messages).toEqual([])
+      // nothing delivered twice, and no backoff after the failed batches
+      expect(new Set(got.map(([, e]) => e.sid)).size).toBe(150)
+      expect(b.lists.map(l => l.at - t0)).toEqual([0, 2500, 5000])
+    } finally {
+      await stop()
+    }
+  })
+
+  it('gives up on a poll stalled for 10 s, backs off, and ignores it if it returns', async () => {
+    const server = new FakeMessageBox()
+    server.deposit(BOB, ALICE, JSON.stringify(ENV))
+    const b = server.client(BOB)
+    let open!: () => void
+    b.listGate = new Promise(resolve => (open = resolve))
+    const { got, fn } = collect()
+    const stop = await new MessageBoxSignaler(b).listen(fn)
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      b.listGate = undefined // only the first list call hangs
+      await jest.advanceTimersByTimeAsync(9999)
+      expect(b.lists).toHaveLength(1)
+      // abandoned at 10 s; the stalled call returns at 12 s and is ignored
+      await jest.advanceTimersByTimeAsync(2001)
+      open()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(got).toEqual([])
+      expect(server.acks).toEqual([])
+      // a failed poll doubles the wait: the next one is at 10 s + 5 s
+      await jest.advanceTimersByTimeAsync(2999)
+      expect(b.lists).toHaveLength(1)
+      await jest.advanceTimersByTimeAsync(1)
+      expect(b.lists.map(l => l.at - t0)).toEqual([0, 15_000])
+      expect(got).toEqual([[ALICE, ENV]])
+      expect(server.acks).toEqual([{ identity: BOB, messageIds: ['m1'] }])
     } finally {
       await stop()
     }
@@ -668,7 +888,7 @@ describe('MessageBoxSignaler', () => {
       await jest.advanceTimersByTimeAsync(0)
       expect(got).toEqual([[ALICE, ENV]])
       expect(server.acks).toEqual([])
-      await jest.advanceTimersByTimeAsync(5000)
+      await jest.advanceTimersByTimeAsync(2500)
       expect(b.lists).toHaveLength(2)
       expect(got).toHaveLength(1)
       expect(server.acks).toEqual([{ identity: BOB, messageIds: ['m1'] }])
@@ -913,6 +1133,10 @@ describe('MessageBoxSignaler', () => {
       expect(b.lists[1]).toEqual({
         messageBox: 'custom_box',
         host: 'https://mb.example',
+        limit: 100,
+        pageSize: 100,
+        maxPages: 1,
+        acceptPayments: false,
         at: t0 + 2500
       })
       expect(server.acks).toEqual([

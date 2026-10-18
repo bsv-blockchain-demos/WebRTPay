@@ -3,8 +3,9 @@
  *
  * Wire form: `CODE_PREFIX + base64url(body)`, at most {@link MAX_CODE_LENGTH} characters.
  * ```
- * [version u8 = 1][kind u8: 1 offer, 2 answer][sid, 16 bytes][identity key, 33 bytes]
- * then TLVs: [tag u8][length varint][value]
+ * offer:  [version u8 = 1][kind u8 = 1][sid, 16 bytes][payee identity key, 33 bytes][TLVs]
+ * answer: [version u8 = 1][kind u8 = 2][sid, 16 bytes][TLVs]
+ * TLVs: [tag u8][length varint][value]
  *   0x01 chain      UTF-8 (offer only)
  *   0x02 amount     varint satoshis, at least 1 (offer only)
  *   0x03 expiresAt  varint seconds since the epoch (offer only)
@@ -12,6 +13,9 @@
  * ```
  * Varints are unsigned LEB128, minimally encoded, at most 2^53 - 1. Unknown tags are
  * skipped; a repeated known tag is rejected.
+ *
+ * An answer carries no identity key: the payee learns the payer's key from the identity
+ * handshake that follows, so writing it into a QR code would only show it to bystanders.
  */
 import { CODE_PREFIX, isIdentityKey } from '../types.js'
 import type { PubKeyHex } from '../types.js'
@@ -44,13 +48,14 @@ export interface OfferCode {
   sdp: string
 }
 
-/** Shown by the payer in reply to an offer code: who they are and their SDP answer. */
+/**
+ * Shown by the payer in reply to an offer code: their SDP answer. It does not name the
+ * payer; the handshake proves who they are.
+ */
 export interface AnswerCode {
   kind: 'answer'
   /** The session id of the offer being answered. */
   sid: Uint8Array
-  /** The payer's identity key. */
-  identityKey: PubKeyHex
   /** The payer's SDP answer. */
   sdp: string
 }
@@ -63,7 +68,8 @@ const KIND_OFFER = 1
 const KIND_ANSWER = 2
 const SID_BYTES = 16
 const KEY_BYTES = 33
-const HEADER_BYTES = 2 + SID_BYTES + KEY_BYTES
+const ANSWER_HEADER_BYTES = 2 + SID_BYTES
+const OFFER_HEADER_BYTES = ANSWER_HEADER_BYTES + KEY_BYTES
 
 const TAG_CHAIN = 0x01
 const TAG_AMOUNT = 0x02
@@ -84,6 +90,9 @@ function invalid(message: string, cause?: unknown): WebRTPayError {
  * `WebRTPayError('too_large')` when the code would exceed {@link MAX_CODE_LENGTH}.
  */
 export function encodeOfferCode(c: Omit<OfferCode, 'kind'>): string {
+  if (!isIdentityKey(c.identityKey)) {
+    throw new RangeError('identityKey must be a compressed public key in lowercase hex')
+  }
   const fields: Uint8Array[] = []
   if (c.chain !== undefined) fields.push(tlv(TAG_CHAIN, utf8Encode(c.chain)))
   if (c.amount !== undefined) {
@@ -98,7 +107,7 @@ export function encodeOfferCode(c: Omit<OfferCode, 'kind'>): string {
     }
     fields.push(tlv(TAG_EXPIRES_AT, varint(Math.floor(c.expiresAt / 1000))))
   }
-  return encodeCode(KIND_OFFER, c, fields)
+  return encodeCode(KIND_OFFER, c, [fromHex(c.identityKey)], fields)
 }
 
 /**
@@ -106,7 +115,7 @@ export function encodeOfferCode(c: Omit<OfferCode, 'kind'>): string {
  * `WebRTPayError('too_large')` when the code would exceed {@link MAX_CODE_LENGTH}.
  */
 export function encodeAnswerCode(c: Omit<AnswerCode, 'kind'>): string {
-  return encodeCode(KIND_ANSWER, c, [])
+  return encodeCode(KIND_ANSWER, c, [], [])
 }
 
 /**
@@ -132,24 +141,31 @@ export function decodeCode(
     throw invalid('Code is not valid base64url', cause)
   }
 
-  if (body.length < HEADER_BYTES) throw invalid('Code is truncated')
+  if (body.length < ANSWER_HEADER_BYTES) throw invalid('Code is truncated')
   if (body[0] !== VERSION) throw invalid(`Unsupported code version ${body[0]}`)
   const kind = body[1]
   if (kind !== KIND_OFFER && kind !== KIND_ANSWER) throw invalid(`Unknown code kind ${kind}`)
   const sid = body.slice(2, 2 + SID_BYTES)
-  const identityKey = toHex(body.subarray(2 + SID_BYTES, HEADER_BYTES))
-  if (!isIdentityKey(identityKey)) throw invalid('Code carries an invalid identity key')
+  // Only an offer names its sender (the payee); an answer's TLVs follow the sid.
+  let identityKey: PubKeyHex | undefined
+  let headerBytes = ANSWER_HEADER_BYTES
+  if (kind === KIND_OFFER) {
+    headerBytes = OFFER_HEADER_BYTES
+    if (body.length < headerBytes) throw invalid('Code is truncated')
+    identityKey = toHex(body.subarray(ANSWER_HEADER_BYTES, OFFER_HEADER_BYTES))
+    if (!isIdentityKey(identityKey)) throw invalid('Code carries an invalid identity key')
+  }
 
-  const fields = readFields(body)
+  const fields = readFields(body, headerBytes)
   const sdpBytes = fields.get(TAG_SDP)
   if (sdpBytes === undefined) throw invalid('Code has no SDP')
   const sdp = decodeSdp(sdpBytes)
 
-  if (kind === KIND_ANSWER) {
+  if (identityKey === undefined) {
     if (fields.has(TAG_CHAIN) || fields.has(TAG_AMOUNT) || fields.has(TAG_EXPIRES_AT)) {
       throw invalid('Answer code carries offer-only fields')
     }
-    return { kind: 'answer', sid, identityKey, sdp }
+    return { kind: 'answer', sid, sdp }
   }
 
   const offer: OfferCode = { kind: 'offer', sid, identityKey, sdp }
@@ -186,21 +202,20 @@ export function decodeCode(
   return offer
 }
 
+/** `[version][kind][sid]`, then `header` (the offer's key), then `fields` and the sdp TLV. */
 function encodeCode(
   kind: number,
-  c: { sid: Uint8Array; identityKey: PubKeyHex; sdp: string },
+  c: { sid: Uint8Array; sdp: string },
+  header: Uint8Array[],
   fields: Uint8Array[]
 ): string {
   if (!(c.sid instanceof Uint8Array) || c.sid.length !== SID_BYTES) {
     throw new RangeError(`sid must be ${SID_BYTES} bytes`)
   }
-  if (!isIdentityKey(c.identityKey)) {
-    throw new RangeError('identityKey must be a compressed public key in lowercase hex')
-  }
   const body = concatBytes(
     Uint8Array.of(VERSION, kind),
     c.sid,
-    fromHex(c.identityKey),
+    ...header,
     ...fields,
     tlv(TAG_SDP, encodeSdp(c.sdp))
   )
@@ -214,10 +229,10 @@ function encodeCode(
   return text
 }
 
-/** Known TLV values after the header, by tag; unknown tags are skipped. */
-function readFields(body: Uint8Array): Map<number, Uint8Array> {
+/** Known TLV values from `start` (the end of the header) on, by tag; unknown tags are skipped. */
+function readFields(body: Uint8Array, start: number): Map<number, Uint8Array> {
   const fields = new Map<number, Uint8Array>()
-  let o = HEADER_BYTES
+  let o = start
   while (o < body.length) {
     const tag = body[o]
     const length = readVarint(body, o + 1)

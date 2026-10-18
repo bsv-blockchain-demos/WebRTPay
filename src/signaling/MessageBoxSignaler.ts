@@ -15,9 +15,18 @@ export interface MessageBoxLike {
     a: { recipient: string; messageBox: string; body: string },
     overrideHost?: string
   ): Promise<unknown>
+  /**
+   * The signaler asks for one bounded page (`limit`, `pageSize`, `maxPages`) and no payment
+   * handling (`acceptPayments: false`); a client that ignores these still works, because the
+   * signaler handles at most 100 new messages per poll whatever it is given.
+   */
   listMessages(a: {
     messageBox: string
     host?: string
+    limit?: number
+    pageSize?: number
+    maxPages?: number
+    acceptPayments?: boolean
   }): Promise<Array<{ messageId: string; sender: string; body: string | Record<string, unknown> }>>
   acknowledgeMessage(a: { messageIds: string[]; host?: string }): Promise<unknown>
 }
@@ -38,18 +47,27 @@ export interface MessageBoxSignalerOptions {
 
 /** Longest wait between polls after consecutive errors. */
 const MAX_BACKOFF_MS = 30000
-/** Most message IDs `MessageBoxClient.acknowledgeMessage` accepts per call. */
-const MAX_ACK_IDS = 1000
+/** Most new messages handled per poll, and the page size asked of the server. */
+const MAX_MESSAGES_PER_POLL = 100
+/**
+ * Most message IDs per `acknowledgeMessage` call: servers cap it (500 on a small ts-stack
+ * MessageBox profile), and one refused batch must not hold back the others.
+ */
+const MAX_ACK_IDS = 100
+/** A poll (list, delivery and acks) still running after this long is abandoned. */
+const POLL_DEADLINE_MS = 10000
 /** Message IDs remembered for dedupe. */
 const MAX_SEEN_IDS = 10000
 
 /**
  * Carries signal envelopes through MessageBox. `send` posts over HTTP to the
- * recipient's host. Listening polls `listMessages`, delivers each new envelope
- * once and acknowledges every message it reads, including ones that are not
- * envelopes, so nothing lingers on the server. One poll loop serves all
- * listeners and runs while at least one is subscribed; errors double the wait
- * (up to 30 s) and never escape the loop.
+ * recipient's host. Listening polls `listMessages` for one page of at most 100
+ * messages, delivers each new envelope once and acknowledges every message it reads,
+ * including ones that are not envelopes, so nothing lingers on the server; at most 100
+ * new messages are handled per poll, the rest wait for the next. Acks go in batches of
+ * 100; a batch that fails is retried on the next poll. One poll loop serves all listeners
+ * and runs while at least one is subscribed; a failed listing or a poll that takes more
+ * than 10 s doubles the wait (up to 30 s), and errors never escape the loop.
  */
 export class MessageBoxSignaler implements Signaler {
   private readonly messageBox: string
@@ -61,6 +79,8 @@ export class MessageBoxSignaler implements Signaler {
   private readonly seen = new Map<string, boolean>()
   private active = false
   private polling = false
+  /** The poll in progress; a poll that is no longer current stops at its next step. */
+  private current: object | undefined
   private failures = 0
   private lastPollAt = 0
   private timer: ReturnType<typeof setTimeout> | undefined
@@ -106,7 +126,13 @@ export class MessageBoxSignaler implements Signaler {
 
   private poll(): void {
     this.polling = true
-    this.pollOnce()
+    const run = {}
+    this.current = run
+    let deadline: ReturnType<typeof setTimeout> | undefined
+    const stalled = new Promise<never>((_, reject) => {
+      deadline = setTimeout(() => reject(new Error('Poll timed out')), POLL_DEADLINE_MS)
+    })
+    Promise.race([this.pollOnce(run), stalled])
       .then(
         () => {
           this.failures = 0
@@ -116,6 +142,9 @@ export class MessageBoxSignaler implements Signaler {
         }
       )
       .then(() => {
+        clearTimeout(deadline)
+        // A stalled call may still return; it must not deliver or ack anything then.
+        this.current = undefined
         this.polling = false
         this.lastPollAt = Date.now()
         this.schedule()
@@ -142,15 +171,23 @@ export class MessageBoxSignaler implements Signaler {
     this.timer = undefined
   }
 
-  private async pollOnce(): Promise<void> {
+  /** One poll; `run` identifies it, and it stops once it is no longer the current one. */
+  private async pollOnce(run: object): Promise<void> {
+    const page = {
+      messageBox: this.messageBox,
+      limit: MAX_MESSAGES_PER_POLL,
+      pageSize: MAX_MESSAGES_PER_POLL,
+      maxPages: 1,
+      acceptPayments: false
+    }
     const listed: unknown = await this.client.listMessages(
-      this.host === undefined
-        ? { messageBox: this.messageBox }
-        : { messageBox: this.messageBox, host: this.host }
+      this.host === undefined ? page : { ...page, host: this.host }
     )
+    if (this.current !== run) return
     if (!Array.isArray(listed)) throw new TypeError('listMessages did not return an array')
 
     const toAck = new Set<string>()
+    let handled = 0
     for (const m of listed as unknown[]) {
       // Nobody is listening any more: leave the rest on the server for the next listener.
       if (this.subs.size === 0) break
@@ -159,6 +196,9 @@ export class MessageBoxSignaler implements Signaler {
       if (typeof messageId !== 'string') continue
       const acked = this.seen.get(messageId)
       if (acked === undefined) {
+        // Over the per-poll budget: neither read nor acked, so a later poll handles it.
+        if (handled >= MAX_MESSAGES_PER_POLL) continue
+        handled++
         this.seen.set(messageId, false)
         const e = envelopeOf(body)
         if (e !== undefined && typeof sender === 'string') dispatchSignal(this.subs, sender, e)
@@ -167,11 +207,15 @@ export class MessageBoxSignaler implements Signaler {
     }
 
     const ids = [...toAck]
-    for (let i = 0; i < ids.length; i += MAX_ACK_IDS) {
+    for (let i = 0; i < ids.length && this.current === run; i += MAX_ACK_IDS) {
       const messageIds = ids.slice(i, i + MAX_ACK_IDS)
-      await this.client.acknowledgeMessage(
-        this.host === undefined ? { messageIds } : { messageIds, host: this.host }
-      )
+      try {
+        await this.client.acknowledgeMessage(
+          this.host === undefined ? { messageIds } : { messageIds, host: this.host }
+        )
+      } catch {
+        continue // left unconfirmed: the next poll acks these again
+      }
       for (const id of messageIds) this.seen.set(id, true)
     }
     while (this.seen.size > MAX_SEEN_IDS) {

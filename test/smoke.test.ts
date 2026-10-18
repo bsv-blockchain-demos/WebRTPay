@@ -30,6 +30,9 @@ describe('package scaffold', () => {
       'encodeMessage',
       'FrameDecoder',
       'FRAME_HEADER_BYTES',
+      // wire limits a peer must respect
+      'MAX_JSON_DEPTH',
+      'MAX_JSON_TOKENS',
       'PeerLink',
       // session
       'authenticate',
@@ -51,6 +54,8 @@ describe('package scaffold', () => {
       'openSignal',
       'ReplayCache',
       'isSignalEnvelope',
+      'MAX_SIGNAL_SDP_CHARS',
+      'MAX_SIGNAL_CIPHERTEXT_CHARS',
       'createMemoryHub',
       'MessageBoxSignaler',
       'RelaySignaler',
@@ -67,7 +72,11 @@ describe('package scaffold', () => {
       'tokenFields',
       'invalidPayment',
       'parsePaymentTransaction',
-      'dispatchSignal'
+      'dispatchSignal',
+      // implementation limits and helpers
+      'MAX_BACKLOG',
+      'TokenBucket',
+      'KeyedBuckets'
     ]) {
       expect(names).not.toContain(internal)
     }

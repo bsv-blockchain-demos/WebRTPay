@@ -4,12 +4,13 @@ import {
   FRAME_HEADER_BYTES,
   FrameDecoder,
   MAX_JSON_DEPTH,
+  MAX_JSON_TOKENS,
   encodeMessage
 } from '../src/channel/frames.js'
 import { DEFAULTS } from '../src/types.js'
 import { utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
-import { nestingDepth, rawFramesOf } from './helpers/frames.js'
+import { nestingDepth, rawFramesOf, structuralTokens } from './helpers/frames.js'
 
 const MIN_PROPERTY_RUNS = 300
 const requestedRuns = Number.parseInt(process.env.FAST_CHECK_NUM_RUNS ?? '', 10)
@@ -312,8 +313,10 @@ describe('frames: nesting limit', () => {
   })
 
   // Any text at all: the decoder must agree with "JSON.parse, top level an object, at most
-  // MAX_JSON_DEPTH deep". A scanner that is too strict rejects good messages; one that is
-  // too lax lets a bomb through.
+  // MAX_JSON_DEPTH deep and at most MAX_JSON_TOKENS structural tokens". A scanner that is
+  // too strict rejects good messages; one that is too lax lets a bomb through. (The token
+  // oracle counts from the parsed value, so it is exact for texts without duplicate keys;
+  // the soup can repeat a key, but never comes near the limit.)
   const soup = fc
     .array(
       fc.constantFrom(
@@ -355,7 +358,24 @@ describe('frames: nesting limit', () => {
   const serialised = fc
     .tuple(depth, levels, fc.constantFrom(undefined, 1, '\t'))
     .map(([d, objectLevels, indent]) => JSON.stringify(nestedValue(d, objectLevels), null, indent))
-  const anyText = fc.oneof(soup, brackets, serialised)
+  // Wide values whose structural token count lands within a few of the limit, either side,
+  // next to strings full of structural characters.
+  const wide = fc
+    .record({
+      slack: fc.integer({ min: -3, max: 3 }),
+      asObject: fc.boolean(),
+      s: structural,
+      indent: fc.constantFrom(undefined, 1)
+    })
+    .map(({ slack, asObject, s, indent }) => {
+      // `{"s":…,"a":X}` has 4 tokens around X: `{`, two `:` and one `,`.
+      const budget = MAX_JSON_TOKENS - 4 + slack
+      const a = asObject
+        ? Object.fromEntries(Array.from({ length: Math.floor(budget / 2) }, (_, i) => [`k${i}`, i]))
+        : Array.from({ length: budget }, (_, i) => i)
+      return JSON.stringify({ s, a }, null, indent)
+    })
+  const anyText = fc.oneof(soup, brackets, serialised, wide)
 
   function expectedOutcome(textOfMessage: string): { value: unknown } | 'protocol' {
     let value: unknown
@@ -365,10 +385,12 @@ describe('frames: nesting limit', () => {
       return 'protocol'
     }
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'protocol'
-    return nestingDepth(value) <= MAX_JSON_DEPTH ? { value } : 'protocol'
+    return nestingDepth(value) <= MAX_JSON_DEPTH && structuralTokens(value) <= MAX_JSON_TOKENS
+      ? { value }
+      : 'protocol'
   }
 
-  it('accepts exactly the JSON objects within the depth limit, for any text', () => {
+  it('accepts exactly the JSON objects within the depth and token limits, for any text', () => {
     fc.assert(
       fc.property(anyText, chunkSize, (t, chunk) => {
         const expected = expectedOutcome(t)

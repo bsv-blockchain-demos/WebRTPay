@@ -34,12 +34,30 @@ export interface BindingTranscriptInput {
 }
 
 /**
- * The bytes an identity signs to bind itself to one data channel: UTF-8 of seven lines
- * joined by `\n` — `webrtpay/1 channel-binding`, the signer's fingerprints, the
- * verifier's fingerprints (each list sorted and joined by `,`), the signer's nonce, the
- * verifier's nonce, the signer's key and the verifier's key. Both sides compute the same
- * bytes for a given signer only when they see the same DTLS certificates, so a relay that
- * terminates DTLS on each side cannot pass one side's signature to the other.
+ * The bytes an identity signs to bind itself to one data channel. Exactly:
+ *
+ * ```
+ * UTF-8( label "\n" signerFps "\n" verifierFps "\n" signerNonce "\n" verifierNonce
+ *        "\n" signerKey "\n" verifierKey )
+ * ```
+ *
+ * - `label` is the literal `webrtpay/1 channel-binding`.
+ * - `signerFps` / `verifierFps`: every `a=fingerprint:` line of that side's own SDP
+ *   (session or media level, any algorithm), each written `<alg> <hex>` with the algorithm
+ *   in lower case and the hex in lower case without colons (`sdpFingerprints`), the list
+ *   sorted by UTF-16 code unit (`Array.prototype.sort`) and joined by `,` with no spaces.
+ *   The signer's list comes from its local SDP, the verifier's from the remote SDP as the
+ *   signer received it (and the other way round when checking).
+ * - Nonces are the standard padded base64 from the two `hello` messages (32 bytes each);
+ *   keys are compressed public keys in lower-case hex.
+ * - No trailing newline. No field contains `\n` (SDP is split into lines first), and in a
+ *   valid SDP no list entry contains `,` (an `<alg>` is an RFC 4566 token, the hex is hex),
+ *   so the seven fields, and each list's entries, can be recovered from the bytes.
+ *
+ * `test/handshake.test.ts` has a test vector (SDP lines in, transcript hex out). Both sides
+ * compute the same bytes for a given signer only when they see the same DTLS certificates,
+ * so a relay that terminates DTLS on each side cannot pass one side's signature to the
+ * other.
  */
 export function bindingTranscript(a: BindingTranscriptInput): number[] {
   const text = [
@@ -62,8 +80,8 @@ export interface AuthenticateOptions {
   /** Fail unless the peer proves this identity key (lowercase hex). */
   expectedPeer?: PubKeyHex
   /**
-   * Time for the whole handshake, waiting for the channel to open included; defaults to
-   * 15 s.
+   * Time for the whole handshake, waiting for the channel to open included, counted from
+   * when `startAfter` settles if it is given; defaults to 15 s.
    */
   timeoutMs?: number
   /**
@@ -71,6 +89,13 @@ export interface AuthenticateOptions {
    * Until then the link keeps the cap it was created with.
    */
   maxMessageBytes?: number
+  /**
+   * Start the handshake (and its `timeoutMs`) only once this settles, such as when the SDP
+   * answer has been sent: the peer cannot connect before it has the answer, so time spent
+   * delivering it should not count. Peer messages are still taken in meanwhile. A
+   * rejection fails the handshake with that error and closes the link.
+   */
+  startAfter?: Promise<unknown>
 }
 
 /**
@@ -118,7 +143,7 @@ class Handshake {
   private localKey = ''
   private readonly localNonce = toBase64(randomBytes(NONCE_BYTES))
   private peer: Hello | undefined
-  private readonly timer: ReturnType<typeof setTimeout>
+  private timer: ReturnType<typeof setTimeout> | undefined
   private readonly offMessage: () => void
   private readonly offClose: () => void
 
@@ -145,16 +170,25 @@ class Handshake {
       this.fail(reason ?? new WebRTPayError('closed', 'Link closed during the handshake'))
     })
     const timeoutMs = o.timeoutMs ?? DEFAULTS.handshakeTimeoutMs
-    this.timer = setTimeout(() => {
-      this.fail(new WebRTPayError('timeout', `Handshake not finished within ${timeoutMs} ms`))
-    }, timeoutMs)
+    if (o.startAfter === undefined) this.startTimer(timeoutMs)
     this.run(this.start(timeoutMs))
   }
 
-  /** Learn our key, wait for the channel, say hello. */
+  private startTimer(timeoutMs: number): void {
+    this.timer = setTimeout(() => {
+      this.fail(new WebRTPayError('timeout', `Handshake not finished within ${timeoutMs} ms`))
+    }, timeoutMs)
+  }
+
+  /** Learn our key, wait for `startAfter` and the channel, say hello. */
   private async start(timeoutMs: number): Promise<void> {
     const { publicKey } = await this.o.wallet.getPublicKey({ identityKey: true }, this.o.originator)
     this.localKey = publicKey
+    if (this.o.startAfter !== undefined) {
+      await this.o.startAfter
+      if (this.settled) return
+      this.startTimer(timeoutMs)
+    }
     await this.link.waitOpen(timeoutMs)
     if (this.settled) return
     const hello: Hello = { t: 'hello', v: 1, identityKey: publicKey, nonce: this.localNonce }

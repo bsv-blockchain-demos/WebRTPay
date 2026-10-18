@@ -1,7 +1,10 @@
 import { DEFAULTS } from '../types.js'
 import type { PubKeyHex } from '../types.js'
 
-/** What a payee allows from peers that dial it by identity key (spec §6). */
+/**
+ * What a payee allows from peers that dial it by identity key (spec §6). Each sender may
+ * also have only one inbound session at a time; that is not configurable.
+ */
 export interface InboundLimits {
   /** Most inbound sessions open at once, handshake included. */
   maxConcurrent: number
@@ -13,30 +16,52 @@ export interface InboundLimits {
   maxMessageBytes: number
   /** An inbound session with no traffic for this long is closed, in milliseconds. */
   idleTimeoutMs: number
+  /**
+   * An inbound session whose peer has sent nothing this long after the handshake is closed,
+   * in milliseconds (the idle timeout applies from its first message on).
+   */
+  firstMessageTimeoutMs: number
+  /** An inbound session is closed this long after the handshake, however busy, in ms. */
+  maxSessionMs: number
 }
 
-/** 3 sessions, 10 offers a minute (3 per sender), 16 MiB messages, 60 s idle timeout. */
+/**
+ * 3 sessions (1 per sender), 10 offers a minute (3 per sender), 16 MiB messages, 60 s idle
+ * timeout, 15 s for the first message, 2 minutes per session.
+ */
 export const DEFAULT_INBOUND_LIMITS: Readonly<InboundLimits> = Object.freeze({
   maxConcurrent: 3,
   offersPerMinute: 10,
   offersPerMinutePerSender: 3,
   maxMessageBytes: DEFAULTS.inboundMaxMessageBytes,
-  idleTimeoutMs: 60000
+  idleTimeoutMs: 60000,
+  firstMessageTimeoutMs: 15000,
+  maxSessionMs: 120000
 })
+
+/**
+ * Why an offer is refused: `sender` for that sender's own limits (it already has a session,
+ * or has used its offers for the minute), `busy` for the payee's overall limits.
+ */
+export type InboundRefusal = 'sender' | 'busy'
 
 const WINDOW_MS = 60000
 /** Longest delay `setTimeout` honours; anything larger fires at once. */
 const MAX_TIMER_MS = 2 ** 31 - 1
 
 /**
- * Admission control for inbound offers. An offer is admitted when a session slot is free
- * and neither the overall nor the sender's offers in the last 60 s reach their limit; it
- * then takes a slot until {@link release}. Refused offers count against nothing, so a
- * sender that keeps being refused cannot use up anyone else's budget.
+ * Admission control for inbound offers. An offer is admitted when its sender has no
+ * session and has had fewer than its per-minute offers admitted in the last 60 s, and then
+ * when a session slot is free and the overall offers in the last 60 s are below their
+ * limit; it then takes a slot (and the sender's one session) until {@link release}. The
+ * sender's limits are checked first, and refused offers count against nothing, so a sender
+ * that keeps being refused cannot use up anyone else's budget.
  */
 export class InboundLimiter {
   private readonly limits: InboundLimits
   private active = 0
+  /** Senders with a session open. */
+  private readonly sessions = new Set<PubKeyHex>()
   /** Admission times within the window, oldest first. */
   private readonly admitted: number[] = []
   private readonly bySender = new Map<PubKeyHex, number[]>()
@@ -51,33 +76,47 @@ export class InboundLimiter {
     if (!Number.isSafeInteger(l.maxMessageBytes) || l.maxMessageBytes < 1) {
       throw new RangeError('maxMessageBytes must be a positive integer')
     }
-    if (!isTimerMs(l.idleTimeoutMs)) {
-      throw new RangeError(`idleTimeoutMs must be a positive number up to ${MAX_TIMER_MS}`)
+    for (const name of ['idleTimeoutMs', 'firstMessageTimeoutMs', 'maxSessionMs'] as const) {
+      if (!isTimerMs(l[name])) {
+        throw new RangeError(`${name} must be a positive number up to ${MAX_TIMER_MS}`)
+      }
     }
     this.limits = { ...l }
   }
 
-  /** Admit an offer from `sender` at `now` (ms) and take a session slot, or refuse it. */
-  tryAdmit(sender: PubKeyHex, now: number = Date.now()): boolean {
+  /** Why an offer from `sender` at `now` (ms) would be refused, or `undefined`. */
+  refusal(sender: PubKeyHex, now: number = Date.now()): InboundRefusal | undefined {
     this.prune(now)
-    const fromSender = this.bySender.get(sender) ?? []
+    if (
+      this.sessions.has(sender) ||
+      (this.bySender.get(sender)?.length ?? 0) >= this.limits.offersPerMinutePerSender
+    ) {
+      return 'sender'
+    }
     if (
       this.active >= this.limits.maxConcurrent ||
-      this.admitted.length >= this.limits.offersPerMinute ||
-      fromSender.length >= this.limits.offersPerMinutePerSender
+      this.admitted.length >= this.limits.offersPerMinute
     ) {
-      return false
+      return 'busy'
     }
+    return undefined
+  }
+
+  /** Admit an offer from `sender` at `now` (ms) and take a session slot, or refuse it. */
+  tryAdmit(sender: PubKeyHex, now: number = Date.now()): boolean {
+    if (this.refusal(sender, now) !== undefined) return false
     this.active++
+    this.sessions.add(sender)
     this.admitted.push(now)
+    const fromSender = this.bySender.get(sender) ?? []
     fromSender.push(now)
     this.bySender.set(sender, fromSender)
     return true
   }
 
-  /** Give back the slot an admitted offer took, when its session ends. */
-  release(): void {
-    if (this.active > 0) this.active--
+  /** Give back the slot `sender`'s admitted offer took, when its session ends. */
+  release(sender: PubKeyHex): void {
+    if (this.sessions.delete(sender) && this.active > 0) this.active--
   }
 
   private prune(now: number): void {

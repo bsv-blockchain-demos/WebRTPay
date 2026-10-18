@@ -5,6 +5,7 @@ import type { Hello, PaymentWire, WireMessage } from '../src/payments/wire.js'
 import type { AuthenticatedPeer } from '../src/session/AuthenticatedPeer.js'
 import { authenticate, bindingTranscript } from '../src/session/handshake.js'
 import type { AuthenticateOptions } from '../src/session/handshake.js'
+import { sdpFingerprints } from '../src/codec/sdp.js'
 import { CHANNEL_PROTOCOL_ID } from '../src/types.js'
 import { fromHex, randomBytes, toBase64, toHex, utf8Decode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
@@ -304,6 +305,50 @@ describe('bindingTranscript', () => {
     // The caller's arrays are left as they were.
     expect(fps).toEqual(['sha-512 bb', 'sha-256 aa'])
   })
+
+  it('matches the published test vector, from SDP fingerprint lines to transcript bytes', () => {
+    // Fixed inputs other implementations can check their encoding against. The signer's SDP
+    // has two fingerprint lines (to show sorting); hex is upper case with colons, as browsers
+    // write it, and is normalised to `<alg> <lowercase hex without colons>`.
+    const signerSdp = [
+      'v=0',
+      'a=fingerprint:SHA-256 00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F',
+      'a=fingerprint:sha-1 A0:A1:A2:A3:A4:A5:A6:A7:A8:A9:AA:AB:AC:AD:AE:AF:B0:B1:B2:B3',
+      ''
+    ].join('\r\n')
+    const verifierSdp = [
+      'v=0',
+      'a=fingerprint:sha-256 E0:E1:E2:E3:E4:E5:E6:E7:E8:E9:EA:EB:EC:ED:EE:EF:F0:F1:F2:F3:F4:F5:F6:F7:F8:F9:FA:FB:FC:FD:FE:FF',
+      ''
+    ].join('\r\n')
+    const transcript = bindingTranscript({
+      signerFingerprints: sdpFingerprints(signerSdp),
+      verifierFingerprints: sdpFingerprints(verifierSdp),
+      signerNonce: 'ERERERERERERERERERERERERERERERERERERERERERE=', // 32 bytes of 0x11
+      verifierNonce: 'IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=', // 32 bytes of 0x22
+      signerKey: '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798', // key 1
+      verifierKey: '02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5' // key 2
+    })
+    expect(toHex(Uint8Array.from(transcript))).toBe(
+      [
+        '77656272747061792f31206368616e6e656c2d62696e64696e670a7368612d31',
+        '2061306131613261336134613561366137613861396161616261636164616561',
+        '6662306231623262332c7368612d323536203030303130323033303430353036',
+        '3037303830393061306230633064306530663130313131323133313431353136',
+        '3137313831393161316231633164316531660a7368612d323536206530653165',
+        '3265336534653565366537653865396561656265636564656565666630663166',
+        '3266336634663566366637663866396661666266636664666566660a45524552',
+        '4552455245524552455245524552455245524552455245524552455245524552',
+        '455245524552453d0a4969496949694969496949694969496949694969496949',
+        '69496949694969496949694969496949694969493d0a30323739626536363765',
+        '6639646362626163353561303632393563653837306230373032396266636462',
+        '3264636532386439353966323831356231366638313739380a30326336303437',
+        '6639343431656437643664333034353430366539356330376364383563373738',
+        '653462386365663363613761626163303962393563373039656535'
+      ].join('')
+    )
+    expect(transcript).toHaveLength(443)
+  })
 })
 
 describe('authenticate over loopback', () => {
@@ -581,6 +626,35 @@ describe('authenticate over loopback', () => {
     expect(r.aClose?.code).toBe('auth_failed')
   })
 
+  it('starts the timeout once startAfter settles, still listening meanwhile', async () => {
+    // A's answer goes out only at 1.5 s (startAfter) and B starts then too; a 1 s timeout
+    // counted from the start would have fired long before.
+    const A = party()
+    const B = party()
+    const { a, b } = await linkPair()
+    let released!: () => void
+    const startAfter = new Promise<void>(resolve => (released = resolve))
+    const atA = authenticate(a, { wallet: A.wallet, timeoutMs: 1000, startAfter })
+    const atB = new Promise<AuthenticatedPeer>((resolve, reject) =>
+      setTimeout(() => {
+        authenticate(b, { wallet: B.wallet, timeoutMs: 1000 }).then(resolve, reject)
+        released()
+      }, 1500)
+    )
+    const [pa, pb] = await Promise.all([atA, atB])
+    expect(pa.peerIdentityKey).toBe(B.key)
+    expect(pb.peerIdentityKey).toBe(A.key)
+  })
+
+  it('fails with the error startAfter rejects with and closes the link', async () => {
+    const A = party()
+    const { a } = await linkPair()
+    const unsent = new WebRTPayError('peer_unreachable', 'answer not delivered')
+    const startAfter = new Promise<void>((_, reject) => setTimeout(() => reject(unsent), 100))
+    await expect(authenticate(a, { wallet: A.wallet, startAfter })).rejects.toBe(unsent)
+    expect(await closeOf(a)).toBe(unsent)
+  })
+
   it('rejects a maxMessageBytes that is not a size, leaving the link alone', async () => {
     const A = party()
     const { a } = await linkPair()
@@ -692,6 +766,20 @@ describe('AuthenticatedPeer', () => {
     expect((await closed)?.code).toBe('protocol')
     // Sent before closing; the close may still drop it in flight (see PeerLink.close).
     expect(sent).toHaveBeenCalledWith({ t: 'error', code: 'protocol' })
+  })
+
+  it.each<[string, (B: Party) => object]>([
+    ['hello', B => ({ t: 'hello', v: 1, identityKey: B.key, nonce: nonce() })],
+    ['auth', () => ({ t: 'auth', signature: 'ab'.repeat(35) })],
+    ['ready', () => ({ t: 'ready' })]
+  ])('closes with protocol when the peer sends %s after the handshake', async (_name, make) => {
+    const { B, b, pa } = await authenticatedPair()
+    const got: WireMessage[] = []
+    pa.onMessage(m => got.push(m))
+    const closed = closeOf(pa)
+    await b.send(make(B))
+    expect((await closed)?.code).toBe('protocol')
+    expect(got).toEqual([])
   })
 
   it('closes the link with the reason given to close', async () => {

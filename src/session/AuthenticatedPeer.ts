@@ -11,8 +11,9 @@ export const MAX_BACKLOG = 64
 /**
  * A data channel session whose peer proved its identity key (see `authenticate`, which
  * creates it). Carries {@link WireMessage}s both ways; every incoming value is checked with
- * `parseWireMessage`, and one that fails is answered with `{ t: 'error', code: 'protocol' }`
- * before the session closes with `protocol`.
+ * `parseWireMessage`, and one that fails, or a handshake message (`hello`, `auth`, `ready`:
+ * the handshake is over), is answered with `{ t: 'error', code: 'protocol' }` before the
+ * session closes with `protocol`.
  *
  * Messages that arrive before the first {@link onMessage} or {@link waitFor} are kept and
  * handed to that first listener, in order; after that, messages that arrive while no
@@ -127,6 +128,10 @@ export class AuthenticatedPeer {
       m = parseWireMessage(raw)
     } catch (cause) {
       this.fail(new WebRTPayError('protocol', 'Peer sent an invalid message', { cause }))
+      return
+    }
+    if (m.t === 'hello' || m.t === 'auth' || m.t === 'ready') {
+      this.fail(new WebRTPayError('protocol', `Peer sent '${m.t}' after the handshake`))
       return
     }
     if (this.backlog === undefined) {

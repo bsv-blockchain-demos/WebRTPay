@@ -9,10 +9,10 @@ import { acceptDirectPayment } from '../src/payments/accept.js'
 import type { SeenStore } from '../src/payments/accept.js'
 import { createPaymentRequestProof } from '../src/payments/requests.js'
 import type { AuthenticatedPeer } from '../src/session/AuthenticatedPeer.js'
-import { sealSignal } from '../src/signaling/envelope.js'
+import { ReplayCache, openSignal, sealSignal } from '../src/signaling/envelope.js'
 import { createMemoryHub } from '../src/signaling/MemorySignaler.js'
 import type { MemoryHub } from '../src/signaling/MemorySignaler.js'
-import type { Signaler } from '../src/signaling/types.js'
+import type { SignalEnvelope, Signaler } from '../src/signaling/types.js'
 import { PAYMENT_PROTOCOL_ID } from '../src/types.js'
 import type {
   IncomingPayment,
@@ -36,8 +36,11 @@ beforeAll(async () => {
 
 /** Every client a test created; closed after each test so no peer or timer outlives it. */
 const clients: DirectPayClient[] = []
+/** Links tests drive by hand, closed after each test too. */
+const rawLinks: PeerLink[] = []
 
 afterEach(async () => {
+  for (const link of rawLinks.splice(0)) link.close()
   await Promise.all(clients.splice(0).map(c => c.close()))
 })
 
@@ -137,8 +140,10 @@ async function failure(p: Promise<unknown>): Promise<WebRTPayError> {
   throw new Error('Expected a rejection')
 }
 
-function closeOf(peer: AuthenticatedPeer): Promise<WebRTPayError | undefined> {
-  return new Promise(resolve => peer.onClose(resolve))
+function closeOf(on: {
+  onClose(fn: (e?: WebRTPayError) => void): () => void
+}): Promise<WebRTPayError | undefined> {
+  return new Promise(resolve => on.onClose(resolve))
 }
 
 function sleep(ms: number): Promise<void> {
@@ -174,6 +179,49 @@ function key(): string {
   return PrivateKey.fromRandom().toPublicKey().toString()
 }
 
+/** An envelope that is well formed but decrypts to nothing. */
+function junkEnvelope(): SignalEnvelope {
+  return { v: 1, sid: toBase64Url(randomBytes(16)), ciphertext: toBase64(randomBytes(64)) }
+}
+
+/**
+ * Dial `payeeKey` by hand as `dialer`: send a sealed offer for a raw link and resolve with
+ * the link and the payee's answer SDP, without running the handshake.
+ */
+async function rawDial(
+  hub: MemoryHub,
+  dialer: TestWallet,
+  payeeKey: string
+): Promise<{ link: PeerLink; answer: string }> {
+  const { link, sdp } = await PeerLink.createOffer({ ...rtc, maxMessageBytes: 65536 })
+  rawLinks.push(link)
+  const sid = toBase64Url(randomBytes(16))
+  const signaler = hub.signaler(dialer.identityKey)
+  let got!: (sdp: string) => void
+  const answered = new Promise<string>(resolve => (got = resolve))
+  const stop = await signaler.listen((from, e) => {
+    void openSignal(dialer.wallet, from, e, { me: dialer.identityKey, replay: new ReplayCache() })
+      .then(p => {
+        if (p.kind === 'answer' && p.sid === sid && p.sdp !== undefined) got(p.sdp)
+      })
+      .catch(() => undefined)
+  })
+  const offer = await sealSignal(dialer.wallet, {
+    v: 1,
+    kind: 'offer',
+    sid,
+    from: dialer.identityKey,
+    to: payeeKey,
+    ts: Date.now(),
+    purpose: 'payment',
+    sdp
+  })
+  await signaler.send(payeeKey, offer)
+  const answer = await answered
+  await stop()
+  return { link, answer }
+}
+
 // ---------------------------------------------------------------- inbound limiter
 
 describe('InboundLimiter', () => {
@@ -187,28 +235,67 @@ describe('InboundLimiter', () => {
       offersPerMinute: 10,
       offersPerMinutePerSender: 3,
       maxMessageBytes: 16 * 1024 * 1024,
-      idleTimeoutMs: 60000
+      idleTimeoutMs: 60000,
+      firstMessageTimeoutMs: 15000,
+      maxSessionMs: 120000
     })
     expect(Object.isFrozen(DEFAULT_INBOUND_LIMITS)).toBe(true)
   })
 
   it('admits up to maxConcurrent sessions and frees a slot on release', () => {
     const l = new InboundLimiter(DEFAULT_INBOUND_LIMITS)
-    expect([key(), key(), key()].map(k => l.tryAdmit(k, T0))).toEqual([true, true, true])
+    const senders = [key(), key(), key()]
+    expect(senders.map(k => l.tryAdmit(k, T0))).toEqual([true, true, true])
     expect(l.tryAdmit(A, T0)).toBe(false)
-    l.release()
+    expect(l.refusal(A, T0)).toBe('busy')
+    l.release(senders[1])
+    expect(l.refusal(A, T0)).toBeUndefined()
     expect(l.tryAdmit(A, T0)).toBe(true)
+  })
+
+  it('allows one session per sender at a time', () => {
+    const l = new InboundLimiter(DEFAULT_INBOUND_LIMITS)
+    expect(l.tryAdmit(A, T0)).toBe(true)
+    expect(l.refusal(A, T0)).toBe('sender')
+    expect(l.tryAdmit(A, T0)).toBe(false)
+    expect(l.tryAdmit(B, T0)).toBe(true)
+    // releasing another sender's slot does not free A's
+    l.release(B)
+    expect(l.tryAdmit(A, T0)).toBe(false)
+    l.release(A)
+    expect(l.tryAdmit(A, T0)).toBe(true)
+  })
+
+  it("checks a sender's own limits before the global ones", () => {
+    const l = new InboundLimiter({ ...DEFAULT_INBOUND_LIMITS, maxConcurrent: 1 })
+    expect(l.tryAdmit(A, T0)).toBe(true)
+    // the only slot is A's: A is refused for itself, anyone else because it is busy
+    expect(l.refusal(A, T0)).toBe('sender')
+    expect(l.refusal(B, T0)).toBe('busy')
+    l.release(A)
+    // A's rate (3 a minute) runs out while the global budget (10) does not
+    for (let i = 1; i < 3; i++) {
+      expect(l.tryAdmit(A, T0 + i)).toBe(true)
+      l.release(A)
+    }
+    expect(l.refusal(A, T0 + 3)).toBe('sender')
+    expect(l.refusal(B, T0 + 3)).toBeUndefined()
   })
 
   it('admits at most offersPerMinutePerSender from one sender per rolling minute', () => {
     const l = new InboundLimiter({ ...DEFAULT_INBOUND_LIMITS, maxConcurrent: 100 })
-    for (let i = 0; i < 3; i++) expect(l.tryAdmit(A, T0 + i)).toBe(true)
-    expect(l.tryAdmit(A, T0 + 10)).toBe(false)
-    expect(l.tryAdmit(B, T0 + 10)).toBe(true)
-    expect(l.tryAdmit(A, T0 + 59_999)).toBe(false)
+    const admit = (sender: string, now: number): boolean => {
+      const admitted = l.tryAdmit(sender, now)
+      if (admitted) l.release(sender)
+      return admitted
+    }
+    for (let i = 0; i < 3; i++) expect(admit(A, T0 + i)).toBe(true)
+    expect(admit(A, T0 + 10)).toBe(false)
+    expect(admit(B, T0 + 10)).toBe(true)
+    expect(admit(A, T0 + 59_999)).toBe(false)
     // the first admission (T0) is a minute old
-    expect(l.tryAdmit(A, T0 + 60_000)).toBe(true)
-    expect(l.tryAdmit(A, T0 + 60_000)).toBe(false)
+    expect(admit(A, T0 + 60_000)).toBe(true)
+    expect(admit(A, T0 + 60_000)).toBe(false)
   })
 
   it('admits at most offersPerMinute in total per rolling minute', () => {
@@ -222,16 +309,20 @@ describe('InboundLimiter', () => {
     const l = new InboundLimiter({ ...DEFAULT_INBOUND_LIMITS, maxConcurrent: 1 })
     expect(l.tryAdmit(A, T0)).toBe(true)
     for (let i = 0; i < 20; i++) expect(l.tryAdmit(B, T0)).toBe(false)
-    l.release()
+    l.release(A)
     expect(l.tryAdmit(B, T0)).toBe(true)
   })
 
   it('never releases below zero', () => {
     const l = new InboundLimiter({ ...DEFAULT_INBOUND_LIMITS, maxConcurrent: 1 })
-    l.release()
-    l.release()
+    l.release(A)
+    l.release(B)
     expect(l.tryAdmit(A, T0)).toBe(true)
     expect(l.tryAdmit(B, T0)).toBe(false)
+    l.release(A)
+    l.release(A)
+    expect(l.tryAdmit(B, T0)).toBe(true)
+    expect(l.tryAdmit(A, T0)).toBe(false)
   })
 
   it('rejects invalid limits with RangeError', () => {
@@ -243,7 +334,11 @@ describe('InboundLimiter', () => {
       { maxMessageBytes: Number.MAX_SAFE_INTEGER + 1 },
       { idleTimeoutMs: Number.NaN },
       { idleTimeoutMs: 0 },
-      { idleTimeoutMs: 2 ** 31 }
+      { idleTimeoutMs: 2 ** 31 },
+      { firstMessageTimeoutMs: 0 },
+      { firstMessageTimeoutMs: 2 ** 31 },
+      { maxSessionMs: Number.NaN },
+      { maxSessionMs: -1 }
     ]
     for (const b of bad) {
       expect(() => new InboundLimiter({ ...DEFAULT_INBOUND_LIMITS, ...b })).toThrow(RangeError)
@@ -633,42 +728,36 @@ describe('DirectPayClient remote payments (MemoryHub, loopback WebRTC)', () => {
     await b.stop()
   })
 
-  it('ignores an answer to a dial from anyone but the recipient', async () => {
+  it('ignores a forged answer to a dial, which neither ends it nor burns its sid', async () => {
     const hub = createMemoryHub()
     const payer = await makeWallet()
+    const payee = await makeWallet()
     const intruder = await makeWallet()
-    const silent = await silentListener(hub)
+    await hubClient(hub, payee).startReceiving(accepting(payee))
     const base = hub.signaler(payer.identityKey)
-    let sid = ''
-    let sent!: () => void
-    const offered = new Promise<void>(resolve => (sent = resolve))
     const signaler: Signaler = {
       send: async (to, e) => {
-        sid = e.sid
-        sent()
+        // the sid travels in the clear, so whoever sees the offer can answer it first
+        const forged = await sealSignal(intruder.wallet, {
+          v: 1,
+          kind: 'answer',
+          sid: e.sid,
+          from: intruder.identityKey,
+          to: payer.identityKey,
+          ts: Date.now(),
+          purpose: 'payment',
+          sdp: 'v=0\r\n'
+        })
+        await hub.signaler(intruder.identityKey).send(payer.identityKey, forged)
         await base.send(to, e)
       },
       listen: fn => base.listen(fn)
     }
     const sender = client(payer, { signaler })
-    const dial = failure(sender.connect(silent.identityKey, { timeoutMs: 1000 }))
-    await offered
 
-    // the sid travels in the clear, so whoever sees the envelope can answer with it
-    const forged = await sealSignal(intruder.wallet, {
-      v: 1,
-      kind: 'answer',
-      sid,
-      from: intruder.identityKey,
-      to: payer.identityKey,
-      ts: Date.now(),
-      purpose: 'payment',
-      sdp: 'v=0\r\n'
-    })
-    await hub.signaler(intruder.identityKey).send(payer.identityKey, forged)
-
-    expect((await dial).code).toBe('peer_unreachable')
-    await silent.stop()
+    // the payee's genuine answer, with the same sid, still connects the dial
+    const peer = await sender.connect(payee.identityKey)
+    expect(peer.peerIdentityKey).toBe(payee.identityKey)
   })
 
   it('close() ends a pending dial with closed and refuses new work', async () => {
@@ -730,10 +819,8 @@ describe('DirectPayClient code exchange (no signaler)', () => {
       chain: 'test',
       amount: 1000
     })
-    expect(decodeCode(answer.answerCode)).toMatchObject({
-      kind: 'answer',
-      identityKey: payer.identityKey
-    })
+    // the answer does not name the payer: the payee learns who it is from the handshake
+    expect(Object.keys(decodeCode(answer.answerCode)).sort()).toEqual(['kind', 'sdp', 'sid'])
 
     const [payeeSide, payerSide] = await Promise.all([
       offer.complete(answer.answerCode),
@@ -782,7 +869,6 @@ describe('DirectPayClient code exchange (no signaler)', () => {
 
     const foreign = encodeAnswerCode({
       sid: randomBytes(16),
-      identityKey: payer.identityKey,
       sdp: decodeCode(answer.answerCode).sdp
     })
     expect((await failure(offer.complete(foreign))).code).toBe('invalid_code')
@@ -825,5 +911,321 @@ describe('DirectPayClient code exchange (no signaler)', () => {
 
     expect(constructed).toBe(1)
     offer.cancel()
+  })
+})
+
+// ---------------------------------------------------------------- audit hardening
+
+describe('DirectPayClient inbound limits (MemoryHub, loopback WebRTC)', () => {
+  it('gives a sender one session at a time; its extra offers get no reply and no budget', async () => {
+    const acceptOffer = jest.spyOn(PeerLink, 'acceptOffer')
+    try {
+      const hub = createMemoryHub()
+      const payee = await makeWallet()
+      await hubClient(hub, payee, { limits: { maxConcurrent: 1 } }).startReceiving(accepting(payee))
+      const a = hubClient(hub, await makeWallet())
+      const b = hubClient(hub, await makeWallet())
+
+      const first = await a.connect(payee.identityKey)
+      // A already has the only session: its second offer is dropped unanswered...
+      expect((await failure(a.connect(payee.identityKey, { timeoutMs: 1000 }))).code).toBe(
+        'peer_unreachable'
+      )
+      // ...without spending the reject budget, so B is still told the payee is busy
+      const busy = await failure(b.connect(payee.identityKey, { timeoutMs: 1000 }))
+      expect(busy.code).toBe('rejected')
+      expect(busy.message).toContain('busy')
+      expect(acceptOffer).toHaveBeenCalledTimes(1)
+
+      first.close()
+      await sleep(200)
+      expect((await a.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+    } finally {
+      acceptOffer.mockRestore()
+    }
+  })
+
+  it('answers refusals at most once a second and drops the rest unanswered', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    await hubClient(hub, payee, { limits: { maxConcurrent: 1 } }).startReceiving(accepting(payee))
+    await hubClient(hub, await makeWallet()).connect(payee.identityKey)
+    const b = hubClient(hub, await makeWallet())
+    const c = hubClient(hub, await makeWallet())
+
+    expect((await failure(b.connect(payee.identityKey, { timeoutMs: 1000 }))).code).toBe('rejected')
+    const refusedAt = Date.now()
+    expect((await failure(c.connect(payee.identityKey, { timeoutMs: 600 }))).code).toBe(
+      'peer_unreachable'
+    )
+    await sleep(Math.max(0, refusedAt + 1100 - Date.now()))
+    expect((await failure(c.connect(payee.identityKey, { timeoutMs: 1000 }))).code).toBe('rejected')
+  })
+
+  it('frees the slot as soon as an inbound handshake fails', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const errors: unknown[] = []
+    await hubClient(hub, payee, { limits: { maxConcurrent: 1 } }).startReceiving({
+      ...accepting(payee),
+      onError: e => errors.push(e)
+    })
+    const { link, answer } = await rawDial(hub, await makeWallet(), payee.identityKey)
+    await link.acceptAnswer(answer)
+    await link.waitOpen(5000)
+    await link.send({ t: 'hello', v: 1, identityKey: 'not a key', nonce: 'x' })
+    await eventually(async () => {
+      if (errors.length === 0) throw new Error('no failure yet')
+    })
+    expect(errors[0]).toMatchObject({ code: 'auth_failed' })
+
+    const sender = hubClient(hub, await makeWallet())
+    expect((await sender.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+  })
+
+  it('counts the inbound open and handshake budget from when the answer has been sent', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const payer = await makeWallet()
+    // The carrier is slow both ways: the answer takes 1 s to send and reaches the payer
+    // 1.5 s after that. The payee's 2.5 s budget runs from 1 s, so the handshake (which
+    // cannot start before 2.5 s) fits; counted from the offer it would not.
+    const payeeBase = hub.signaler(payee.identityKey)
+    await client(payee, {
+      signaler: {
+        send: async (to, e) => {
+          await sleep(1000)
+          await payeeBase.send(to, e)
+        },
+        listen: fn => payeeBase.listen(fn)
+      },
+      timeouts: { connectMs: 2500 }
+    }).startReceiving(accepting(payee))
+    const payerBase = hub.signaler(payer.identityKey)
+    const sender = client(payer, {
+      signaler: {
+        send: (to, e) => payerBase.send(to, e),
+        listen: fn => payerBase.listen((from, e) => void setTimeout(() => fn(from, e), 1500))
+      },
+      timeouts: { connectMs: 8000 }
+    })
+
+    expect((await sender.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+  })
+
+  it('drops an inbound dialer that never says hello after connectMs, not 15 s', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const errors: Array<{ e: unknown; at: number }> = []
+    await hubClient(hub, payee, { timeouts: { connectMs: 1000 } }).startReceiving({
+      ...accepting(payee),
+      onError: e => errors.push({ e, at: Date.now() })
+    })
+
+    const { link, answer } = await rawDial(hub, await makeWallet(), payee.identityKey)
+    const answeredAt = Date.now()
+    await link.acceptAnswer(answer)
+    await eventually(async () => {
+      if (errors.length === 0) throw new Error('no failure yet')
+    }, 40)
+    expect(errors[0].e).toMatchObject({ code: 'timeout' })
+    expect(errors[0].at - answeredAt).toBeLessThan(3000)
+  })
+
+  it('frees the slot after connectMs when the answer cannot be sent', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const stuck = await makeWallet()
+    const base = hub.signaler(payee.identityKey)
+    const signaler: Signaler = {
+      send: (to, e) => (to === stuck.identityKey ? new Promise(() => {}) : base.send(to, e)),
+      listen: fn => base.listen(fn)
+    }
+    await client(payee, {
+      signaler,
+      limits: { maxConcurrent: 1 },
+      timeouts: { connectMs: 1000 }
+    }).startReceiving(accepting(payee))
+    const dial = failure(hubClient(hub, stuck).connect(payee.identityKey, { timeoutMs: 1500 }))
+    expect((await dial).code).toBe('peer_unreachable')
+
+    const sender = hubClient(hub, await makeWallet())
+    expect((await sender.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+  })
+
+  it('closes a session that sends nothing within firstMessageTimeoutMs of the handshake', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    await hubClient(hub, payee, {
+      limits: { idleTimeoutMs: 60000, firstMessageTimeoutMs: 300 }
+    }).startReceiving(accepting(payee))
+    const sender = hubClient(hub, payer)
+
+    const quiet = await sender.connect(payee.identityKey)
+    const started = Date.now()
+    expect((await closeOf(quiet))?.code).toBe('closed')
+    expect(Date.now() - started).toBeLessThan(3000)
+
+    // a peer that speaks first is on the idle timeout from then on
+    const chatty = await sender.connect(payee.identityKey)
+    await chatty.send({ t: 'payment.ack', id: 'traffic', status: 'accepted' })
+    await sleep(1000)
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+    expect(await sender.sendPayment(chatty, token)).toMatchObject({ status: 'accepted', txid })
+  })
+
+  it('ends an inbound session after maxSessionMs however busy it is', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    await hubClient(hub, payee, {
+      limits: { idleTimeoutMs: 60000, maxSessionMs: 800 }
+    }).startReceiving(accepting(payee))
+    const peer = await hubClient(hub, await makeWallet()).connect(payee.identityKey)
+    const started = Date.now()
+    const closed = closeOf(peer)
+    const chatter = setInterval(() => {
+      peer.send({ t: 'payment.ack', id: 'traffic', status: 'accepted' }).catch(() => undefined)
+    }, 100)
+    try {
+      expect((await closed)?.code).toBe('closed')
+    } finally {
+      clearInterval(chatter)
+    }
+    expect(Date.now() - started).toBeGreaterThanOrEqual(700)
+    expect(Date.now() - started).toBeLessThan(3000)
+  })
+
+  it('decrypts at most 10 signals from one sender and a burst of 40 overall', async () => {
+    const hub = createMemoryHub()
+    const payee = await makeWallet()
+    const decrypt = jest.spyOn(payee.wallet, 'decrypt')
+    await hubClient(hub, payee).startReceiving(accepting(payee))
+    const loud = hub.signaler(key())
+    for (let i = 0; i < 25; i++) await loud.send(payee.identityKey, junkEnvelope())
+    await sleep(200)
+    expect(decrypt).toHaveBeenCalledTimes(10)
+    // one loud sender has not used up everyone else's budget
+    const sender = hubClient(hub, await makeWallet())
+    expect((await sender.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+
+    const other = await makeWallet()
+    const opened = jest.spyOn(other.wallet, 'decrypt')
+    await hubClient(hub, other).startReceiving(accepting(other))
+    await Promise.all(
+      Array.from({ length: 80 }, () => hub.signaler(key()).send(other.identityKey, junkEnvelope()))
+    )
+    await sleep(200)
+    expect(opened.mock.calls.length).toBeGreaterThanOrEqual(40)
+    expect(opened.mock.calls.length).toBeLessThanOrEqual(45)
+  })
+
+  it("lets answers to the client's own dial past the intake budgets", async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    await hubClient(hub, payee).startReceiving(accepting(payee))
+    const base = hub.signaler(payer.identityKey)
+    const signaler: Signaler = {
+      send: async (to, e) => {
+        // junk in the payee's name spends the payee's whole per-sender budget first
+        const asPayee = hub.signaler(payee.identityKey)
+        for (let i = 0; i < 12; i++) await asPayee.send(payer.identityKey, junkEnvelope())
+        await base.send(to, e)
+      },
+      listen: fn => base.listen(fn)
+    }
+    const sender = client(payer, { signaler })
+    expect((await sender.connect(payee.identityKey)).peerIdentityKey).toBe(payee.identityKey)
+  })
+})
+
+describe('DirectPayClient payments and offers (audit hardening)', () => {
+  it('accepts one payment once when two sessions deliver it at the same time', async () => {
+    const hub = createMemoryHub()
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => (release = resolve))
+    const handled: string[] = []
+    const receiver = hubClient(hub, payee, { chain: 'test' })
+    await receiver.startReceiving({
+      onPayment: async p => {
+        handled.push(p.messageId)
+        await gate
+        // no SeenStore: only the client's own serialisation prevents a second internalize
+        await acceptDirectPayment(payee.wallet, p)
+        return 'accepted'
+      }
+    })
+    const sender = hubClient(hub, payer, { chain: 'test' })
+    // the same payer on two sessions: one dialled, one by code exchange
+    const remote = await sender.connect(payee.identityKey)
+    const offer = await receiver.createOfferCode()
+    const answer = await sender.answerOfferCode(offer.code)
+    const [, local] = await Promise.all([offer.complete(answer.answerCode), answer.connected])
+    const { token, txid } = await makeToken(payer, payee.identityKey, 3000)
+
+    const first = sender.sendPayment(remote, token)
+    const second = eventually(async () => {
+      if (handled.length === 0) throw new Error('not delivered yet')
+    }).then(() => sender.sendPayment(local, token))
+    // Settled either way below; a failed expectation must not leave them unhandled.
+    const acked = Promise.all([first, second])
+    acked.catch(() => undefined)
+    try {
+      await eventually(async () => {
+        if (handled.length === 0) throw new Error('not delivered yet')
+      })
+      await sleep(500)
+      // the second delivery is waiting for the first one's decision, not deciding again
+      expect(handled).toHaveLength(1)
+    } finally {
+      release()
+    }
+
+    const acks = await acked
+    expect(acks.map(a => a.status)).toEqual(['accepted', 'accepted'])
+    expect(acks.map(a => a.txid)).toEqual([txid, txid])
+    expect(payee.internalizeAction).toHaveBeenCalledTimes(1)
+  })
+
+  it('will not complete an expired offer, and closes its link when it expires', async () => {
+    const createOffer = jest.spyOn(PeerLink, 'createOffer')
+    try {
+      const payee = await makeWallet()
+      const offer = await client(payee).createOfferCode({
+        chain: 'test',
+        expiresInMs: 1500,
+        handlers: accepting(payee)
+      })
+      const { link } = await (createOffer.mock.results[0].value as Promise<{ link: PeerLink }>)
+      const answer = await client(await makeWallet()).answerOfferCode(offer.code)
+      const decoded = decodeCode(offer.code, { now: 0 })
+      const expiresAt = decoded.kind === 'offer' ? decoded.expiresAt! : 0
+
+      expect((await closeOf(link))?.code).toBe('timeout')
+      expect(Date.now()).toBeGreaterThanOrEqual(expiresAt)
+      expect((await failure(offer.complete(answer.answerCode))).code).toBe('invalid_code')
+      answer.cancel()
+    } finally {
+      createOffer.mockRestore()
+    }
+  })
+
+  it('keeps a completed offer session open past the offer expiry', async () => {
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const sender = client(payer)
+    const offer = await client(payee).createOfferCode({
+      chain: 'test',
+      expiresInMs: 1500,
+      handlers: accepting(payee)
+    })
+    const answer = await sender.answerOfferCode(offer.code)
+    const [, payerSide] = await Promise.all([offer.complete(answer.answerCode), answer.connected])
+    await sleep(1600)
+    const { token, txid } = await makeToken(payer, payee.identityKey, 1000)
+    expect(await sender.sendPayment(payerSide, token)).toMatchObject({ status: 'accepted', txid })
   })
 })

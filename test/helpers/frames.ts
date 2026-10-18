@@ -46,3 +46,15 @@ export function nestingDepth(value: unknown): number {
   for (const child of Object.values(value)) deepest = Math.max(deepest, nestingDepth(child))
   return 1 + deepest
 }
+
+/**
+ * Structural tokens `JSON.stringify(value)` contains: one `{` or `[` per container, one `:`
+ * per object member and one `,` between neighbouring members or elements. Counted from the
+ * parsed value, so a text with duplicate keys has more tokens than this reports.
+ */
+export function structuralTokens(value: unknown): number {
+  if (typeof value !== 'object' || value === null) return 0
+  const children = Object.values(value)
+  const own = 1 + Math.max(0, children.length - 1) + (Array.isArray(value) ? 0 : children.length)
+  return children.reduce<number>((sum, child) => sum + structuralTokens(child), own)
+}
