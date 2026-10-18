@@ -1,7 +1,13 @@
 import { beforeAll, describe, expect, it, jest } from '@jest/globals'
 import { P2PKH, PrivateKey, ProtoWallet, PublicKey, Transaction } from '@bsv/sdk'
 import { makePaymentTx } from './helpers/tx.js'
-import { decodePayment, encodePayment, parseWireMessage } from '../src/payments/wire.js'
+import {
+  MAX_DIRECT_TRANSACTION_BYTES,
+  decodePayment,
+  encodePayment,
+  parseWireMessage,
+  validatePaymentToken
+} from '../src/payments/wire.js'
 import type { PaymentWire, WireMessage } from '../src/payments/wire.js'
 import { acceptDirectPayment, paymentKey, verifyDirectPayment } from '../src/payments/accept.js'
 import type { SeenStore } from '../src/payments/accept.js'
@@ -16,9 +22,10 @@ import type {
   IncomingPayment,
   PaymentRequestMessage,
   PaymentToken,
+  PaymentTokenInput,
   WalletLike
 } from '../src/types.js'
-import { randomBytes, toBase64, toHex } from '../src/util/bytes.js'
+import { randomBytes, toBase64, toHex, utf8Encode } from '../src/util/bytes.js'
 import { WebRTPayError } from '../src/util/errors.js'
 
 // ---------------------------------------------------------------- helpers
@@ -751,6 +758,45 @@ describe('acceptDirectPayment', () => {
     expect(seen.keys.size).toBe(0)
   })
 
+  it('returns accepted when recording a payment fails after the wallet took it (M18)', async () => {
+    const { payee, txid, p } = await setup()
+    const failure = new Error('quota exceeded')
+    const reported: unknown[] = []
+    const failing = (add: SeenStore['add']): SeenStore => ({ has: () => false, add })
+    for (const seen of [
+      failing(() => {
+        throw failure
+      }),
+      failing(async () => {
+        throw failure
+      })
+    ]) {
+      await expect(
+        acceptDirectPayment(payee.wallet, p, { seen, onSeenError: e => reported.push(e) })
+      ).resolves.toEqual({ txid, status: 'accepted' })
+    }
+    expect(reported).toEqual([failure, failure])
+    // without a hook, or with one that throws, it is accepted all the same
+    await expect(
+      acceptDirectPayment(payee.wallet, p, {
+        seen: failing(() => {
+          throw failure
+        })
+      })
+    ).resolves.toEqual({ txid, status: 'accepted' })
+    await expect(
+      acceptDirectPayment(payee.wallet, p, {
+        seen: failing(() => {
+          throw failure
+        }),
+        onSeenError: () => {
+          throw new Error('hook bug')
+        }
+      })
+    ).resolves.toEqual({ txid, status: 'accepted' })
+    expect(payee.internalizeAction).toHaveBeenCalledTimes(4)
+  })
+
   it('paymentKey distinguishes every component', () => {
     const base = paymentKey(TXID, 0, 'AAAA', 'BBBB')
     expect(paymentKey(TXID, 0, 'AAAA', 'BBBB')).toBe(base)
@@ -763,6 +809,118 @@ describe('acceptDirectPayment', () => {
         paymentKey(TXID, 0, 'AAAA', 'BBBC')
       ]).size
     ).toBe(5)
+  })
+})
+
+describe('payment tokens with a Uint8Array transaction (R9)', () => {
+  it('encodePayment writes the same wire message for number[] and Uint8Array', async () => {
+    const payer = await makeWallet()
+    const { token } = await makeToken(payer, IDENTITY_KEY, 5000)
+    const bytes: PaymentTokenInput = { ...token, transaction: Uint8Array.from(token.transaction) }
+    expect(encodePayment('pay-1', bytes, 'hi')).toEqual(encodePayment('pay-1', token, 'hi'))
+    // what comes out of the wire is always a number array
+    expect(Array.isArray(decodePayment(encodePayment('pay-1', bytes)).token.transaction)).toBe(true)
+  })
+
+  it('verifyDirectPayment and acceptDirectPayment take a Uint8Array transaction', async () => {
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const { token, txid } = await makeToken(payer, payee.identityKey, 5000)
+    const p = {
+      messageId: 'pay-1',
+      sender: payer.identityKey,
+      token: { ...token, transaction: Uint8Array.from(token.transaction) }
+    }
+    await expect(verifyDirectPayment(payee.wallet, p)).resolves.toEqual({ txid, satoshis: 5000 })
+    await expect(acceptDirectPayment(payee.wallet, p)).resolves.toEqual({
+      txid,
+      status: 'accepted'
+    })
+    const [args] = payee.internalizeAction.mock.calls[0]
+    expect(Array.from(args.tx)).toEqual(token.transaction)
+  })
+
+  it('still rejects a transaction that is not bytes', async () => {
+    const payer = await makeWallet()
+    const payee = await makeWallet()
+    const { token } = await makeToken(payer, payee.identityKey, 5000)
+    for (const transaction of [
+      toBase64(Uint8Array.from(token.transaction)),
+      new Uint16Array(token.transaction),
+      token.transaction.map(b => (b === 0 ? 256 : b)),
+      [...token.transaction.slice(0, -1), 1.5]
+    ]) {
+      const p = { messageId: 'pay-1', sender: payer.identityKey, token: { ...token, transaction } }
+      expect(
+        await asyncCodeOf(() => verifyDirectPayment(payee.wallet, p as unknown as IncomingPayment))
+      ).toBe('invalid_payment')
+    }
+  })
+})
+
+describe('validatePaymentToken (M20)', () => {
+  it('passes a token the payee can decode, as number[] or Uint8Array, with or without a note', async () => {
+    const payer = await makeWallet()
+    const { token } = await makeToken(payer, IDENTITY_KEY, 5000)
+    expect(() => validatePaymentToken(token)).not.toThrow()
+    expect(() => validatePaymentToken(token, 'x'.repeat(500))).not.toThrow()
+    const { outputIndex: _omit, ...noIndex } = token
+    expect(() =>
+      validatePaymentToken({ ...noIndex, transaction: Uint8Array.from(token.transaction) })
+    ).not.toThrow()
+  })
+
+  it('throws invalid_payment for everything the payee would reject without its key', async () => {
+    const payer = await makeWallet()
+    const { token } = await makeToken(payer, IDENTITY_KEY, 5000)
+    const bad: Array<[string, unknown, string?]> = [
+      ['no output at outputIndex', { ...token, outputIndex: 1 }],
+      ['amount differs from the output', { ...token, amount: 4999 }],
+      ['amount out of range', { ...token, amount: 0 }],
+      ['outputIndex not a uint32', { ...token, outputIndex: -1 }],
+      [
+        'derivation not base64',
+        { ...token, customInstructions: { ...token.customInstructions, derivationPrefix: 'a b' } }
+      ],
+      ['transaction not Atomic BEEF', { ...token, transaction: [1, 2, 3] }],
+      ['empty transaction', { ...token, transaction: [] }],
+      [
+        'transaction with a value that is not a byte',
+        { ...token, transaction: [...token.transaction, 256] }
+      ],
+      ['transaction as text', { ...token, transaction: 'AAAA' }],
+      ['note over 500 characters', token, 'x'.repeat(501)],
+      ['not an object', null]
+    ]
+    for (const [why, t, note] of bad) {
+      expect([why, codeOf(() => validatePaymentToken(t as PaymentTokenInput, note))]).toEqual([
+        why,
+        'invalid_payment'
+      ])
+    }
+  })
+})
+
+describe('MAX_DIRECT_TRANSACTION_BYTES (M19)', () => {
+  it('fits a payment message within the default inbound cap with every other field at its largest', () => {
+    expect(MAX_DIRECT_TRANSACTION_BYTES).toBe(12579840)
+    const wire = encodePayment(
+      'i'.repeat(64),
+      {
+        customInstructions: {
+          derivationPrefix: 'P'.repeat(400),
+          derivationSuffix: 'S'.repeat(400)
+        },
+        transaction: new Uint8Array(MAX_DIRECT_TRANSACTION_BYTES),
+        amount: 2.1e15,
+        outputIndex: 0xffffffff
+      },
+      // each of these characters becomes the six bytes \u0001 in JSON
+      '\u0001'.repeat(500)
+    )
+    const bytes = utf8Encode(JSON.stringify(wire)).length
+    expect(bytes).toBeLessThanOrEqual(DEFAULTS.inboundMaxMessageBytes)
+    expect(bytes).toBeGreaterThan(DEFAULTS.inboundMaxMessageBytes - 4096)
   })
 })
 

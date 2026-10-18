@@ -1,7 +1,13 @@
 import { P2PKH, PublicKey } from '@bsv/sdk'
 import { PAYMENT_PROTOCOL_ID, isIdentityKey } from '../types.js'
-import type { IncomingPayment, PubKeyHex, WalletLike } from '../types.js'
-import { invalidPayment, parsePaymentTransaction, plainRecord, tokenFields } from './validate.js'
+import type { IncomingPaymentInput, PubKeyHex, WalletLike } from '../types.js'
+import {
+  invalidPayment,
+  isByteArray,
+  parsePaymentTransaction,
+  plainRecord,
+  tokenFields
+} from './validate.js'
 
 /**
  * Remembers which payments were already internalized, so a re-delivered payment (the
@@ -38,7 +44,7 @@ interface VerifiedPayment {
 
 async function verify(
   wallet: WalletLike,
-  p: IncomingPayment,
+  p: IncomingPaymentInput,
   originator: string | undefined
 ): Promise<VerifiedPayment> {
   const payment = plainRecord(p)
@@ -48,7 +54,7 @@ async function verify(
   }
   const fields = tokenFields(payment.token, payment.outputIndex)
   const { transaction, outputIndex, derivationPrefix, derivationSuffix, amount } = fields
-  if (!Array.isArray(transaction)) throw invalidPayment('Payment transaction is not a byte array')
+  if (!isByteArray(transaction)) throw invalidPayment('Payment transaction is not a byte array')
   const tx = parsePaymentTransaction(transaction)
 
   const { publicKey } = await wallet.getPublicKey(
@@ -73,7 +79,8 @@ async function verify(
     txid: tx.id('hex'),
     satoshis: amount,
     sender,
-    transaction: transaction as number[],
+    // a number array for every wallet, also those whose transport cannot carry a Uint8Array
+    transaction: Array.isArray(transaction) ? transaction : Array.from(transaction),
     outputIndex,
     derivationPrefix,
     derivationSuffix
@@ -92,11 +99,26 @@ async function verify(
  */
 export async function verifyDirectPayment(
   wallet: WalletLike,
-  p: IncomingPayment,
+  p: IncomingPaymentInput,
   o: { originator?: string } = {}
 ): Promise<{ txid: string; satoshis: number }> {
   const { txid, satoshis } = await verify(wallet, p, o.originator)
   return { txid, satoshis }
+}
+
+/** Options for {@link acceptDirectPayment}. */
+export interface AcceptDirectPaymentOptions {
+  /** Passed to every wallet call. */
+  originator?: string
+  /** Where accepted payments are recorded; without it every delivery is internalized. */
+  seen?: SeenStore
+  labels?: string[]
+  description?: string
+  /**
+   * Called with what `seen.add` threw or rejected with after the wallet accepted the
+   * payment. The payment still counts as accepted; anything this throws is ignored.
+   */
+  onSeenError?: (e: unknown) => void
 }
 
 /**
@@ -106,7 +128,9 @@ export async function verifyDirectPayment(
  * {@link paymentKey}, return `duplicate` without internalizing; otherwise
  * `internalizeAction` (labels `['peerpay', 'direct', 'inbound']`, description
  * `'Received direct BSV'` unless overridden), require `accepted === true`, then record
- * the key in `seen`.
+ * the key in `seen`. Once the wallet has the payment it is `accepted`, even when recording
+ * it fails (that failure goes to `onSeenError`, and a re-delivery is then internalized
+ * again, as without a `seen` store).
  *
  * @throws WebRTPayError `invalid_payment` when verification fails (nothing is
  * internalized). A wallet error from `internalizeAction` propagates unchanged, and a
@@ -115,8 +139,8 @@ export async function verifyDirectPayment(
  */
 export async function acceptDirectPayment(
   wallet: WalletLike,
-  p: IncomingPayment,
-  o: { originator?: string; seen?: SeenStore; labels?: string[]; description?: string } = {}
+  p: IncomingPaymentInput,
+  o: AcceptDirectPaymentOptions = {}
 ): Promise<{ txid: string; status: 'accepted' | 'duplicate' }> {
   const v = await verify(wallet, p, o.originator)
   const key = paymentKey(v.txid, v.outputIndex, v.derivationPrefix, v.derivationSuffix)
@@ -142,6 +166,15 @@ export async function acceptDirectPayment(
     o.originator
   )
   if (result?.accepted !== true) throw new Error('The wallet did not accept the payment')
-  await o.seen?.add(key)
+  try {
+    await o.seen?.add(key)
+  } catch (e) {
+    // The wallet holds the payment: refusing it now would tell the payer it failed.
+    try {
+      o.onSeenError?.(e)
+    } catch {
+      // a hook that throws changes nothing
+    }
+  }
   return { txid: v.txid, status: 'accepted' }
 }

@@ -88,7 +88,7 @@ export interface TokenFields {
   derivationSuffix: string
   amount: number
   outputIndex: number
-  /** Unchecked: base64 on the wire, a byte array in a `PaymentToken`. */
+  /** Unchecked: base64 on the wire, bytes (`number[]` or `Uint8Array`) in a token. */
   transaction: unknown
 }
 
@@ -114,6 +114,17 @@ export function tokenFields(v: unknown, fallbackOutputIndex?: unknown): TokenFie
     throw invalidPayment('Payment output index is invalid')
   }
   return { derivationPrefix, derivationSuffix, amount, outputIndex, transaction: token.transaction }
+}
+
+/** A `Uint8Array`, or an array whose every element is an integer from 0 to 255. */
+export function isByteArray(v: unknown): v is Uint8Array | number[] {
+  if (v instanceof Uint8Array) return true
+  if (!Array.isArray(v)) return false
+  for (let i = 0; i < v.length; i++) {
+    const b: unknown = v[i]
+    if (typeof b !== 'number' || (b & 255) !== b) return false
+  }
+  return true
 }
 
 /** Parses 1…`DEFAULTS.maxMessageBytes` bytes of Atomic BEEF. Throws `invalid_payment`. */

@@ -4,29 +4,51 @@ import type { WalletInterface, WalletProtocol } from '@bsv/sdk'
 /** A compressed secp256k1 public key as 66 lowercase hex characters. */
 export type PubKeyHex = string
 
-/** Atomic BEEF (BRC-95) transaction bytes as a plain number array. */
+/**
+ * Atomic BEEF (BRC-95) transaction bytes as a plain number array: the form this package
+ * hands out. Narrower than `@bsv/sdk`'s `AtomicBEEF` of the same name (`number[] |
+ * Uint8Array`), which the input types below accept.
+ */
 export type AtomicBEEF = number[]
 
 /**
- * A payment as carried in a PeerPay-compatible message: the transaction plus the
- * derivation values the recipient needs to take custody of the output.
+ * A payment as given to this package (`sendPayment`, `encodePayment`,
+ * `validatePaymentToken`): the transaction, as a number array or a `Uint8Array` like
+ * `@bsv/sdk`'s `AtomicBEEF` (`createAction`'s `tx`), plus the derivation values the
+ * recipient needs to take custody of the output. PeerPay's `PaymentToken` is one.
  */
-export interface PaymentToken {
+export interface PaymentTokenInput {
   customInstructions: {
     derivationPrefix: string
     derivationSuffix: string
   }
-  transaction: AtomicBEEF
+  transaction: number[] | Uint8Array
   amount: number
   outputIndex?: number
 }
 
-/** A payment received from a peer, ready for `internalizeAction`. */
-export interface IncomingPayment {
+/**
+ * A payment as carried in a PeerPay-compatible message, as this package hands it out:
+ * the transaction is always a number array.
+ */
+export interface PaymentToken extends PaymentTokenInput {
+  transaction: AtomicBEEF
+}
+
+/**
+ * A received payment as given to `acceptDirectPayment` and `verifyDirectPayment`, its
+ * transaction a number array or a `Uint8Array`. PeerPay's `IncomingPayment` is one.
+ */
+export interface IncomingPaymentInput {
   messageId: string
   sender: string
-  token: PaymentToken
+  token: PaymentTokenInput
   outputIndex?: number
+}
+
+/** A payment received from a peer, ready for `internalizeAction`. */
+export interface IncomingPayment extends IncomingPaymentInput {
+  token: PaymentToken
 }
 
 /**

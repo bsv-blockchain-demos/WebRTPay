@@ -3,6 +3,7 @@ import type {
   PaymentRequestMessage,
   PaymentRequestResponse,
   PaymentToken,
+  PaymentTokenInput,
   PubKeyHex
 } from '../types.js'
 import { fromBase64, toBase64 } from '../util/bytes.js'
@@ -10,6 +11,7 @@ import { WebRTPayError } from '../util/errors.js'
 import { normalizePaymentRequest, normalizePaymentRequestResponse } from './requests.js'
 import {
   invalidPayment,
+  isByteArray,
   isMessageId,
   isShortString,
   optional,
@@ -116,6 +118,23 @@ const MAX_ERROR_MESSAGE_CHARS = 500
 const MAX_NOTE_CHARS = 500
 /** Longest base64 text that can decode to `DEFAULTS.maxMessageBytes` bytes. */
 const MAX_TRANSACTION_CHARS = 4 * Math.ceil(DEFAULTS.maxMessageBytes / 3)
+/**
+ * Most UTF-8 bytes of a `payment` message besides its transaction's base64: a 64-character
+ * id, two 400-character derivation strings, the largest amount and output index, a
+ * 500-character note escaped to 6 bytes a character, and the JSON around them (4040).
+ */
+const PAYMENT_MESSAGE_OVERHEAD_BYTES = 4096
+
+/**
+ * Largest Atomic BEEF, in bytes, that can be delivered directly to a payee with the default
+ * inbound cap of 16 MiB of JSON (`DEFAULTS.inboundMaxMessageBytes`): 12,579,840 bytes, about
+ * 12 MiB, since base64 adds a third and the rest of the `payment` message takes up to 4096
+ * bytes. `DirectPayClient.sendPayment` refuses a larger transaction with `too_large` before
+ * sending anything. A payee with a lower `limits.maxMessageBytes` accepts less; it answers an
+ * oversize message with `{ t: 'error', code: 'too_large' }` and closes the session.
+ */
+export const MAX_DIRECT_TRANSACTION_BYTES =
+  Math.floor((DEFAULTS.inboundMaxMessageBytes - PAYMENT_MESSAGE_OVERHEAD_BYTES) / 4) * 3
 
 function malformed(message: string): WebRTPayError {
   return new WebRTPayError('protocol', message)
@@ -266,8 +285,12 @@ export function parseWireMessage(v: unknown): WireMessage {
   }
 }
 
-/** Builds the `payment` wire message for a token; `outputIndex` defaults to 0. */
-export function encodePayment(id: string, token: PaymentToken, note?: string): PaymentWire {
+/**
+ * Builds the `payment` wire message for a token (its transaction a number array or a
+ * `Uint8Array`); `outputIndex` defaults to 0. It checks nothing: see
+ * {@link validatePaymentToken}.
+ */
+export function encodePayment(id: string, token: PaymentTokenInput, note?: string): PaymentWire {
   const { derivationPrefix, derivationSuffix } = token.customInstructions
   return {
     t: 'payment',
@@ -279,6 +302,33 @@ export function encodePayment(id: string, token: PaymentToken, note?: string): P
       outputIndex: token.outputIndex ?? 0
     },
     ...(note === undefined ? {} : { note })
+  }
+}
+
+/**
+ * Checks a payment token before it is sent, as the payee will: everything
+ * {@link decodePayment} checks (strict base64 derivation prefix and suffix of 1–400
+ * characters, an amount from 1 to 2.1e15, a uint32 output index, a transaction of bytes —
+ * a `Uint8Array` or integers 0–255 — that parses as Atomic BEEF of at most 32 MiB, a note of
+ * at most 500 characters), and that output `outputIndex` exists and carries exactly `amount`
+ * satoshis. Only the payee can check that the output pays its key. Call it after creating
+ * the transaction and before broadcasting it: a token it refuses would be acked `rejected`
+ * after the money left. `DirectPayClient.sendPayment` calls it before sending.
+ *
+ * @throws WebRTPayError `invalid_payment` naming the first problem.
+ */
+export function validatePaymentToken(token: PaymentTokenInput, note?: string): void {
+  const fields = tokenFields(token)
+  if (!isByteArray(fields.transaction)) {
+    throw invalidPayment('Payment transaction is not a byte array')
+  }
+  const tx = parsePaymentTransaction(fields.transaction)
+  const output = tx.outputs[fields.outputIndex]
+  if (output === undefined || output.satoshis !== fields.amount) {
+    throw invalidPayment('Payment output does not carry the stated amount')
+  }
+  if (note !== undefined && !isShortString(note, MAX_NOTE_CHARS)) {
+    throw invalidPayment('Payment note is invalid')
   }
 }
 

@@ -42,6 +42,8 @@ describe('package scaffold', () => {
       'parseWireMessage',
       'encodePayment',
       'decodePayment',
+      'validatePaymentToken',
+      'MAX_DIRECT_TRANSACTION_BYTES',
       'acceptDirectPayment',
       'verifyDirectPayment',
       'paymentKey',
@@ -72,6 +74,7 @@ describe('package scaffold', () => {
       'tokenFields',
       'invalidPayment',
       'parsePaymentTransaction',
+      'isByteArray',
       'dispatchSignal',
       // implementation limits and helpers
       'MAX_BACKLOG',
