@@ -86,7 +86,7 @@ describe('docs/protocol.md worked examples', () => {
     expect(DOC).toContain(shown(OFFER_SDP))
     // The prose naming the inputs, however its lines are wrapped.
     const prose = DOC.replace(/\s+/g, ' ')
-    for (const field of [KEY_1, 'chain `main`', 'amount 1000', 'expiresAt 1792240000000 ms']) {
+    for (const field of [KEY_1, 'chain `main`', 'amount 1000', 'expiresAt 4102444800000 ms']) {
       expect(prose).toContain(field)
     }
     const code = encodeOfferCode({
@@ -94,10 +94,20 @@ describe('docs/protocol.md worked examples', () => {
       identityKey: KEY_1,
       chain: 'main',
       amount: 1000,
-      expiresAt: 1792240000000,
+      expiresAt: 4102444800000,
       sdp: OFFER_SDP
     })
     expect(DOC).toContain('```\n' + code + '\n```')
+    // The shown code decodes as it is, until its expiry in 2100 (M30).
+    expect(decodeCode(code, { expectedChain: 'main' })).toMatchObject({
+      kind: 'offer',
+      identityKey: KEY_1,
+      chain: 'main',
+      amount: 1000,
+      expiresAt: 4102444800000
+    })
+    expect(() => decodeCode(code, { now: 4102444800000 })).toThrow('expired')
+    expect(DOC).toContain('`03` `05` `80ae99a40f` | expiresAt 4102444800 s')
   })
 
   it('shows the channel-binding transcript of its test vector', () => {

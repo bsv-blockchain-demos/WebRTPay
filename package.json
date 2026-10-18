@@ -5,9 +5,22 @@
   "type": "module",
   "sideEffects": false,
   "license": "SEE LICENSE IN LICENSE.txt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sirdeggen/WebRTPay.git"
+  },
+  "homepage": "https://github.com/sirdeggen/WebRTPay#readme",
+  "bugs": {
+    "url": "https://github.com/sirdeggen/WebRTPay/issues"
+  },
   "engines": {
     "node": ">=22"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/src/index.d.ts",
@@ -18,6 +31,13 @@
       "default": "./dist/server/index.js"
     },
     "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "server": [
+        "dist/server/index.d.ts"
+      ]
+    }
   },
   "bin": {
     "webrtpay-relay": "dist/server/cli.js"
@@ -34,7 +54,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:turn": "RUN_TURN_TESTS=1 node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
-    "format:check": "prettier --check --no-error-on-unmatched-pattern src server test examples"
+    "format:check": "prettier --check --no-error-on-unmatched-pattern src server test examples",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "ws": "^8.21.3"

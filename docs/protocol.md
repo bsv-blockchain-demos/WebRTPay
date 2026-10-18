@@ -299,10 +299,11 @@ a=max-message-size:262144
 
 With sid `000102030405060708090a0b0c0d0e0f`, identity key
 `0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798`, chain `main`, amount
-1000 and expiresAt 1792240000000 ms the offer code is:
+1000 and expiresAt 4102444800000 ms (2100-01-01T00:00:00Z, so `decodeCode` accepts it as it
+is until then) the offer code is:
 
 ```
-webrtpay1:AQEAAQIDBAUGBwgJCgsMDQ4PAnm-Zn753LusVaBilc6HCwcCm_zbLc4o2VnygVsW-BeYAQRtYWluAgLoBwMFgNPN1gYQbwEAEgRhQjNkGHg5WXcxUXY3TGsySHM1UHowUnQ4VWU2TQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fAwIOfBpSO51PYIohbF2eS38Q1DEQywBxB8NQESABDbgABAAFAAYABwAIAAnDUQ
+webrtpay1:AQEAAQIDBAUGBwgJCgsMDQ4PAnm-Zn753LusVaBilc6HCwcCm_zbLc4o2VnygVsW-BeYAQRtYWluAgLoBwMFgK6ZpA8QbwEAEgRhQjNkGHg5WXcxUXY3TGsySHM1UHowUnQ4VWU2TQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fAwIOfBpSO51PYIohbF2eS38Q1DEQywBxB8NQESABDbgABAAFAAYABwAIAAnDUQ
 ```
 
 | Bytes (hex) | Meaning |
@@ -312,7 +313,7 @@ webrtpay1:AQEAAQIDBAUGBwgJCgsMDQ4PAnm-Zn753LusVaBilc6HCwcCm_zbLc4o2VnygVsW-BeYAQ
 | `0279be66…16f81798` | payee identity key, 33 bytes |
 | `01` `04` `6d61696e` | chain `main` |
 | `02` `02` `e807` | amount 1000 |
-| `03` `05` `80d3cdd606` | expiresAt 1792240000 s |
+| `03` `05` `80ae99a40f` | expiresAt 4102444800 s |
 | `10` `6f` | TLV sdp, length 111 |
 | `01` `00` `12` | compact; setup actpass; max-message-size 2^18 |
 | `04` `61423364` | ufrag `aB3d` |
@@ -333,6 +334,10 @@ webrtpay1:AQEAAQIDBAUGBwgJCgsMDQ4PAnm-Zn753LusVaBilc6HCwcCm_zbLc4o2VnygVsW-BeYAQ
   unreliable channel closes the link with `protocol`.
 - ICE is non-trickle: each side waits until gathering completes, or 5 s, then sends one complete
   SDP. DTLS fingerprint verification is never disabled.
+- Every SDP, the peer's offer or answer and a side's own, must carry exactly one
+  `a=fingerprint:` line, a `sha-256` one of 32 bytes; any other is refused with `protocol` before
+  the WebRTC stack applies it. The handshake signs the fingerprints (§5.3), and a stack may
+  enforce only one of several (libdatachannel checks the first media-level line).
 - Every message is binary. A text message closes the link with `protocol`.
 
 ### 4.2 Frame
@@ -353,8 +358,13 @@ Each direction numbers its messages independently: 0 for the first message on th
 
 ### 4.3 Receiving
 
-A receiver processes frames in arrival order and closes the link at the first violation, with
-no reply (the stream can no longer be trusted):
+A receiver processes frames in arrival order and closes the link at the first violation. A
+message over the cap (`too_large`) is answered first with
+`{ "t": "error", "code": "too_large", "message": "Message exceeds <cap> bytes" }`: the cap is
+checked before a frame is buffered, so the stream is still in step. The receiver then reads
+nothing more and closes when the peer does, or 1 s after handing the reply to its channel
+(closing at once can discard it). Every other violation closes the link with no reply (the
+stream can no longer be trusted):
 
 | Violation | Error |
 | --- | --- |
@@ -377,7 +387,7 @@ exactly the cap is accepted.
 
 | When | Cap |
 | --- | --- |
-| A link created by `DirectPayClient`, until the peer authenticates | 65536 bytes |
+| A link in the identity handshake (`authenticate` sets it first), until the peer authenticates | 65536 bytes |
 | After the peer's `auth` verifies, on the payee (inbound sessions and offer codes) | 16 MiB (`limits.maxMessageBytes`) |
 | After the peer's `auth` verifies, on the payer (`connect`, `answerOfferCode`) | 32 MiB (`maxMessageBytes`) |
 | A `PeerLink` used on its own | 32 MiB unless set |
@@ -438,8 +448,9 @@ webrtpay/1 channel-binding
 - The signer takes its own list from its local SDP and the verifier's from the remote SDP; the
   verifier computes the same bytes with the roles mirrored. Both lists must be non-empty.
 - Nonces are the `hello` texts as sent; keys are the identity keys from the `hello`s.
-- No field can contain `\n`, and no list entry can contain `,`, so the fields are unambiguous.
-  A man in the middle terminates DTLS separately with each side, so each side sees a different
+- No field can contain `\n`, and in an SDP that passes the fingerprint rule of §4.1 each list
+  is a single `sha-256 <64 hex>` entry, which contains no `,`, so the fields are unambiguous. A
+  man in the middle terminates DTLS separately with each side, so each side sees a different
   remote fingerprint and neither signature verifies.
 
 ### 5.4 Signature
@@ -454,7 +465,9 @@ and sends the DER signature as hex. The verifier calls
 A failed handshake closes the link without a reply: `auth_failed` for a bad message, a key
 that is not the expected one, a repeated nonce, a missing fingerprint, a signature that does not
 verify, too many queued messages or a wallet failure; `timeout` when it does not finish in time
-(15 s by default; `DirectPayClient` gives it what is left of the 30 s connect budget).
+(15 s by default; `DirectPayClient` gives it what is left of the 30 s connect budget). A message
+over 65536 bytes before the peer authenticated closes it with `too_large`, after the reply of
+§4.3.
 
 ### 5.6 Test vector
 
@@ -522,14 +535,28 @@ The session layer checks the `id` and only the types of the rest (`outputIndex` 
 `null` reads as 0). The payee then checks the values, and answers a payment that fails them
 with a `rejected` ack (the session stays open):
 
-- `transaction`: strict base64 of 1 byte to 32 MiB that parses as Atomic BEEF;
+- `transaction`: strict base64 of 1 byte to 32 MiB that parses as Atomic BEEF (but see the
+  size ceiling below);
 - `amount`: an integer from 1 to 2.1 × 10^15;
 - `outputIndex`: an integer from 0 to 2^32 − 1;
 - `derivationPrefix`, `derivationSuffix`: strict base64, 1–400 characters;
 - `note`: at most 500 UTF-16 code units.
 
-`id` is 16 random bytes as base64url in this package. The app receives the token with
-`transaction` as a byte array (`number[]`), the same `PaymentToken` PeerPay uses.
+`id` is 16 random bytes as base64url in this package. The app hands this package a token with
+`transaction` as a `number[]` or a `Uint8Array` (`@bsv/sdk`'s `AtomicBEEF`, as PeerPay's
+`PaymentToken` has it) and receives tokens with `transaction` as a `number[]`.
+
+**Size ceiling.** The whole `payment` message must fit the payee's message cap (§4.4), 16 MiB by
+default. Base64 adds a third and the other fields take at most 4096 bytes, so the largest
+transaction a payee with the default cap accepts directly is 12,579,840 bytes
+(`MAX_DIRECT_TRANSACTION_BYTES`, about 12 MiB). `sendPayment` refuses a larger one with
+`too_large` before sending anything; a payee with a lower cap answers an oversize message with
+an `error` `too_large` (§4.3), which the payer reports as `too_large`.
+
+**Before sending**, `sendPayment` (and `validatePaymentToken`, for a payer that checks before
+broadcasting) applies the checks above, and checks that output `outputIndex` exists and carries
+exactly `amount` satoshis; a token that fails is refused with `invalid_payment` and nothing is
+sent.
 
 ### 6.2 `payment.ack` (payee → payer)
 
@@ -574,8 +601,12 @@ lower-case hex, identical to message-box-client's.
 ### 6.5 Session rules (`DirectPayClient`)
 
 **Payer.** Sends `payment` and waits up to 45 s for the `payment.ack` with the same `id`,
-ignoring other messages. Once the ack is in, it sends `bye` and closes. The payee never closes
-right after an ack, so the ack cannot be cut off.
+ignoring other messages except `error`, which ends the wait (`too_large` for code `too_large`,
+`closed` otherwise). Once the ack is in, it sends `bye` and closes. The payee never closes
+right after an ack, so the ack cannot be cut off. The payer keeps the token until the ack is
+`accepted` or `received`: a `rejected` ack that carries a `txid` after the transaction was
+broadcast means the payee holds an output it cannot find without the derivation values, so the
+same token is delivered again rather than paid again.
 
 **Payee.** Handles one message at a time, in order:
 
@@ -588,7 +619,10 @@ right after an ack, so the ack cannot be cut off.
 
 It closes a session with `timeout` after 60 s without a message, and with `rate_limited` when
 more than 8 messages are waiting. A session it answered from a signal must also send its first
-message within 15 s of the handshake and ends 120 s after it, however busy.
+message within 60 s of the handshake (`firstMessageTimeoutMs`) and ends 120 s after it, however
+busy. The first-message window is the payer's time to create and broadcast the transaction
+after connecting, permission prompts included: a payer prepares promptly, checks
+`peer.isOpen` before broadcasting, and sends right after.
 
 **Accepting a payment** (`acceptDirectPayment`): output `outputIndex` must be P2PKH to the key
 from `getPublicKey({ protocolID: [2, '3241645161d8'], keyID: "<prefix> <suffix>",
@@ -638,8 +672,9 @@ ciphertext is a 32-byte IV, the AES-256-GCM ciphertext and a 16-byte tag.
 
 ### 7.4 Opening
 
-The receiver rejects with `invalid_signal` (and `DirectPayClient` drops silently) unless, in
-this order:
+The receiver rejects with `invalid_signal` (and `DirectPayClient` drops the signal and reports
+it to `onError`, at most once every 10 s, so a wallet that cannot decrypt is visible) unless,
+in this order:
 
 1. the envelope is well formed (§7.1) and the carrier-asserted sender is an identity key;
 2. `decrypt` with `counterparty` = the carrier's sender succeeds and yields a JSON object with
@@ -691,6 +726,16 @@ address is disclosed): one over its sender's limits gets no reply; one refused b
 payee is busy gets a `reject` `busy`, but at most one reject a second is sent and the rest go
 unanswered.
 
+Budgets and windows run on a monotonic clock (`performance.now()`), so a wall clock set back
+cannot hold them shut.
+
+**Known limitation.** Identities are free, so a few of them can hold every inbound slot: each
+dials, completes the handshake and sends any message (a `payment.ack` the payee ignores) within
+the first-message window, then one every 60 s. `maxSessionMs` (120 s) bounds each hold, but
+redialing renews it within the per-sender offer limit, so direct receive stays busy while it
+goes on. Nothing is spent and payers fall back to MessageBox. Reserving a slot for known
+counterparties is possible future work.
+
 ### 7.7 Carriers
 
 **MessageBox** (`MessageBoxSignaler`): the envelope's JSON text is the message `body` in box
@@ -719,20 +764,27 @@ stores nothing and never logs payloads.
 
 A connection is admitted, before the WebSocket upgrade, per **source**: the address in the
 `TRUSTED_IP_HEADER` request header when it holds exactly one IP address, otherwise the socket's
-peer address. IPv4 (and IPv4-mapped IPv6) counts as is; other IPv6 counts by its /64.
+peer address. IPv4 (and IPv4-mapped IPv6) counts as is; other IPv6 counts by its /64 and also
+by its /48, with 4 times the limits, since a /48 (a free tunnel-broker allocation) holds 65,536
+/64s. The header is trusted only when every connection arrives through the proxy that sets
+it: a client that reaches the relay directly can send any value. Users behind one
+carrier-grade NAT address share its limits; operators raise them with the variables in the
+README.
 
 | Refusal (plain HTTP, then close) | When |
 | --- | --- |
 | `404 Not Found` | the path is not the relay's (default `/`, trailing slashes ignored); a relay attached to an app's server leaves such upgrades alone |
-| `429 Too Many Requests` | the source holds 20 sockets, or opened 30 in the last minute |
+| `429 Too Many Requests` | the source holds 20 sockets or opened 30 in the last minute, or its /48 holds 80 or opened 120 |
 | `503 Service Unavailable` | the relay holds 10000 sockets, or 1000 not yet authenticated |
+
+A connection token is spent only for a connection that is admitted.
 
 On a server the relay created, `GET /health` (or `HEAD`) answers `200 {"status":"ok"}`.
 
 ### 8.2 Frames
 
-Every WebSocket message is one JSON object as text, at most 65536 bytes (a larger one closes
-the socket with 1009).
+Every WebSocket message is one JSON object as text, at most 98688 bytes (4 × the envelope cap;
+a larger one closes the socket with 1009).
 
 Relay → client:
 
@@ -783,21 +835,35 @@ Each client frame gets exactly one reply, in the order the frames were sent.
 - The envelope is checked as in §7.1; one that is missing or malformed (including non-JSON and
   binary frames) gets `bad_request` without `ref`. Otherwise `ref` is the envelope's `sid`.
 - A `t` other than `signal` or `turn`, or a `to` that is not an identity key, gets
-  `bad_request`; an envelope whose JSON `{"v":1,"sid":…,"ciphertext":…}` is over 16384 UTF-8
-  bytes gets `too_large`.
+  `bad_request`; an envelope whose JSON `{"v":1,"sid":…,"ciphertext":…}` is over 24672 UTF-8
+  bytes gets `too_large`. 24672 is the largest well-formed envelope (a 64-character sid and a
+  24576-character ciphertext), so any signal §7 allows, a 16384-character SDP included, fits;
+  only a sid or ciphertext of multi-byte characters can exceed it.
 - The relay forwards `{ t: 'signal', from, envelope: { v: 1, sid, ciphertext } }` (other fields
-  dropped) to every socket of `to`, if `to` has budget left: 30 signals a minute from all senders
-  together. It replies `sent` when at least one socket took it, otherwise `offline`.
+  dropped) to every socket of `to`, within two budgets: the sender's own share of `to`, 6 signals
+  a minute from one sender identity (checked first), and `to`'s total, 120 a minute from all
+  senders together. A spent share gets `rate_limited` with `ref`. It replies `sent` when at
+  least one socket took it, otherwise `offline` (`to` is not connected, no socket took it, or
+  its total is spent). Budgets are spent only for a signal delivered.
+- The shares stop one identity from making a recipient unreachable. Identities are free,
+  though: one address may hold 20 sockets, each a fresh identity with its own share, and 20 × 6
+  a minute is the whole total of 120. Spending it that way takes 20 sockets from one address
+  held for as long as it lasts.
 
 `turn`:
 
 - Without TURN configured: `ice` with the STUN servers.
-- Otherwise, within the source's budget (6 an hour unless `TURN_PER_IP_PER_HOUR` says otherwise)
-  and the relay's (600 an hour): `ice` with the STUN servers followed by
-  `{ urls: TURN_URLS, username, credential }`; past either budget, `rate_limited`.
+- Otherwise, within the source's budget (6 an hour unless `TURN_PER_IP_PER_HOUR` says
+  otherwise), for IPv6 its /48's (24 an hour), and the relay's (600 an hour): `ice` with the
+  STUN servers followed by `{ urls: TURN_URLS, username, credential }`; past any budget,
+  `rate_limited`.
 
 A frame over the socket's rate (20 per 10 s, refilled continuously) gets `rate_limited` and is
-dropped.
+dropped, as long as the socket has sent at most 20 such frames in a row; the next closes the
+socket with 1008. WebSocket pings count against the same rate, before authentication too: one
+within it gets a pong, one over it gets none and counts as a frame over the rate. Replies stay in
+order for a client briefly over the rate, while one that floods, whether it reads the replies
+or not, is cut off.
 
 ### 8.5 Errors
 
@@ -805,8 +871,9 @@ dropped.
 | --- | --- | --- | --- |
 | `auth_failed` | authentication failed (then close 1008) | no | `auth_failed` |
 | `bad_request` | malformed frame or envelope, bad `to` | when the envelope is well formed | `protocol` |
-| `too_large` | envelope over 16384 bytes | yes | `too_large` |
-| `offline` | no socket of `to` took the signal, or `to` is over its budget | yes | `peer_unreachable` |
+| `too_large` | envelope over 24672 bytes | yes | `too_large` |
+| `offline` | `to` is not connected, no socket of `to` took the signal, or `to`'s total is spent | yes | `peer_unreachable` |
+| `rate_limited` | the sender's share of `to` | yes | `rate_limited` |
 | `rate_limited` | socket rate, 5 sockets per identity, TURN budgets | no | `rate_limited` |
 
 Any other code maps to `protocol`. `offline` tells any authenticated key whether another key
@@ -817,7 +884,8 @@ at once instead of after 30 s (see the README).
 
 Every 30 s the relay pings each socket with 16 random bytes; a socket that has not answered the
 previous ping with a pong echoing its payload is terminated, as is one with more than 1 MiB
-queued (also checked before each write). On shutdown sockets are closed with 1001.
+queued (also checked before each write). Pings from a client are answered only within its rate
+(§8.4). On shutdown sockets are closed with 1001.
 
 ### 8.7 TURN credentials
 
@@ -848,6 +916,8 @@ so coturn's `--user-quota` still counts per identity. The relay's TTL is 600 s (
   authenticating, this one included; one that stayed authenticated for 30 s resets it to 0.
   `onStateChange` reports each `offline` caused by a failure with the error that ended the
   connection or the attempt (for example `auth_failed` from the relay).
+- Runs the app's `onIceServers` and `onStateChange` callbacks so that a throw cannot stop the
+  handshake or a `turn` request; what they throw goes to `onCallbackError`.
 - Treats a TURN server whose REST username (`<expiry>:…`) expires within 30 s as expired.
   `iceServers()` is the list from the latest `ice` frame (a new connection's STUN-only frame
   replaces an earlier TURN answer). `turnProvider()` keeps the last `turn` answer across
@@ -868,24 +938,27 @@ so coturn's `--user-quota` still counts per identity. The relay's TTL is 600 s (
 | Frame size (header included) | 16384 bytes |
 | Message cap before authentication | 65536 bytes |
 | Message cap after: payee / payer | 16 MiB / 32 MiB |
+| Largest transaction delivered directly (default payee cap) | 12,579,840 bytes |
+| Linger after a `too_large` reply | 1 s |
 | JSON depth / structural tokens | 32 / 4096 |
 | Session messages kept before the app listens | 64 |
 | Inbound sessions: total / per sender | 3 / 1 |
 | Inbound offers per 60 s: total / per sender | 10 / 3 |
-| Inbound session: first message / idle / lifetime | 15 s / 60 s / 120 s |
+| Inbound session: first message / idle / lifetime | 60 s / 60 s / 120 s |
 | Inbound messages waiting | 8 |
 | Signals opened: overall / per sender | 20 a second (burst 40) / 10 a minute (burst 10) |
+| Signals that cannot be opened, reported to `onError` | 1 every 10 s |
 | Rejects sent | 1 a second |
 | Signal sdp / sid / ciphertext | 16384 / 64 / 24576 characters |
 | MessageBox poll: idle / dialing / deadline / max backoff | 2.5 s / 1 s / 10 s / 30 s |
-| Relay envelope / WebSocket message | 16384 / 65536 bytes |
+| Relay envelope / WebSocket message | 24672 / 98688 bytes |
 | Relay: authenticate within | 10 s |
-| Relay: frames per socket | 20 per 10 s |
-| Relay: sockets per identity / per source / total / unauthenticated | 5 / 20 / 10000 / 1000 |
-| Relay: connections per source | 30 a minute |
-| Relay: signals to one identity | 30 a minute |
+| Relay: frames per socket (pings included) / over the rate in a row before close | 20 per 10 s / 20 |
+| Relay: sockets per identity / per source / per /48 / total / unauthenticated | 5 / 20 / 80 / 10000 / 1000 |
+| Relay: connections per source / per /48 | 30 / 120 a minute |
+| Relay: signals to one identity from one sender / from all | 6 / 120 a minute |
 | Relay: queued bytes per socket / ping interval | 1 MiB / 30 s |
-| Relay: TURN credentials per source / in total / lifetime | 6 an hour (`TURN_PER_IP_PER_HOUR`) / 600 an hour / 600 s |
+| Relay: TURN credentials per source / per /48 / in total / lifetime | 6 / 24 / 600 an hour / 600 s |
 | `RelaySignaler`: TURN servers count as expired | 30 s before their expiry |
 | `iceServersProvider` wait before gathering without it | 5 s |
 
@@ -897,13 +970,13 @@ Every expected failure is a `WebRTPayError` with one of these `code`s:
 | --- | --- |
 | `timeout` | a step did not finish in time |
 | `closed` | the link, session, signaler or client closed |
-| `protocol` | the peer, relay or carrier broke the wire rules |
+| `protocol` | the peer, relay or carrier broke the wire rules, or the WebRTC stack refused a configuration or SDP (the stack's error is the `cause`) |
 | `auth_failed` | the identity handshake or relay authentication failed |
 | `peer_unreachable` | no carrier could reach the peer, or no answer came |
 | `rejected` | the peer refused the connection (`busy`, `not_receiving`) |
 | `invalid_code` | a malformed, expired or wrong-network code |
-| `invalid_payment` | a payment that is malformed or does not pay this wallet |
+| `invalid_payment` | a payment that is malformed or does not pay this wallet, or a token `sendPayment` refuses to send |
 | `invalid_signal` | a signal that cannot be opened (§7.4) |
 | `rate_limited` | a limit was reached |
-| `too_large` | a message, code or envelope over its size limit |
+| `too_large` | a message, code, envelope or direct transaction over its size limit |
 | `unsupported` | a missing capability (no `RTCPeerConnection`, no signaler, no handlers) |

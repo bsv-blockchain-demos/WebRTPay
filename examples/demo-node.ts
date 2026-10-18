@@ -24,6 +24,7 @@ import { RTCPeerConnection } from 'node-datachannel/polyfill'
 import {
   DirectPayClient,
   PAYMENT_PROTOCOL_ID,
+  WebRTPayError,
   acceptDirectPayment,
   createMemoryHub,
   randomBytes,
@@ -123,15 +124,25 @@ const payer = new DirectPayClient({
   chain: 'test'
 })
 
-// Payee: answer offers and take custody of each payment once.
+// Payee: answer offers and take custody of each payment once. A real app persists `seen`,
+// and keeps a payment that verified but could not be internalized for a passing reason
+// (wallet locked, storage down) to retry, acking it 'received': see the README.
 const seen = new Set<string>()
 await payee.startReceiving({
   async onPayment(p) {
-    const { status, txid } = await acceptDirectPayment(payeeWallet, p, {
-      seen: { has: key => seen.has(key), add: key => void seen.add(key) }
-    })
-    console.log(`[payee] ${status}: ${p.token.amount} sats from ${short(p.sender)} in ${txid}`)
-    return 'accepted' // a duplicate is already in the wallet
+    try {
+      const { status, txid } = await acceptDirectPayment(payeeWallet, p, {
+        seen: { has: key => seen.has(key), add: key => void seen.add(key) }
+      })
+      console.log(`[payee] ${status}: ${p.token.amount} sats from ${short(p.sender)} in ${txid}`)
+      return 'accepted' // a duplicate is already in the wallet
+    } catch (e) {
+      // malformed, or it does not pay this wallet: nothing was stored
+      if (e instanceof WebRTPayError && e.code === 'invalid_payment') {
+        return { status: 'rejected', reason: e.message }
+      }
+      throw e // acked 'rejected' with a generic reason; the payer keeps its token
+    }
   },
   onSession: peer => console.log(`[payee] authenticated session with ${short(peer)}`),
   onError: e => console.error('[payee] error:', e)

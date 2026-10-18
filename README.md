@@ -4,12 +4,13 @@ Direct wallet-to-wallet BSV payments over WebRTC data channels, authenticated wi
 identity keys.
 
 A payer hands the payee the same `PaymentToken` that PeerPay sends through MessageBox (Atomic
-BEEF plus the BRC-29 derivation prefix and suffix), but over an encrypted peer-to-peer data
-channel: no server stores it or can read it (when two networks need a TURN relay, the relay
-carries only DTLS ciphertext). Both sides prove their identity key bound to the DTLS session,
-so whoever carries the signaling cannot read, change or redirect a payment. A carrier can still
-drop signals, which stops a direct payment from happening (a denial of service), but it can
-never take or divert the funds: the payer connects before it creates the transaction.
+BEEF, as a `number[]` or a `Uint8Array` going in and a `number[]` coming out, plus the BRC-29
+derivation prefix and suffix), but over an encrypted peer-to-peer data channel: no server
+stores it or can read it (when two networks need a TURN relay, the relay carries only DTLS
+ciphertext). Both sides prove their identity key bound to the DTLS session, so whoever carries
+the signaling cannot read, change or redirect a payment. A carrier can still drop signals,
+which stops a direct payment from happening (a denial of service), but it can never take or
+divert the funds: the payer connects before it creates the transaction.
 
 - Browser-safe root entry: no Node builtins; `RTCPeerConnection` from the platform or injected
   (node-datachannel in Node, react-native-webrtc in React Native).
@@ -47,12 +48,23 @@ Requirements: Node 22 or later, or a browser; `@bsv/sdk` `^2.8.6 || ^3.0.0`; a B
 (`WalletClient`, a wallet-toolbox `Wallet`, anything with the methods in `WalletLike`). In Node,
 inject a WebRTC implementation such as `node-datachannel/polyfill` through `rtc`.
 
+- **ESM only.** Use `import`; a CommonJS `require()` of the package needs Node 22.12 or later.
+- **DOM types.** The type declarations use the DOM's WebRTC types (`RTCPeerConnection`,
+  `RTCIceServer`, `RTCIceTransportPolicy`). A Node or React Native project that type-checks
+  them needs `"lib": ["ES2022", "DOM"]` in its `tsconfig.json`, or declarations of its own for
+  those names; with `skipLibCheck` and neither, they silently become `any`.
+
 ## Quick start
 
 ### Receive (payee)
 
 ```ts
-import { DirectPayClient, MessageBoxSignaler, acceptDirectPayment } from '@bsv/webrtpay'
+import {
+  DirectPayClient,
+  MessageBoxSignaler,
+  WebRTPayError,
+  acceptDirectPayment
+} from '@bsv/webrtpay'
 
 const originator = 'wallet.example.com'
 const client = new DirectPayClient({
@@ -63,42 +75,67 @@ const client = new DirectPayClient({
   chain: 'main'
 })
 
-const seen = new Set<string>() // persist this: it is what makes a re-delivered payment harmless
+// Yours: `seen`, a durable SeenStore (has/add), is what makes a re-delivered payment harmless;
+// `retryStore` is a durable store with a cap for payments to internalize later; `isTransient`
+// says whether a wallet failure will pass (wallet locked, storage, IPC or network down).
 await client.startReceiving({
   async onPayment(p) {
-    // Checks that output p.token.outputIndex pays this wallet's BRC-29 key for p.sender,
-    // then internalizes it once.
-    await acceptDirectPayment(wallet, p, {
-      originator,
-      seen: { has: key => seen.has(key), add: key => void seen.add(key) }
-    })
-    return 'accepted' // or 'received' (kept for a local retry), or { status: 'rejected', reason }
+    try {
+      // Checks that output p.token.outputIndex pays this wallet's BRC-29 key for p.sender,
+      // then internalizes it once.
+      await acceptDirectPayment(wallet, p, { originator, seen })
+      return 'accepted'
+    } catch (e) {
+      // malformed, or it does not pay this wallet: nothing was stored
+      if (e instanceof WebRTPayError && e.code === 'invalid_payment') {
+        return { status: 'rejected', reason: e.message }
+      }
+      // it verified, but the wallet cannot take it right now: keep it, never refuse it
+      if (isTransient(e)) {
+        await retryStore.keep(p)
+        return 'received'
+      }
+      throw e // acked 'rejected' with a generic reason; the payer keeps its token
+    }
   },
   onError: e => console.warn('direct payment session failed', e)
 })
 ```
 
-`p.sender` is the identity key the payer proved in the handshake. A handler that throws makes
-the ack `rejected`, but by then the payer has usually broadcast the transaction: when a payment
-verifies and only internalizing fails for a passing reason (wallet locked, storage down), keep
-it, retry locally and return `'received'`. Receiving answers offers
-automatically within the inbound limits (3 sessions, 1 per sender, 10 offers a minute, 3 per
-sender); see [Security and privacy](#security-and-privacy) before turning it on for users.
+`p.sender` is the identity key the payer proved in the handshake. By the time a payment arrives
+the payer has usually broadcast it, so a payment that verifies is never refused: when only
+internalizing fails for a passing reason, keep it, retry locally and return `'received'`. Keep
+only such failures, in a store with a cap: a wallet's argument or proof errors (a BEEF it cannot
+verify fails with `WERR_INVALID_PARAMETER`, say) do not pass, and keeping those would let anyone
+fill the store. A handler that throws makes the ack `rejected`. `acceptDirectPayment` reports a
+payment the wallet took as `accepted` even when `seen.add` fails afterwards (`onSeenError`
+hears about it). Receiving answers offers automatically within the inbound limits (3 sessions,
+1 per sender, 10 offers a minute, 3 per sender); see
+[Security and privacy](#security-and-privacy) before turning it on for users.
 
 ### Pay (payer)
 
-Connect first, then create the transaction: if the payee cannot be reached, nothing is spent.
+Connect first, then create the transaction: if the payee cannot be reached, nothing is spent. A
+payee that answered the dial waits 60 s (its `firstMessageTimeoutMs`) for the payment before it
+hangs up, and creating and broadcasting the transaction, permission prompts included, has to
+fit in that window. So have the user confirm before `connect`, sign the transaction without
+broadcasting it (`noSend`), check that the session is still open, then broadcast and send at
+once.
 
 ```ts
 import { P2PKH, PublicKey } from '@bsv/sdk'
-import { PAYMENT_PROTOCOL_ID, randomBytes, toBase64 } from '@bsv/webrtpay'
-import type { PaymentToken } from '@bsv/webrtpay'
+import { PAYMENT_PROTOCOL_ID, randomBytes, toBase64, validatePaymentToken } from '@bsv/webrtpay'
+import type { PaymentTokenInput } from '@bsv/webrtpay'
+
+// `wallet` takes the originator on every call (a WalletInterface such as a wallet-toolbox
+// Wallet); a WalletClient takes it in its constructor instead, and one argument per method.
 
 // 1. Dial and authenticate (30 s budget). Rejects peer_unreachable, rejected ('busy',
-//    'not_receiving'), timeout or auth_failed.
+//    'not_receiving'), rate_limited, timeout or auth_failed.
 const peer = await client.connect(payeeKey)
 
-// 2. Build the payment as PeerPay does: P2PKH to the payee's BRC-29 key for a fresh derivation.
+// 2. Build the payment as PeerPay does, P2PKH to the payee's BRC-29 key for a fresh
+//    derivation, and sign it without broadcasting it.
 const derivationPrefix = toBase64(randomBytes(32))
 const derivationSuffix = toBase64(randomBytes(32))
 const { publicKey } = await wallet.getPublicKey(
@@ -110,38 +147,59 @@ const { publicKey } = await wallet.getPublicKey(
   originator
 )
 const lockingScript = new P2PKH().lock(PublicKey.fromString(publicKey).toHash()).toHex()
-const { tx } = await wallet.createAction(
+const { tx, txid } = await wallet.createAction(
   {
     description: 'Direct payment',
     outputs: [{ satoshis: 1000, lockingScript, outputDescription: 'Payment' }],
-    options: { randomizeOutputs: false }
+    options: { randomizeOutputs: false, noSend: true }
   },
   originator
 )
-const token: PaymentToken = {
+const token: PaymentTokenInput = {
   customInstructions: { derivationPrefix, derivationSuffix },
-  transaction: tx!,
+  transaction: tx!, // number[] or Uint8Array
   amount: 1000,
   outputIndex: 0
 }
+validatePaymentToken(token) // what the payee checks short of its own key: invalid_payment
 
-// 3. Deliver it and wait for the payee's ack (45 s); the session then ends.
+// 3. Broadcast only while the payee is still there, then deliver and wait for its ack (45 s).
+if (!peer.isOpen) {
+  // the payee hung up: connect again before broadcasting, or abort the action
+}
+await wallet.createAction(
+  { description: 'Direct payment', options: { sendWith: [txid!] } },
+  originator
+)
 const ack = await client.sendPayment(peer, token)
-// ack.status: 'accepted' | 'received' | 'rejected' (ack.reason)
+// ack.status: 'accepted' | 'received' | 'rejected' (ack.reason); the session then ends
 ```
 
-If `sendPayment` fails after the transaction was broadcast (the channel dropped, the ack timed
-out), keep the token: delivering the same token again, directly or through MessageBox, is safe
-because the payee acknowledges a payment it already has without internalizing it twice.
+Keep the token until the ack is `accepted` or `received`. If `sendPayment` fails after the
+broadcast (the channel dropped, the ack timed out), or the ack is `rejected` and carries a
+`txid`, the payee may hold an output it cannot find without the derivation values: deliver the
+same token again, directly or through MessageBox, rather than treating the payment as failed or
+paying again. The payee acknowledges a payment it already has without internalizing it twice.
+
+`sendPayment` sends nothing, and leaves the session as it was, for a token
+`validatePaymentToken` refuses (`invalid_payment`) or a transaction over
+`MAX_DIRECT_TRANSACTION_BYTES` (`too_large`): 12,579,840 bytes, about 12 MiB, what fits a
+payee's default 16 MiB message cap once base64-encoded. A session that has closed fails at
+once with `closed`. A payee configured with a smaller cap answers an oversize payment with an
+error, which `sendPayment` reports as `too_large`.
 
 ### Face to face (code exchange, no server)
 
 The payee shows an offer code; the payer scans it and shows an answer code; the payee scans
 that. The payee is the offerer because an offer can wait for minutes while the answer must be
 applied within about 15 s (the answerer's ICE timer), and the payee is the one scanning then.
-Pasting codes through a chat app usually misses that window.
+That window starts when the payer calls `answerOfferCode`, which gathers, starts the ICE
+checks toward the payee and starts the 30 s timer of `connected`: the payer reviews the offer
+with `decodeCode` and confirms before answering, then shows the answer code at once. Pasting
+codes through a chat app usually misses the window.
 
 ```ts
+import { decodeCode } from '@bsv/webrtpay'
 // showQr, scanQr and confirmWithUser stand for your UI.
 
 // Payee: no signaler needed. `handlers` are ReceiveHandlers, as for startReceiving.
@@ -149,12 +207,18 @@ const offer = await client.createOfferCode({ amount: 1000, expiresInMs: 5 * 60_0
 showQr(offer.code)
 const payerSession = await offer.complete(await scanQr()) // payerSession.peerIdentityKey
 
-// Payer: refuses an expired code and one for another network than `chain`.
-const answer = await client.answerOfferCode(await scanQr())
-await confirmWithUser(answer.offer.identityKey, answer.offer.amount) // who, and how much
-showQr(answer.answerCode)
-const peer = await answer.connected // the payee proved answer.offer.identityKey
-const ack = await client.sendPayment(peer, token)
+// Payer: review first, as answering starts the clock.
+const text = await scanQr()
+// refuses an expired code and one for another network
+const preview = decodeCode(text, { expectedChain: 'main' })
+if (preview.kind !== 'offer') throw new Error("Scan the payee's offer code")
+if (await confirmWithUser(preview.identityKey, preview.amount)) {
+  const answer = await client.answerOfferCode(text) // ICE and the connect timer start here
+  showQr(answer.answerCode)
+  const peer = await answer.connected // the payee proved preview.identityKey
+  // prepare, check peer.isOpen, broadcast and send as in Pay; on giving up, answer.cancel()
+  const ack = await client.sendPayment(peer, token)
+}
 ```
 
 An offer code carries the payee's identity key, network, optional amount and expiry and its
@@ -192,7 +256,8 @@ recipient's host, so payer and payee may use different servers).
 **`RelaySignaler`** keeps one authenticated WebSocket to a relay, and only while it is needed:
 while subscribed, while a send is in flight, or after `connect()`. Options: `url` (`ws:` or
 `wss:`), `wallet`, `originator`, `WebSocket` (defaults to the global one), `onIceServers`,
-`onStateChange` and `random`.
+`onStateChange`, `onCallbackError` and `random`. A throw from `onIceServers` or
+`onStateChange` never reaches the connection; it goes to `onCallbackError`.
 
 - `listen()` resolves once the connection is authenticated or the first attempt has failed. The
   subscription stays either way, and while it lasts a lost or refused connection is retried in
@@ -249,6 +314,55 @@ array or takes more than 5 s is passed over and the gather uses `rtc.iceServers`
 dial never fails because of it. `onIceServersProviderError` is told why each time: what the
 provider threw or rejected with (`rate_limited` once the relay's budget is spent), a
 `TypeError` for a result that is not an array, or a `timeout` `WebRTPayError` after 5 s.
+
+**Node with node-datachannel.** Its polyfill hands each TURN server to libdatachannel as a
+`turn:<username>:<credential>@host` url, which cuts a REST username (`<expiry>:<pseudonym>`)
+at its colon, so coturn refuses relay-issued credentials and relayed connections fail without
+an error. Give libdatachannel TURN servers as native `IceServer` objects instead, through the
+polyfill's `peerConnection` option (this is what the repository's TURN tests run):
+
+```ts
+import { PeerConnection } from 'node-datachannel'
+import type { IceServer, RtcConfig } from 'node-datachannel'
+import { RTCPeerConnection as Polyfill } from 'node-datachannel/polyfill'
+
+let made = 0
+class TurnRTCPeerConnection extends Polyfill {
+  constructor(config: RTCConfiguration & { bindAddress?: string } = {}) {
+    const native: RtcConfig = { iceServers: (config.iceServers ?? []).flatMap(nativeIceServers) }
+    if (config.bindAddress !== undefined) native.bindAddress = config.bindAddress
+    if (config.iceTransportPolicy !== undefined) {
+      native.iceTransportPolicy = config.iceTransportPolicy
+    }
+    super({ ...config, peerConnection: new PeerConnection(`webrtpay-${++made}`, native) })
+  }
+}
+
+/** `server`'s urls for libdatachannel: TURN as native IceServer objects, others as they are. */
+function nativeIceServers(server: RTCIceServer): Array<string | IceServer> {
+  const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
+  return urls.map(url => {
+    const turn = /^(turns?):([^:?]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(url)
+    if (turn === null) return url
+    const [, scheme, hostname, port, transport] = turn
+    const tls = scheme.toLowerCase() === 'turns'
+    return {
+      hostname,
+      port: port === undefined ? (tls ? 5349 : 3478) : Number(port),
+      username: server.username,
+      password: server.credential,
+      relayType: tls ? 'TurnTls' : transport?.toLowerCase() === 'tcp' ? 'TurnTcp' : 'TurnUdp'
+    }
+  })
+}
+
+const client = new DirectPayClient({
+  wallet,
+  signaler: relay,
+  rtc: { RTCPeerConnection: TurnRTCPeerConnection as unknown as typeof RTCPeerConnection },
+  iceServersProvider: relay.turnProvider()
+})
+```
 
 ## Security model
 
@@ -314,6 +428,13 @@ Read this before enabling receiving for users.
 - **TURN.** Relay-issued TURN usernames are pseudonyms (`<expiry>:<HMAC of the identity key>`),
   but they travel in the clear on `turn:` urls. Do not run coturn verbose or with its Redis
   stats database, which log them.
+- **Known limitation: free identities can keep direct receive busy.** A few throwaway keys can
+  each dial, complete the handshake and send any message (one the payee ignores) within the
+  first-message window, then one a minute, holding every inbound slot. `maxSessionMs` (120 s)
+  ends each session, but redialing within the per-sender offer limits takes the slot again, so
+  genuine payers get `busy` or no answer for as long as it goes on. Nothing is spent, and
+  MessageBox remains the fallback; reserving a slot for known counterparties is possible future
+  work.
 
 ## Relay server
 
@@ -325,26 +446,54 @@ coturn server. It stores nothing and never logs payloads.
 PUBLIC_URLS=wss://relay.example.com TRUSTED_IP_HEADER=cf-connecting-ip npx webrtpay-relay
 ```
 
+Set `TRUSTED_IP_HEADER` only when the listener can be reached solely through the proxy that sets
+it: keep it private (a ClusterIP Service behind the tunnel, a loopback or cluster-internal
+address, a firewall or the proxy's own allow-list). A client that can reach the relay directly
+can send any value and choose its own per-source limits.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` | `8787` | Port to listen on. |
 | `HOST` | `0.0.0.0` | Address to listen on. |
 | `PUBLIC_URLS` | — | Comma-separated `wss://` urls clients dial; clients sign the one they use. **Required in production**: the relay refuses to start without it unless `HOST` is a loopback address, because otherwise clients sign a url built from the `Host` header, which the client chooses. Set it whenever a proxy fronts the relay, even on loopback. |
-| `TRUSTED_IP_HEADER` | — | Header the outermost proxy sets to the client's single address, for the per-source limits: `cf-connecting-ip` behind Cloudflare. Without it every client behind a proxy shares the proxy's limits. `x-forwarded-for` is right only behind exactly one proxy that overwrites it. |
+| `TRUSTED_IP_HEADER` | — | Header the outermost proxy sets to the client's single address, for the per-source limits: `cf-connecting-ip` behind Cloudflare. Without it every client behind a proxy shares the proxy's limits. `x-forwarded-for` is right only behind exactly one proxy that overwrites it. Set it only when every connection reaches the relay through that proxy (firewall it, or keep the listener private, e.g. a ClusterIP Service behind the tunnel); a client that can reach the relay directly can send any value and choose its own per-source limits. |
 | `STUN_URLS` | — | Comma-separated STUN urls handed to every authenticated socket. |
 | `TURN_SECRET` | — | coturn `static-auth-secret`; requires `TURN_URLS`. |
 | `TURN_URLS` | — | Comma-separated TURN urls to issue credentials for; requires `TURN_SECRET`. |
 | `TURN_TTL` | `600` | Lifetime of issued TURN credentials, in seconds. |
-| `TURN_PER_IP_PER_HOUR` | `6` | TURN credential sets one source address may get per hour; requires `TURN_SECRET`. The relay issues at most 600 an hour in total. |
+| `TURN_PER_IP_PER_HOUR` | `6` | TURN credential sets one source address may get per hour; requires `TURN_SECRET`. |
+| `TURN_PER_48_PER_HOUR` | `24` | The same for all the IPv6 sources of one /48 together; requires `TURN_SECRET`. |
+| `TURN_PER_HOUR` | `600` | TURN credential sets the relay issues per hour in total; requires `TURN_SECRET`. |
+| `SOCKETS_PER_IP` | `20` | Sockets one source address may hold. |
+| `CONNECTIONS_PER_IP_PER_MINUTE` | `30` | New connections one source address may open a minute. |
+| `SOCKETS_PER_48` | `80` | Sockets all the IPv6 sources of one /48 may hold together. |
+| `CONNECTIONS_PER_48_PER_MINUTE` | `120` | New connections all the IPv6 sources of one /48 may open a minute. |
+| `MAX_SOCKETS` | `10000` | Sockets the relay holds. |
+| `MAX_UNAUTHENTICATED_SOCKETS` | `1000` | Sockets not yet authenticated the relay holds. |
+| `SIGNALS_PER_PAIR_PER_MINUTE` | `6` | Signals one sender identity may send one recipient a minute. |
+| `SIGNALS_PER_RECIPIENT_PER_MINUTE` | `120` | Signals one recipient may receive a minute from all senders. |
+| `MAX_OVER_RATE_FRAMES` | `20` | Frames over the socket rate answered in a row before the socket is closed. |
 
 - `GET /health` answers `{"status":"ok"}`. `SIGTERM` or `SIGINT` closes every socket and exits.
 - At startup it warns when there are no public urls (development only) and when `PUBLIC_URLS`
   is set without `TRUSTED_IP_HEADER`.
-- Connections are admitted per source address (IPv6 by /64) before the WebSocket upgrade:
-  more than 20 sockets or 30 new connections a minute from one source get `HTTP 429`; more
-  than 10000 sockets, or 1000 not yet authenticated, get `HTTP 503`.
-- An authenticated socket may send 20 frames per 10 s; an identity may hold 5 sockets and
-  receive 30 signals a minute from all senders together.
+- Connections are admitted per source address before the WebSocket upgrade: more than 20
+  sockets or 30 new connections a minute from one source get `HTTP 429`; more than 10000
+  sockets, or 1000 not yet authenticated, get `HTTP 503`. IPv6 counts by its /64 and also by its
+  /48, at 4 times those limits (80 sockets, 120 connections a minute), since a free
+  tunnel-broker /48 holds 65,536 /64s; an organisation that shares one /48 shares its budget
+  too. Every user behind one carrier-grade NAT address shares that address's limits; raise them
+  with the variables above when many of your users do.
+- A socket may send 20 frames per 10 s, WebSocket pings included. Each frame over that is
+  answered `rate_limited` (pings get no pong) until 20 have come in a row; the next closes the
+  socket with 1008, so a client that floods, reading the replies or not, is cut off.
+- An identity may hold 5 sockets and receive 120 signals a minute from all senders together,
+  6 a minute from any one sender identity. A sender over its share gets `rate_limited`; when
+  the total is spent the sender gets `offline`, as if the recipient were not connected. Fresh
+  identities are free, so 20 sockets from one address, each a new identity, can still spend a
+  recipient's whole total; the shares stop one identity from doing it.
+- An envelope may be up to 24672 bytes, the largest a signal can produce (a 16384-character
+  SDP fits).
 - TURN credentials are issued only on request (`{ t: 'turn' }`), at most 6 an hour per source
   address (`TURN_PER_IP_PER_HOUR`) and 600 an hour in total, valid for `TURN_TTL`. The username
   is `<expiry>:<pseudonym>` (`credential = base64(HMAC-SHA1(secret, username))`), so coturn
@@ -354,10 +503,10 @@ PUBLIC_URLS=wss://relay.example.com TRUSTED_IP_HEADER=cf-connecting-ip npx webrt
   fresh keys.
 
 In code, `createRelayServer(options)` takes the same settings (`port`, `host`, `publicUrls`,
-`trustedIpHeader`, `stunUrls`, `turn: { secret, urls, ttlSeconds }`, and
-`limits: { turnPerIpPerHour }` for `TURN_PER_IP_PER_HOUR`) plus `server` (attach to an existing
-HTTP server), `path`, the other `limits` (see `DEFAULT_RELAY_LIMITS`), `log` and, for
-development only, `trustHostHeader`. It resolves to `{ url, port, close(), stats() }`.
+`trustedIpHeader`, `stunUrls`, `turn: { secret, urls, ttlSeconds }`, and `limits` for the limit
+variables, e.g. `limits: { turnPerIpPerHour }` for `TURN_PER_IP_PER_HOUR`) plus `server`
+(attach to an existing HTTP server), `path`, the other `limits` (see `DEFAULT_RELAY_LIMITS`),
+`log` and, for development only, `trustHostHeader`. It resolves to `{ url, port, close(), stats() }`.
 `docker/relay.Dockerfile` builds an image running `dist/server/cli.js` as a non-root user.
 
 ## Running the local STUN/TURN stack
@@ -392,11 +541,9 @@ docker compose -f docker/docker-compose.yml down
   until their lifetime runs out, so about 8 runs in a row fill them. The TURN tests then time
   out and coturn logs `create_relay_ioa_sockets: no available ports`; run
   `docker compose -f docker/docker-compose.yml restart coturn` to free them.
-- node-datachannel's polyfill hands TURN servers to libdatachannel as
-  `turn:<username>:<credential>@host` urls, which cuts a REST username at its colon, and coturn
-  then refuses it. `turnRtc()` in `test/helpers/rtc.ts` passes TURN servers as native
-  `IceServer` objects instead; a Node app that uses relay-issued TURN with node-datachannel
-  needs the same.
+- The TURN tests give node-datachannel its TURN servers as native `IceServer` objects (see
+  [ICE servers and TURN](#ice-servers-and-turn)), since its polyfill cuts a REST username at
+  its colon.
 
 ## React Native
 
@@ -414,7 +561,9 @@ const client = new DirectPayClient({
 
 The root entry also needs `TextEncoder`, `TextDecoder` with `{ fatal: true }`,
 `crypto.getRandomValues` (for example from `react-native-get-random-values`) and
-`queueMicrotask`; `RelaySignaler` uses the global `WebSocket` unless given one. It uses no
+`queueMicrotask`, and uses `performance.now()` when there is one; `RelaySignaler` uses the
+global `WebSocket` unless given one. For the type declarations, add `"DOM"` to `lib` (see
+[Install](#install)). It uses no
 Node builtins, `Buffer` or `process`, and imports nothing outside `src/`
 (`test/browser-safety.test.ts` enforces this). It has not been run on React Native.
 
@@ -432,7 +581,7 @@ Node tests run real WebRTC with node-datachannel bound to `127.0.0.1`.
 
 ## Verification
 
-What the test suite exercises (`npm test`: 661 tests at 0.1.0; `npm run test:turn` adds 3 TURN
+What the test suite exercises (`npm test`: 700 tests at 0.1.0; `npm run test:turn` adds 3 TURN
 tests):
 
 - codes, compact SDP, frames: unit tests plus fast-check property suites with hostile input
@@ -450,7 +599,10 @@ tests):
 - the examples in `docs/protocol.md`, recomputed from the code (`test/protocol-doc.test.ts`);
 - guards: nothing under `src/` uses Node (`test/browser-safety.test.ts`), no public IP address
   is published in tests or docs (`test/ip-literals.test.ts`), and the files the README links
-  to are in the package (`test/package-files.test.ts`).
+  to are in the package (`test/package-files.test.ts`);
+- type-level interop: `PaymentToken` and `IncomingPayment` against `@bsv/sdk`'s
+  `CreateActionResult` and `@bsv/message-box-client` 2.6.0's types, both ways
+  (`test/types.test.ts`, checked by `npm run typecheck`).
 
 The demo, `examples/demo-node.ts`, is not part of `npm test`; run by hand, it pays through the
 built package and prints an `accepted` ack.
@@ -464,9 +616,7 @@ Not verified:
 - real networks: the test sandbox drops UDP to non-loopback addresses, so NAT traversal and
   Electron-to-Electron across networks are untested;
 - TURN in production (only the local coturn), and a real MessageBox server;
-- real BRC-100 wallets other than `ProtoWallet` (`internalizeAction` is mocked in the tests);
-- that the redeclared PeerPay types stay assignable to `@bsv/message-box-client`'s (kept by
-  hand; no type-level test, since it is not a dependency).
+- real BRC-100 wallets other than `ProtoWallet` (`internalizeAction` is mocked in the tests).
 
 ## License
 
